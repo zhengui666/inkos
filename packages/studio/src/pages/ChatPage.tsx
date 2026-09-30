@@ -6,13 +6,7 @@ import { fetchJson, postApi, useApi } from "../hooks/use-api";
 import type { ChatAttachmentPayload } from "../store/chat/types";
 import { chatSelectors, useChatStore } from "../store/chat";
 import type { ChatSessionKind } from "../store/chat";
-import { useServiceStore } from "../store/service";
-import {
-  DropdownMenu,
-  DropdownMenuTrigger,
-  DropdownMenuContent,
-  DropdownMenuItem,
-} from "../components/ui/dropdown-menu";
+import { CodexRuntimeStatus } from "../components/CodexRuntimeStatus";
 import {
   Reasoning,
   ReasoningTrigger,
@@ -32,7 +26,6 @@ import { presentationChoiceSet, type PlayPresentation } from "../components/chat
 import {
   BotMessageSquare,
   ArrowUp,
-  ChevronDown,
   Check,
   FolderUp,
   X,
@@ -49,14 +42,10 @@ import {
   MessageContent,
 } from "../components/ai-elements/message";
 import {
-  type ChatPageModelPreference,
-  buildChatPageModelGroups,
-  filterModelGroups,
   getChatScrollBehavior,
   getBookCreateSessionId,
   getProjectChatSessionId,
   pickProjectChatSessionId,
-  pickModelSelection,
   resolveWorkSessionBinding,
   setBookCreateSessionId,
   setProjectChatSessionId,
@@ -76,6 +65,7 @@ interface Nav {
   toDashboard: () => void;
   toBook: (id: string) => void;
   toServices: () => void;
+  toProjectSettings: () => void;
   toFilm: (projectId: string) => void;
   toFilmStudio: (projectId: string) => void;
 }
@@ -89,11 +79,6 @@ export interface ChatPageProps {
   readonly theme: Theme;
   readonly t: TFunction;
   readonly sse: { messages: ReadonlyArray<SSEMessage>; connected: boolean };
-}
-
-interface ServiceConfigPayload {
-  readonly service?: string | null;
-  readonly defaultModel?: string | null;
 }
 
 interface PlayImageSettings {
@@ -309,14 +294,11 @@ export function ChatPage({ activeBookId, activeWorkId, workProfileId, mode = act
   const loading = useChatStore(chatSelectors.isActiveSessionStreaming);
   const chatStreaming = useChatStore(chatSelectors.isActiveSessionChatStreaming);
   const lastFailedSend = useChatStore(chatSelectors.activeSessionLastFailedSend);
-  const selectedModel = useChatStore((s) => s.selectedModel);
-  const selectedService = useChatStore((s) => s.selectedService);
   // -- Store actions --
   const setInput = useChatStore((s) => s.setInput);
   const sendMessage = useChatStore((s) => s.sendMessage);
   const retryLastSend = useChatStore((s) => s.retryLastSend);
   const abortSession = useChatStore((s) => s.abortSession);
-  const setSelectedModel = useChatStore((s) => s.setSelectedModel);
   const loadSessionList = useChatStore((s) => s.loadSessionList);
   const createSession = useChatStore((s) => s.createSession);
   const createDraftSession = useChatStore((s) => s.createDraftSession);
@@ -401,95 +383,6 @@ export function ChatPage({ activeBookId, activeWorkId, workProfileId, mode = act
       || !last.content
       || (last.toolExecutions?.some(t => t.status === "running" || t.status === "processing") ?? false);
   }, [messages]);
-
-  // -- Model picker: read raw state, derive with useMemo (stable refs) --
-  const services = useServiceStore((s) => s.services);
-  const servicesLoading = useServiceStore((s) => s.servicesLoading);
-  const bankModelsLoading = useServiceStore((s) => s.bankModelsLoading);
-  const customModelsLoading = useServiceStore((s) => s.customModelsLoading);
-  const modelsByService = useServiceStore((s) => s.modelsByService);
-  const fetchServices = useServiceStore((s) => s.fetchServices);
-  const fetchBankModels = useServiceStore((s) => s.fetchBankModels);
-  const fetchCustomModels = useServiceStore((s) => s.fetchCustomModels);
-  const [configuredModelSelection, setConfiguredModelSelection] = useState<ChatPageModelPreference | null>(null);
-  const [serviceConfigLoaded, setServiceConfigLoaded] = useState(false);
-
-  useEffect(() => { void fetchServices(); }, [fetchServices]);
-  useEffect(() => {
-    void fetchBankModels();
-    void fetchCustomModels();
-  }, [fetchBankModels, fetchCustomModels]);
-  useEffect(() => {
-    let cancelled = false;
-
-    void fetchJson<ServiceConfigPayload>("/services/config")
-      .then((payload) => {
-        if (cancelled) return;
-        setConfiguredModelSelection({
-          service: payload.service ?? null,
-          model: payload.defaultModel ?? null,
-        });
-      })
-      .catch(() => {
-        if (!cancelled) setConfiguredModelSelection(null);
-      })
-      .finally(() => {
-        if (!cancelled) setServiceConfigLoaded(true);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const groupedModels = useMemo(
-    () => buildChatPageModelGroups(services, modelsByService, configuredModelSelection),
-    [configuredModelSelection, modelsByService, services],
-  );
-
-  const modelPickerStatus = useMemo(() => {
-    if (servicesLoading || services.length === 0) return "loading" as const;
-    const connected = services.filter((s) => s.connected);
-    if (connected.length === 0) return "no-models" as const;
-    if (bankModelsLoading) return "loading" as const;
-    if (groupedModels.some((group) => group.models.length > 0)) return "ready" as const;
-    const hasConnectedBank = connected.some((s) => !s.service.startsWith("custom"));
-    const hasConnectedCustom = connected.some((s) => s.service.startsWith("custom"));
-    if (!hasConnectedBank && hasConnectedCustom && customModelsLoading) return "loading" as const;
-    return "no-models" as const;
-  }, [customModelsLoading, groupedModels, services, servicesLoading, bankModelsLoading]);
-
-  const selectedModelLabel = useMemo(() => {
-    if (!selectedModel) return isZh ? "选择模型" : "Select model";
-    const group = groupedModels.find((item) => item.service === selectedService);
-    const model = group?.models.find((item) => item.id === selectedModel);
-    const modelLabel = model?.name ?? selectedModel;
-    return group ? `${group.label} · ${modelLabel}` : modelLabel;
-  }, [groupedModels, selectedModel, selectedService, isZh]);
-
-  // A session model is canonical once the session has run; project config only
-  // seeds sessions that have not selected a model yet.
-  useEffect(() => {
-    if (!serviceConfigLoaded) return;
-    if (activeSession?.modelOverride) {
-      const matchingGroups = groupedModels.filter((group) => group.models.some((model) => model.id === activeSession.modelOverride));
-      const sessionGroup = matchingGroups.find(group => group.service === (activeSession.serviceOverride ?? selectedService)) ?? matchingGroups[0];
-      if (sessionGroup
-        && (selectedModel !== activeSession.modelOverride || selectedService !== sessionGroup.service)) {
-        setSelectedModel(activeSession.modelOverride, sessionGroup.service);
-      }
-      return;
-    }
-    const nextSelection = pickModelSelection(
-      groupedModels,
-      selectedModel,
-      selectedService,
-      configuredModelSelection,
-    );
-    if (nextSelection) {
-      setSelectedModel(nextSelection.model, nextSelection.service);
-    }
-  }, [activeSession?.modelOverride, activeSession?.serviceOverride, configuredModelSelection, groupedModels, selectedModel, selectedService, serviceConfigLoaded, setSelectedModel]);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -1188,32 +1081,7 @@ export function ChatPage({ activeBookId, activeWorkId, workProfileId, mode = act
                 </button>
               </div>
               <div className="flex items-center gap-2 px-3 pb-2 border-t border-border/20 pt-1.5">
-                {modelPickerStatus === "loading" ? (
-                  <span className="text-[15px] text-muted-foreground/40 animate-pulse">{isZh ? "加载模型..." : "Loading models..."}</span>
-                ) : modelPickerStatus === "ready" ? (
-                  <DropdownMenu>
-                    <DropdownMenuTrigger className="flex items-center gap-1.5 px-2 py-1.5 rounded-md hover:bg-muted text-[16px] transition-colors cursor-pointer">
-                      <span className="font-medium truncate max-w-[260px]">
-                        {selectedModelLabel}
-                      </span>
-                      <ChevronDown size={17} className="text-muted-foreground" />
-                    </DropdownMenuTrigger>
-                    <ModelPickerContent
-                      groupedModels={groupedModels}
-                      selectedModel={selectedModel}
-                      selectedService={selectedService}
-                      onSelect={setSelectedModel}
-                      onManage={() => nav.toServices()}
-                    />
-                  </DropdownMenu>
-                ) : (
-                  <button
-                    onClick={() => nav.toServices()}
-                    className="text-[15px] text-muted-foreground/50 hover:text-primary transition-colors"
-                  >
-                    {isZh ? "配置模型 →" : "Set up models →"}
-                  </button>
-                )}
+                <CodexRuntimeStatus isZh={isZh} onSettings={nav.toProjectSettings} />
                 {isPlaySurface && (
                   <button
                     type="button"
@@ -1296,72 +1164,5 @@ export function ChatPage({ activeBookId, activeWorkId, workProfileId, mode = act
       )}
       <ProjectArtifactDrawer />
     </div>
-  );
-}
-
-function ModelPickerContent({
-  groupedModels,
-  selectedModel,
-  selectedService,
-  onSelect,
-  onManage,
-}: {
-  groupedModels: ReadonlyArray<{ service: string; label: string; models: ReadonlyArray<{ id: string; name?: string }> }>;
-  selectedModel: string | null;
-  selectedService: string | null;
-  onSelect: (model: string, service: string) => void;
-  onManage: () => void;
-}) {
-  const [search, setSearch] = useState("");
-  const filtered = useMemo(() => filterModelGroups(groupedModels, search), [groupedModels, search]);
-
-  return (
-    <DropdownMenuContent side="top" align="start" className="w-64 max-h-80 flex flex-col">
-      <div className="px-2 py-1.5 border-b border-border/30">
-        <input
-          type="text"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder="搜索模型..."
-          className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground/40"
-          onClick={(e) => e.stopPropagation()}
-          onKeyDown={(e) => e.stopPropagation()}
-        />
-      </div>
-      <div className="overflow-y-auto flex-1">
-        {filtered.map((group) => (
-          <div key={group.service}>
-            <div className="px-2 py-1.5 text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-              {group.label}
-            </div>
-            {group.models.map((m) => {
-              const isSelected = selectedModel === m.id && selectedService === group.service;
-              return (
-                <DropdownMenuItem
-                  key={`${group.service}:${m.id}`}
-                  onClick={() => onSelect(m.id, group.service)}
-                  className={isSelected ? "bg-muted/50" : ""}
-                >
-                  <div className="flex flex-1 items-center justify-between">
-                    <span className="text-sm">{m.name ?? m.id}</span>
-                    {isSelected && <Check size={14} className="text-primary shrink-0" />}
-                  </div>
-                </DropdownMenuItem>
-              );
-            })}
-          </div>
-        ))}
-        {filtered.length === 0 && (
-          <div className="px-3 py-4 text-xs text-muted-foreground/50 text-center italic">
-            无匹配模型
-          </div>
-        )}
-      </div>
-      <div className="border-t border-border/30">
-        <DropdownMenuItem onClick={onManage} className="text-primary">
-          管理服务商
-        </DropdownMenuItem>
-      </div>
-    </DropdownMenuContent>
   );
 }

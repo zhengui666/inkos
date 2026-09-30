@@ -30,6 +30,11 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: pnpm test
+      - name: Verify pinned Codex native-tool isolation without credentials
+        if: runner.os == 'Linux'
+        env:
+          INKOS_CODEX_INTEGRATION: '1'
+        run: pnpm --filter @actalk/inkos-core exec vitest run src/codex/__tests__/isolation.integration.test.ts
 
   verify-pack:
     runs-on: ubuntu-latest

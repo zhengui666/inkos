@@ -23,7 +23,7 @@ styleCommand
       const root = findProjectRoot();
       const bookId = await resolveBookId(bookIdArg, root);
       const text = await readFile(resolve(file), "utf-8");
-      const config = await loadConfig();
+      const config = await loadConfig({ requireApiKey: false });
       const pipeline = new PipelineRunner(buildPipelineConfig(config, root));
       const activatedSkills = await resolveCliProfileSkills(root, "longform-novel", {
         extraSkillIds: ["inkos-long-story-analysis", "inkos-imitation-writing"],

@@ -1,4 +1,7 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { CodexFixture } from './codex-fixture.js';
+const codex = vi.hoisted(() => ({ create: vi.fn() }));
+vi.mock('../codex/client.js', () => ({ createCodexClient: codex.create }));
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,8 +9,6 @@ import { createFillNodeTool, createReviseNodeTool, type FilmLLMDeps } from "../a
 import { loadStoryGraph } from "../interactive-film/graph-store.js";
 import { saveStoryGraph } from "../interactive-film/graph-store.js";
 import { StoryGraphSchema, StoryNodeSchema } from "../interactive-film/graph-schema.js";
-import {createServer} from 'node:http';
-import {once} from 'node:events';
 import {createLLMClient} from '../llm/provider.js';
 import {filmLLMDepsFromClient} from '../agent/film-authoring-tools.js';
 import {createWorkManifest,saveWorkManifest} from '../harness/work-store.js';
@@ -95,10 +96,9 @@ describe("revise_node tool (stubbed LLM)", () => {
     ]});await saveStoryGraph(root,'p',graph);
     const requests:any[]=[];
     const replacement={sceneDesc:'The relay cabinet is closed.',dialogue:[{speaker:'Operator',text:'The relay is powered.',emotion:'calm',condition:{var:'power',op:'==',value:true}}]};
-    const server=createServer(async(req,res)=>{const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));const body=JSON.parse(Buffer.concat(chunks).toString('utf8'));requests.push(body);const name=body.tools[0].function.name;const selected=JSON.parse(body.messages.find((m:any)=>m.role==='user').content).fields as Array<keyof typeof replacement>;const result=Object.fromEntries(selected.map(field=>[field,replacement[field]]));res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({choices:[{finish_reason:'tool_calls',message:{tool_calls:[{id:'edit',type:'function',function:{name,arguments:JSON.stringify(result)}}]}}]}));});
-    server.listen(0,'127.0.0.1');await once(server,'listening');
+    const fixture=new CodexFixture(view=>{const body={tools:view.tools,messages:[{role:'system',content:view.thread.baseInstructions},...view.messages]};requests.push(body);const name=body.tools[0]!.function.name;const selected=JSON.parse(body.messages.find(m=>m.role==='user')!.content).fields as Array<keyof typeof replacement>;return{calls:[{name,args:Object.fromEntries(selected.map(field=>[field,replacement[field]]))}]};});codex.create.mockImplementation(fixture.createClient);
     try{
-      const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,apiFormat:'chat',stream:false,temperature:0,thinkingBudget:0});
+      const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:'https://fixture.invalid/v1',apiFormat:'chat',stream:false,temperature:0,thinkingBudget:0});
       const tool=createReviseNodeTool(root,'p',filmLLMDepsFromClient(client,'fixture'),'en');
       await tool.execute('edit',{nodeId:'n1',fields:['dialogue'],instruction:'Clarify only the dialogue.'});
       expect(requests).toHaveLength(1);
@@ -115,6 +115,6 @@ describe("revise_node tool (stubbed LLM)", () => {
       expect(requests[1].tools[0].function.parameters.required).toEqual(['sceneDesc']);
       expect(requests[1].tools[0].function.parameters.properties).not.toHaveProperty('dialogue');
       expect(await loadStoryGraph(root,'p')).toEqual({...graph,nodes:graph.nodes.map(n=>n.id==='n1'?{...n,...replacement}:n)});
-    }finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}
+    }finally{codex.create.mockReset();}
   },20000);
 });

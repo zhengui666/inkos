@@ -1,6 +1,6 @@
 import { createBuiltInWorkProfileRegistry } from "../builtin-profiles.js";
 import { Type, type Static } from "@mariozechner/pi-ai";
-import type { AgentTool } from "@mariozechner/pi-agent-core";
+import type { AgentTool } from "../../codex/contracts.js";
 import { createHash } from "node:crypto";
 import { validatedArtifactWrites } from "../artifact-validation.js";
 import { assertGenericArtifactEditable } from '../artifact-edit-policy.js';

@@ -1,4 +1,4 @@
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage } from "../codex/contracts.js";
 import type { UserMessage } from "@mariozechner/pi-ai";
 import { estimateTextTokens } from "../llm/provider.js";
 import type { ContextCompressionCallback } from "../models/context-compression.js";

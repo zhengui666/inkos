@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CodexFixture, bufferedFixtureReply } from "./codex-fixture.js";
 import type { Context, Model } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
 import { guardedPiNonStreaming } from "../agent/pi-stream.js";
@@ -27,6 +28,9 @@ import {WriterAgent} from '../agents/writer.js';
 import {ContinuityAuditor} from '../agents/continuity.js';
 
 const fetchWithProxyMock = vi.hoisted(() => vi.fn());
+const codexClientMock = vi.hoisted(() => vi.fn());
+vi.mock("../codex/client.js", () => ({ createCodexClient: codexClientMock }));
+let codex: CodexFixture;
 
 vi.mock("../utils/proxy-fetch.js", () => ({
   fetchWithProxy: fetchWithProxyMock,
@@ -367,22 +371,32 @@ describe("guardedPiNonStreaming", () => {
     expect(result.chapters[0]?.charCount).toBe(25);
     expect(result.chapters[1]).toEqual(neighbor);
   });
-  it('bounds buffered drafting requests while producing every requested chapter',async()=>{
-    const budgets:number[]=[];
+  it('bounds dynamic-tool chapter batches while producing every requested chapter',async()=>{
+    const batches:number[][]=[];
     fetchWithProxyMock.mockImplementation(async(_url:string,init:RequestInit)=>{
-      const body=JSON.parse(String(init.body)),tool=body.tools[0].function;budgets.push(body.max_tokens);
+      const body=JSON.parse(String(init.body)),tool=body.tools[0].function;
       const numbers=Object.keys(tool.parameters.properties).filter(key=>key.startsWith('chapter_')&&key.endsWith('_content')).map(key=>Number(key.split('_')[1]));
+      batches.push(numbers);
       const args={storyTitle:'Receipt',...Object.fromEntries(numbers.flatMap(number=>[[`chapter_${number}_title`,`Part ${number}`],[`chapter_${number}_content`,'Mara delivers the receipt and the owner accepts it.']]))};
-      return new Response(JSON.stringify({choices:[{finish_reason:'tool_calls',message:{tool_calls:[{id:'batch-'+budgets.length,type:'function',function:{name:tool.name,arguments:JSON.stringify(args)}}]}}]}));
+      return new Response(JSON.stringify({choices:[{finish_reason:'tool_calls',message:{tool_calls:[{id:'batch-'+batches.length,type:'function',function:{name:tool.name,arguments:JSON.stringify(args)}}]}}]}));
     });
     const client=createLLMClient({provider:'openai',service:'custom',configSource:'studio',baseUrl:model.baseUrl,model:model.id,apiKey:'fixture',apiFormat:'chat',stream:false,temperature:0,thinkingBudget:0});
     const result=await new ShortFictionWriterAgent({client,model:model.id,projectRoot:'/tmp'}).writeDraft({direction:'Complete the story',outlineMarkdown:'Six chapters',chapterCount:6,charsPerChapter:1000,language:'zh'});
     expect(result.chapters.map(c=>c.number)).toEqual([1,2,3,4,5,6]);
-    expect(budgets.length).toBeGreaterThan(1);
-    expect(budgets.every(budget=>budget<=8192)).toBe(true);
+    expect(batches.length).toBeGreaterThan(1);
+    expect(batches.flat()).toEqual([1,2,3,4,5,6]);
+    expect(batches.every(batch=>batch.length < 6)).toBe(true);
+    expect(codex.requests.filter(request=>request.method==='thread/start').every(request=>request.params.dynamicTools.length===1)).toBe(true);
   });
   beforeEach(() => {
     fetchWithProxyMock.mockReset();
+    // Domain replies below retain their compact buffered example format. Only
+    // direct provider tests use fetch; agent tests execute the real Codex Agent
+    // against dynamic-tool requests from this in-memory App Server peer.
+    codex = new CodexFixture(async view => bufferedFixtureReply(await fetchWithProxyMock('fixture://codex', {
+      body: JSON.stringify({ messages: [{ role: 'system', content: view.thread.baseInstructions }, ...view.messages], tools: view.tools }),
+    })));
+    codexClientMock.mockImplementation(codex.createClient);
     delete process.env.INKOS_LLM_FIRST_EVENT_TIMEOUT_MS;
     delete process.env.INKOS_LLM_REQUEST_TIMEOUT_MS;
   });
@@ -634,7 +648,8 @@ describe("guardedPiNonStreaming", () => {
     expect(result.content.some(part => part.type === "toolCall")).toBe(false);
     expect(events).not.toContain("toolcall_end");
     const client = createLLMClient({provider:"openai",service:"custom",configSource:"studio",baseUrl:model.baseUrl,model:model.id,apiKey:"fixture",apiFormat:"chat",stream:false,temperature:0,thinkingBudget:0});
-    await expect(new ShortFictionOutlineAgent({client,model:model.id,projectRoot:"/tmp"}).createOutline({direction:"Fixture",chapterCount:2,charsPerChapter:20,language:"en"})).rejects.toMatchObject({code:"MODEL_OUTPUT_LIMIT"});
+    await expect(new ShortFictionOutlineAgent({client,model:model.id,projectRoot:"/tmp"}).createOutline({direction:"Fixture",chapterCount:2,charsPerChapter:20,language:"en"})).rejects.toMatchObject({code:"WORKER_MODEL_ERROR"});
+    expect(codex.toolResponses).toHaveLength(0);
     expect(fetchWithProxyMock).toHaveBeenCalledTimes(2);
   });
 
@@ -654,7 +669,7 @@ describe("guardedPiNonStreaming", () => {
     expect(fetchWithProxyMock).toHaveBeenCalledTimes(2);
     expect(result.storyTitle).toBe("Story");
     expect(result.rawContent).toBe(`Story premise and ending\n\n## Chapter 1\n\n${chapterOne}\n\n## Chapter 2\n\n${chapterTwo}`);
-    expect(JSON.parse(fetchWithProxyMock.mock.calls[0]![1].body).thinking).toEqual({ type: "disabled" });
+    expect(codex.requests.find(request=>request.method==='turn/start')?.params.effort).toBe('medium');
   });
 
   it("adapts a non-streaming tool call back into Pi events", async () => {

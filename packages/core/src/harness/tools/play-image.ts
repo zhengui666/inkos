@@ -5,7 +5,7 @@ import { withWorkMutationScope, runInWorkMutationQueue } from '../../utils/work-
 import { syncWorkSourceArtifacts } from '../source-sync.js';
 import type { ActionArtifactRef } from '../contracts.js';
 import { Type } from '@sinclair/typebox';
-import type { AgentTool } from '@mariozechner/pi-agent-core';
+import type { AgentTool } from '../../codex/contracts.js';
 import { PlayStore } from '../../play/play-store.js';
 import { createPlayDB } from '../../play/play-db-factory.js';
 import { buildPlayEntityImagePrompt,buildPlaySceneImagePrompt,playSceneImageKey,generatePlayImage,playImageContext } from '../../play/play-image.js';

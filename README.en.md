@@ -44,14 +44,18 @@ Thanks to [ByteDance Volcano Engine](https://www.volcengine.com/activity/ai618?u
 
 > 💡 **One key for global frontier models** — pair InkOS with [**kkaiapi**](https://en.kkaiapi.com/): an OpenAI-compatible gateway for Claude, GPT, Gemini, DeepSeek, Kimi, Qwen, GLM, and image models. Add it as a custom service with base URL `https://api.kkaiapi.com/v1`, then switch models in Studio without juggling multiple provider accounts.
 
-## v2.0.0 Unified Pi Agent Harness and Professional Creation Kernel
+## Codex and ChatGPT sign-in
+
+Agents now run on the official Codex App Server. In Studio → Project settings → Codex, sign in with ChatGPT and select the model, reasoning effort, and supported speed. Agent chat no longer requires a legacy provider API key. Credentials stay server-side; standalone model/image services keep their existing provider settings. [Setup and security boundaries](docs/codex-runtime.md)
+
+## v2.0.0 Unified Codex Agent Harness and Professional Creation Kernel
 
 Preview a 1.x upgrade with `inkos work migrate --json`, then apply it with `inkos work migrate --apply`. Migration converts book defaults, rules and state snapshots while retaining the original directories and unspecified historical values. The original files retain retired writing settings; 2.0 uses Profile action policies. Projects missing runtime state enter the library as drafts requiring reconstruction.
 
-InkOS 2.0 converges the Chat Agent and every production workflow on one pi-agent-centered harness. Models understand, propose, and invoke capabilities; InkOS owns confirmation, context, state, atomic persistence, and artifact truth. Long fiction, short fiction, scripts, storyboards, interactive films, Play, and translation keep their own craft methods while sharing execution, retrieval, observation, and recovery infrastructure.
+InkOS 2.0 converges the Chat Agent and every production workflow on one Codex-centered harness. Models understand, propose, and invoke capabilities; InkOS owns confirmation, context, state, atomic persistence, and artifact truth. Long fiction, short fiction, scripts, storyboards, interactive films, Play, and translation keep their own craft methods while sharing execution, retrieval, observation, and recovery infrastructure.
 
 - **Model setup**: Studio includes provider settings, model routing, cover-service settings, [kkaiapi](https://en.kkaiapi.com/) / OpenRouter aggregator entries, and custom OpenAI-compatible endpoints.
-- **One production harness**: Studio Chat, TUI, `inkos interact`, and production workers share the pi-agent tool loop and typed action/result boundary. Existing pipelines are deterministic, interruptible capabilities rather than parallel natural-language decision engines.
+- **One production harness**: Studio Chat, TUI, `inkos interact`, and production workers share the Codex agent tool loop and typed action/result boundary. Existing pipelines are deterministic, interruptible capabilities rather than parallel natural-language decision engines.
 - **19 built-in professional Skills**: dedicated `SKILL.md` packages cover long-form writing/review, commercial shorts, Play, scripts, storyboards, interactive film, translation, analysis, market research, import, covers, and semantic de-slopping. Each medium shares the Skill architecture, not long-form-specific prompts.
 - **Unified local retrieval**: story memory, archived materials, and Skill references use one rebuildable SQLite FTS5 / BM25 projection. Source files remain authoritative and retrieved evidence keeps source locations.
 - **Book-bound references**: imported material can be explicitly bound to a book with intended uses, then retrieved by task instead of injecting every file in full.
@@ -413,7 +417,7 @@ Model output limits are managed by provider model cards in the provider bank. Re
 
 ## How It Works
 
-InkOS uses a pi-agent harness as its shared reasoning and tool-call kernel. The Agent interprets user intent and emits typed actions; the host executes deterministic tools, enforces confirmation and permissions, manages state, and derives completion from real files and tool results. Long fiction, short fiction, scripts, storyboards, interactive film, Play, and translation share this architecture while retaining dedicated Skills, state models, and production steps.
+InkOS uses a Codex agent harness as its shared reasoning and tool-call kernel. The Agent interprets user intent and emits typed actions; the host executes deterministic tools, enforces confirmation and permissions, manages state, and derives completion from real files and tool results. Long fiction, short fiction, scripts, storyboards, interactive film, Play, and translation share this architecture while retaining dedicated Skills, state models, and production steps.
 
 <p align="center">
   <img src="assets/arch-system.svg" width="900" alt="System architecture">
@@ -497,7 +501,7 @@ inkos review my-book --json
 inkos export my-book --format epub
 ```
 
-These commands express already-determined user actions. Natural-language intent still enters the pi-agent Harness and is resolved against the current Work Profile capability surface.
+These commands express already-determined user actions. Natural-language intent still enters the Codex agent Harness and is resolved against the current Work Profile capability surface.
 
 ### 3. Natural Language Agent Mode
 
@@ -630,7 +634,7 @@ pnpm typecheck    # Type-check without emitting
 
 ## Acknowledgments
 
-InkOS's agent runtime is built on [pi](https://github.com/badlogic/pi-mono) (`@mariozechner/pi-ai` and `@mariozechner/pi-agent-core`) by Mario Zechner. Thanks to pi for the solid foundation.
+The agent runtime uses the official [Codex App Server](https://developers.openai.com/codex/app-server/). Standalone provider and image integrations retain [pi-ai](https://github.com/badlogic/pi-mono). Thanks to both open-source projects.
 
 ## License
 

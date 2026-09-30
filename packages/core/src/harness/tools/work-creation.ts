@@ -1,5 +1,5 @@
 import { Type } from "@sinclair/typebox";
-import type { AgentTool } from "@mariozechner/pi-agent-core";
+import type { AgentTool } from "../../codex/contracts.js";
 import { createBuiltInWorkProfileRegistry } from "../builtin-profiles.js";
 import { createInitialWorkManifestWrite } from "../source-sync.js";
 import { loadWorkManifest } from "../work-store.js";

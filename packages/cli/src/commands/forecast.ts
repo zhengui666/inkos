@@ -33,7 +33,7 @@ forecastCommand
       const branchCount = parsePositiveInteger(opts.branches, FORECAST_DEFAULT_BRANCHES, "branches");
       const horizon = parsePositiveInteger(opts.horizon, FORECAST_DEFAULT_HORIZON, "horizon");
 
-      const config = await loadConfig({ projectRoot: root });
+      const config = await loadConfig({ requireApiKey: false, projectRoot: root });
       if (opts.llmBaseUrl) config.llm.baseUrl = opts.llmBaseUrl;
       if (opts.model) config.llm.model = opts.model;
       const pipeline = new PipelineRunner(buildPipelineConfig(config, root, { quiet: Boolean(opts.json) }));

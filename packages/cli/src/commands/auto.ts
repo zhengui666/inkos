@@ -67,7 +67,7 @@ export const autoCommand = new Command("auto")
         return;
       }
 
-      const config = await loadConfig();
+      const config = await loadConfig({ requireApiKey: false });
       const pipeline = new PipelineRunner(buildPipelineConfig(config, root, {
         quiet: opts.quiet,
       }));

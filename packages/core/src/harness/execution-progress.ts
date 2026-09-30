@@ -1,4 +1,4 @@
-import type {AgentMessage} from '@mariozechner/pi-agent-core';
+import type {AgentMessage} from '../codex/contracts.js';
 import {createHash} from 'node:crypto';
 import {actionResultFacts} from './action-observation.js';
 

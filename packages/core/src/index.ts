@@ -598,3 +598,7 @@ export { runWorkerAgent, type WorkerAgentOptions } from "./agent/worker-agent.js
 export { compileStyleGuide } from "./agents/style-guide.js";
 export { LLM_API_FORMATS, isLLMApiFormat, toPiApi, type LLMApiFormat } from "./llm/api-format.js";
 export * from "./harness/index.js";
+
+export * from "./codex/account.js";
+export * from "./codex/settings.js";
+export * from "./codex/types.js";

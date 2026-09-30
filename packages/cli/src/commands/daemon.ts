@@ -14,7 +14,7 @@ export const upCommand = new Command("up")
     let logStream: WriteStream | undefined;
     let pidPath: string | undefined;
     try {
-      const config = await loadConfig();
+      const config = await loadConfig({ requireApiKey: false });
       const root = findProjectRoot();
 
       // Check if already running

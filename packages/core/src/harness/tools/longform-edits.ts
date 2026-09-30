@@ -1,5 +1,5 @@
 import { Type, type Static } from "@mariozechner/pi-ai";
-import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentTool, AgentToolResult } from "../../codex/contracts.js";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { executeEditTransaction, type EditRequest } from "../../interaction/edit-controller.js";

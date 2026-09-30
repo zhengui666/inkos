@@ -1,6 +1,7 @@
-import {it,expect} from 'vitest';
-import {createServer} from 'node:http';
-import {once} from 'node:events';
+import {it,expect,vi} from 'vitest';
+import {CodexFixture} from './codex-fixture.js';
+const createCodexClient=vi.hoisted(()=>vi.fn());
+vi.mock('../codex/client.js',()=>({createCodexClient}));
 import {mkdtemp,mkdir,readFile,writeFile,rm,readdir} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -17,20 +18,18 @@ it('revises only an opening, then applies an author-requested chapter reduction 
   let planNumber=0;
   let stage:'opening'|'structure'='opening';
   const calls:string[]=[];
-  const server=createServer(async(request,response)=>{
-    const chunks:Buffer[]=[];for await(const chunk of request)chunks.push(Buffer.from(chunk));
-    const body=JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    const name=body.tools[0].function.name;calls.push(name);
+  const codex=new CodexFixture(({thread})=>{
+    const name=thread.dynamicTools[0].name;calls.push(name);
     const result=name==='submit_short_revision_plan'
       ? (++planNumber,stage==='opening'
         ? {revisionBrief:'Change the independent opening only.',openingHook:'A pair of cups waited by the door.',...(planNumber===1?{chapter_1_instruction:'Change the first scene too.'}:{})}
         :{revisionBrief:'Retain the first and last scenes.',outlineMarkdown:'The stall opens, then closes.',chapter_2_sourceNumber:3})
       :name==='submit_short_fiction_review'?{summary:'Reviewed the supplied scope.',observations:[]}
         :name==='submit_short_package'?{title:'The Tea Stall',intro:'A day at the stall.',sellingPoints:['A small act of care'],coverPrompt:'Two cups at a neighborhood stall.'}:undefined;
-    response.writeHead(result?200:400,{'Content-Type':'application/json'});
-    response.end(JSON.stringify(result?{choices:[{finish_reason:'tool_calls',message:{tool_calls:[{id:name+calls.length,type:'function',function:{name,arguments:JSON.stringify(result)}}]}}]}:{error:{message:'Unexpected worker operation'}}));
+    if(!result)throw new Error('Unexpected worker operation: '+name);
+    return {calls:[{name,args:result}]};
   });
-  server.listen(0,'127.0.0.1');await once(server,'listening');
+  createCodexClient.mockImplementation(codex.createClient);
   try{
     const base=join(root,'works/tea/source');await mkdir(base,{recursive:true});
     await saveWorkManifest(root,createWorkManifest({id:'tea',title:'The Tea Stall',profileId:'short-fiction',language:'en'}));
@@ -42,7 +41,7 @@ it('revises only an opening, then applies an author-requested chapter reduction 
       {relativePath:'works/tea/source/production-state.json',content:JSON.stringify({version:2,intent:'A quiet day at a tea stall.',target:{chapterCount:3,charsPerChapter:40,language:'en'},stages:{}})},
     ]});
     const original=await loadWorkManifest(root,'tea');
-    const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,apiFormat:'chat',stream:false,temperature:0,thinkingBudget:0});
+    const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:'https://unused.invalid/v1',apiFormat:'chat',stream:false,temperature:0,thinkingBudget:0});
     const runtime={client,model:'fixture',projectRoot:root};
     const options={projectRoot:root,storyId:'tea',direction:'Change only the independent opening.',revisionChapterNumbers:[] as number[],cover:false,runtimes:{planner:runtime,writer:runtime,draftReview:runtime,package:runtime}};
     const first=await reviseShortFictionProduction(options);
@@ -66,7 +65,7 @@ it('revises only an opening, then applies an author-requested chapter reduction 
     expect(createHash('sha256').update(await readFile(join(root,'works/tea',previous.snapshotPath!))).digest('hex')).toBe(previous.checksum.slice(7));
     expect(calls.filter(name=>name==='submit_short_revision_chapter')).toHaveLength(0);
     expect(planNumber).toBe(3);
-  }finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));await rm(root,{recursive:true,force:true});}
+  }finally{await rm(root,{recursive:true,force:true});}
 },20000);
 
 it('allows an independent script edit and export in a composed Work while preserving managed domain state',async()=>{

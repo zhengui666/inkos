@@ -1,4 +1,4 @@
-import type { AgentTool } from "@mariozechner/pi-agent-core";
+import type { AgentTool } from "../../codex/contracts.js";
 import { Type, type TSchema } from "@sinclair/typebox";
 import type { WorkManifest } from "../contracts.js";
 import { loadWorkManifest } from "../work-store.js";

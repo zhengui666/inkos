@@ -79,7 +79,7 @@ describe("chat message actions", () => {
     expect(fakeEventSources[0]!.closed).toBe(true);
   });
 
-  it("creates a Work session while retaining the selected service and model identity", async () => {
+  it("creates a Codex Work session without persisting stale provider selections", async () => {
     const store = createTestStore();
     store.setState({selectedModel:"shared-model",selectedService:"custom:responses"});
     fetchJson.mockResolvedValueOnce({
@@ -100,12 +100,12 @@ describe("chat message actions", () => {
 
     expect(sessionId).toBe("work-session");
     expect(fetchJson.mock.calls[0][0]).toBe("/sessions");
-    expect(JSON.parse(fetchJson.mock.calls[0][1].body)).toMatchObject({bookId:null,sessionKind:"work",profileId:"script",workId:"script-work",modelOverride:"shared-model",serviceOverride:"custom:responses"});
+    expect(JSON.parse(fetchJson.mock.calls[0][1].body)).toEqual({bookId:null,sessionKind:"work",profileId:"script",workId:"script-work"});
     expect(store.getState().sessions[sessionId]).toMatchObject({
       profileId: "script",
       workId: "script-work",
-      modelOverride:"shared-model",
-      serviceOverride:"custom:responses",
+      modelOverride: undefined,
+      serviceOverride: undefined,
     });
   });
 
@@ -210,6 +210,26 @@ describe("chat message actions", () => {
     expect(fetchJson).not.toHaveBeenCalled();
   });
 
+  it("sends cold-start Codex chat with no browser model selection", async () => {
+    const store = createTestStore();
+    expect(store.getState().selectedModel).toBeNull();
+    expect(store.getState().selectedService).toBeNull();
+    const sessionId = store.getState().createDraftSession(null, "chat");
+    fetchJson.mockResolvedValueOnce({ session: { sessionId, bookId: null, sessionKind: "chat" } })
+      .mockResolvedValueOnce({ response: "Codex is ready." });
+    await store.getState().sendMessage(sessionId, "Help me write a scene.");
+    expect(fetchJson.mock.calls.map(([path]) => path)).toEqual(["/sessions", "/agent"]);
+    for (const [, init] of fetchJson.mock.calls) {
+      const body = JSON.parse(init.body);
+      expect(body).not.toHaveProperty("model");
+      expect(body).not.toHaveProperty("service");
+      expect(body).not.toHaveProperty("modelOverride");
+      expect(body).not.toHaveProperty("serviceOverride");
+    }
+    expect(store.getState().sessions[sessionId].messages.at(-1)?.content).toBe("Codex is ready.");
+    expect(store.getState().sessions[sessionId].lastFailedSend).toBeUndefined();
+  });
+
   it("syncs the created book id returned by /agent back into the current runtime session", async () => {
     const store = createTestStore();
     const sessionId = store.getState().createDraftSession(null, "book-create");
@@ -251,8 +271,8 @@ describe("chat message actions", () => {
     const body = JSON.parse((agentCall?.[1] as { body: string }).body);
     expect(body.activeBookId).toBe("harbor-book");
     expect(body.sessionKind).toBe("book");
-    expect(body.service).toBe("kkaiapi");
-    expect(body.model).toBe("deepseek-v4-flash");
+    expect(body).not.toHaveProperty("service");
+    expect(body).not.toHaveProperty("model");
   });
 
   it("does not send a selected Work's instruction through a stale bound session", async () => {

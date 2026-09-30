@@ -29,7 +29,7 @@ export const reviseCommand = new Command("revise")
     let notifyLanguage: CliLanguage = "zh";
     let notifyBookName: string | undefined;
     try {
-      const config = await loadConfig();
+      const config = await loadConfig({ requireApiKey: false });
       const root = findProjectRoot();
 
       let bookId: string;

@@ -276,7 +276,7 @@ const strings = {
 
   // Project Settings
   "settings.title": { zh: "项目设置", en: "Project Settings" },
-  "settings.subtitle": { zh: "集中管理写作运行时的项目级开关，不替代模型服务商配置。", en: "Manage project-level runtime switches without replacing model service configuration." },
+  "settings.subtitle": { zh: "管理 Codex 账户、推理与速度，以及项目级写作配置。", en: "Manage your Codex account, reasoning effort, service speed, and project settings." },
   "settings.modelOverrides": { zh: "Agent 模型路由", en: "Agent Model Routing" },
   "settings.modelOverridesHint": { zh: "为每个 agent 指定模型（贵模型写正文、便宜模型审稿等）。服务商、密钥和基础 URL 仍在模型配置页管理。", en: "Route each agent to a model (e.g. premium model for drafting, cheaper for review). Providers, keys, and base URLs stay in Model Config." },
   "settings.notify": { zh: "通知渠道", en: "Notification Channels" },
@@ -286,7 +286,7 @@ const strings = {
   "settings.openModelConfig": { zh: "打开模型配置", en: "Open Model Config" },
   "settings.saved": { zh: "已保存", en: "Saved" },
   "settings.globalDefaultModel": { zh: "全局默认模型", en: "Global Default Model" },
-  "settings.globalDefaultModelHint": { zh: "Chat、书籍操作和 CLI 未指定模型时使用这一组默认服务与模型。", en: "Used by Chat, book actions, and CLI paths when no explicit model is selected." },
+  "settings.globalDefaultModelHint": { zh: "仅用于独立文本 API 调用。协调 Agent 与生产 Worker 均使用上方的 Codex 设置；图像服务单独配置。", en: "Only used by standalone text API calls. Coordinators and production workers use the Codex settings above; image providers are configured separately." },
   "settings.serviceId": { zh: "服务 ID（如 kkaiapi）", en: "service id (e.g. kkaiapi)" },
   "settings.noOverrides": { zh: "暂无模型路由，所有 agent 使用默认模型。", en: "No overrides — every agent uses the default model." },
   "settings.agentName": { zh: "agent（如 writer / architect）", en: "agent (e.g. writer / architect)" },

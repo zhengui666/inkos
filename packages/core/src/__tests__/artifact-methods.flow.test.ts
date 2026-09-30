@@ -1,3 +1,6 @@
+import { CodexFixture } from './codex-fixture.js';
+const codex = vi.hoisted(() => ({ create: vi.fn() }));
+vi.mock('../codex/client.js', () => ({ createCodexClient: codex.create }));
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { mkdtemp, mkdir, writeFile, readFile, readdir, rm } from 'node:fs/promises';
@@ -22,8 +25,7 @@ import {StoryGraphSchema} from '../interactive-film/graph-schema.js';
 
 it('reviews a pinned graph with deterministic structural facts and persists the same evidence',async()=>{
   const root=await mkdtemp(join(tmpdir(),'inkos-graph-review-'));const requests:any[]=[];
-  const server=createServer(async(req,res)=>{const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));const body=JSON.parse(Buffer.concat(chunks).toString('utf8'));requests.push(body);res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({choices:[{finish_reason:'tool_calls',message:{tool_calls:[{id:'review',type:'function',function:{name:body.tools[0].function.name,arguments:JSON.stringify({summary:'Reviewed',observations:[]})}}]}}]}));});
-  server.listen(0,'127.0.0.1');await once(server,'listening');
+  const fixture=new CodexFixture(view=>{requests.push({messages:[{role:'system',content:view.thread.baseInstructions},...view.messages],tools:view.tools});return{calls:[{name:view.tools[0]!.function.name,args:{summary:'Reviewed',observations:[]}}]};});codex.create.mockImplementation(fixture.createClient);
   try{
     await saveWorkManifest(root,createWorkManifest({id:'film',title:'Relay',profileId:'interactive-film',language:'en'}));
     await mkdir(join(root,'works/film/source'),{recursive:true});
@@ -39,7 +41,7 @@ it('reviews a pinned graph with deterministic structural facts and persists the 
     const revision=artifact.revisions.find(r=>r.id===artifact.currentRevisionId)!;
     const extended=StoryGraphSchema.parse({...graph,nodes:[...graph.nodes,{id:'extra',type:'normal',choices:[]}]});
     await syncWorkSourceArtifacts({projectRoot:root,workId:'film',accept:true,writes:[{relativePath:'works/film/source/story-graph.json',content:JSON.stringify(extended)}]});
-    const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,apiFormat:'chat',stream:false,temperature:0,thinkingBudget:0});
+    const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:'https://fixture.invalid/v1',apiFormat:'chat',stream:false,temperature:0,thinkingBudget:0});
     const pipeline=new PipelineRunner({projectRoot:root,client,model:'fixture'});
     const reviewed=await createArtifactMethodTools(pipeline,root,'film')[0]!.execute('review',{artifactId:artifact.id,revisionId:revision.id,instruction:'Review this saved revision against the current requirements.'});
     expect(requests).toHaveLength(1);
@@ -47,21 +49,13 @@ it('reviews a pinned graph with deterministic structural facts and persists the 
     expect(input.structure).toMatchObject({revisionId:revision.id,targetHash:revision.checksum,nodeCount:2,longestObservedSimpleRoute:{choices:1},delivery:{status:'needs_revision',issues:expect.arrayContaining([{code:'FILM_NODE_COUNT',expected:3,actual:2}])}});
     const report=JSON.parse(await readFile(join(root,'works/film',(reviewed.details as {path:string}).path),'utf8'));
     expect(report.structure).toEqual(input.structure);
-  }finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));await rm(root,{recursive:true,force:true});}
+  }finally{await rm(root,{recursive:true,force:true});}
 },20000);
 
 it('reviews an explicit candidate snapshot without adopting it or unrelated source candidates', async () => {
   const root=await mkdtemp(join(tmpdir(),'inkos-candidate-review-'));
   const requests: Array<{messages: Array<{role: string; content: string}>}> = [];
-  const server=createServer(async(req,res)=>{
-    const chunks: Buffer[]=[]; for await(const chunk of req) chunks.push(Buffer.from(chunk));
-    requests.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-    const args={summary:'Candidate inspected',observations:[]};
-    res.writeHead(200,{'Content-Type':'text/event-stream'});
-    res.write(`data: ${JSON.stringify({id:'review',object:'chat.completion.chunk',choices:[{index:0,delta:{role:'assistant',tool_calls:[{index:0,id:'review-call',type:'function',function:{name:'submit_artifact_review',arguments:JSON.stringify(args)}}]},finish_reason:null}]})}\n\n`);
-    res.end(`data: ${JSON.stringify({id:'review',object:'chat.completion.chunk',choices:[{index:0,delta:{},finish_reason:'tool_calls'}]})}\n\ndata: [DONE]\n\n`);
-  });
-  server.listen(0,'127.0.0.1');await once(server,'listening');
+  const fixture=new CodexFixture(view=>{requests.push({messages:[{role:'system',content:view.thread.baseInstructions},...view.messages]});return{calls:[{name:'submit_artifact_review',args:{summary:'Candidate inspected',observations:[]}}]};});codex.create.mockImplementation(fixture.createClient);
   try {
     await saveWorkManifest(root,createWorkManifest({id:'candidate',title:'Candidate',profileId:'short-fiction',language:'en'}));
     const base=join(root,'works/candidate/source');await mkdir(base,{recursive:true});
@@ -69,7 +63,7 @@ it('reviews an explicit candidate snapshot without adopting it or unrelated sour
     await writeFile(join(base,'notes.md'),'Unaccepted planning notes.');
     const before=await syncWorkSourceArtifacts({projectRoot:root,workId:'candidate',accept:false});
     const target=before.artifacts.find(a=>a.revisions[0].path==='source/draft.md')!;
-    const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,apiFormat:'chat',stream:true,temperature:0,thinkingBudget:0});
+    const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:'https://fixture.invalid/v1',apiFormat:'chat',stream:true,temperature:0,thinkingBudget:0});
     const pipeline=new PipelineRunner({client,model:'fixture',projectRoot:root});
     const tool=createArtifactMethodTools(pipeline,root,'candidate')[0];
     await expect(tool.execute('missing',{artifactId:target.id,instruction:'Review candidate'})).rejects.toMatchObject({code:'ARTIFACT_REVISION_REQUIRED'});
@@ -103,20 +97,13 @@ it('reviews an explicit candidate snapshot without adopting it or unrelated sour
     expect(adopted.artifacts.find(a=>a.id===target.id)?.currentRevisionId).toBe(target.revisions[0].id);
     const notes=before.artifacts.find(a=>a.revisions[0].path==='source/notes.md')!;
     expect(adopted.artifacts.find(a=>a.id===notes.id)?.currentRevisionId).toBeNull();
-  } finally {server.closeAllConnections();await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));await rm(root,{recursive:true,force:true});}
+  } finally {await rm(root,{recursive:true,force:true});}
 },15000);
 
 it('reviews a sales package with the manuscript and outline versions used to create it', async () => {
   const root=await mkdtemp(join(tmpdir(),'inkos-package-sources-'));
   const requests:Array<{messages:Array<{role:string;content:string}>}>=[];
-  const server=createServer(async(req,res)=>{
-    const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));
-    requests.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-    res.writeHead(200,{'Content-Type':'text/event-stream'});
-    res.write(`data: ${JSON.stringify({id:'review',choices:[{index:0,delta:{role:'assistant',tool_calls:[{index:0,id:'review',type:'function',function:{name:'submit_artifact_review',arguments:JSON.stringify({summary:'Compared production sources',observations:[]})}}]},finish_reason:null}]})}\n\n`);
-    res.end(`data: ${JSON.stringify({id:'review',choices:[{index:0,delta:{},finish_reason:'tool_calls'}]})}\n\ndata: [DONE]\n\n`);
-  });
-  server.listen(0,'127.0.0.1');await once(server,'listening');
+  const fixture=new CodexFixture(view=>{requests.push({messages:[{role:'system',content:view.thread.baseInstructions},...view.messages]});return{calls:[{name:'submit_artifact_review',args:{summary:'Compared production sources',observations:[]}}]};});codex.create.mockImplementation(fixture.createClient);
   try {
     await saveWorkManifest(root,createWorkManifest({id:'package',title:'Receipt',profileId:'short-fiction',language:'en'}));
     await mkdir(join(root,'works/package/source'),{recursive:true});
@@ -126,7 +113,7 @@ it('reviews a sales package with the manuscript and outline versions used to cre
       {relativePath:'works/package/source/final/sales-package.md',content:'A young clerk proves who signed the receipt.'},
     ]});
     const artifact=work.artifacts.find(a=>a.revisions.some(r=>r.path==='source/final/sales-package.md'))!;
-    const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,apiFormat:'chat',stream:true,temperature:0,thinkingBudget:0});
+    const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:'https://fixture.invalid/v1',apiFormat:'chat',stream:true,temperature:0,thinkingBudget:0});
     const result=await createArtifactMethodTools(new PipelineRunner({client,model:'fixture',projectRoot:root}),root,work.id)[0]!.execute('review',{artifactId:artifact.id,instruction:'Check the package against its story.'});
     const input=JSON.parse([...requests[0]!.messages].reverse().find(m=>m.role==='user')!.content);
     expect(new Set(input.sources.map((source:{path:string})=>source.path))).toEqual(new Set(['source/final/sales-package.md','source/final/full.md','source/outline/v001.md']));
@@ -137,7 +124,7 @@ it('reviews a sales package with the manuscript and outline versions used to cre
     }
     expect(result.details).toMatchObject({kind:'artifact_reviewed',reviewedReferences:expect.any(Array)});
     expect((result.details as {reviewedReferences:unknown[]}).reviewedReferences).toHaveLength(2);
-  } finally {server.closeAllConnections();await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));await rm(root,{recursive:true,force:true});}
+  } finally {await rm(root,{recursive:true,force:true});}
 },15000);
 
 it('regenerates a cover into the active canonical Work and preserves its earlier image revision', async () => {
@@ -201,11 +188,7 @@ it('regenerates a cover into the active canonical Work and preserves its earlier
 it('revises selected Markdown lines with registered source material while preserving surrounding bytes and prior revisions',async()=>{
  const root=await mkdtemp(join(tmpdir(),'inkos-scoped-revision-'));let calls=0;
  const requests:Array<{messages:Array<{role:string,content:string}>}>=[];
- const server=createServer(async(req,res)=>{const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));requests.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));calls++;
-  const args={range_0_content:'Changed action.\nLast scene remains.\n'};res.writeHead(200,{'Content-Type':'text/event-stream'});
-  res.write(`data: ${JSON.stringify({id:'edit',object:'chat.completion.chunk',choices:[{index:0,delta:{role:'assistant',tool_calls:[{index:0,id:'edit-call',type:'function',function:{name:'submit_artifact_revision',arguments:JSON.stringify(args)}}]},finish_reason:null}]})}\n\n`);
-  res.end(`data: ${JSON.stringify({id:'edit',object:'chat.completion.chunk',choices:[{index:0,delta:{},finish_reason:'tool_calls'}]})}\n\ndata: [DONE]\n\n`);
- });server.listen(0,'127.0.0.1');await once(server,'listening');
+ const fixture=new CodexFixture(view=>{requests.push({messages:[{role:'system',content:view.thread.baseInstructions},...view.messages]});calls++;return{calls:[{name:'submit_artifact_revision',args:{range_0_content:'Changed action.\nLast scene remains.\n'}}]};});codex.create.mockImplementation(fixture.createClient);
  try{
   await saveWorkManifest(root,createWorkManifest({id:'script',title:'Script',profileId:'script',language:'en'}));
   await mkdir(join(root,'works/script/source'),{recursive:true});
@@ -214,7 +197,7 @@ it('revises selected Markdown lines with registered source material while preser
   const before=await syncWorkSourceArtifacts({projectRoot:root,workId:'script',accept:true,writes:[{relativePath:'works/script/source/script.md',content:source},{relativePath:'works/script/source/source-material.md',content:material}]});
   const artifact=before.artifacts.find(a=>a.revisions[0].path==='source/script.md')!;
   const reference=before.artifacts.find(a=>a.revisions[0].path==='source/source-material.md')!;
-  const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,apiFormat:'chat',stream:true,temperature:0,thinkingBudget:0});
+  const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:'https://fixture.invalid/v1',apiFormat:'chat',stream:true,temperature:0,thinkingBudget:0});
   const tool=createArtifactMethodTools(new PipelineRunner({client,model:'fixture',projectRoot:root}),root,'script')[1];
   await expect(tool.execute('invalid',{artifactId:artifact.id,instruction:'Change action',editRanges:[{startLine:3,endLine:8}]})).rejects.toMatchObject({code:'ARTIFACT_EDIT_RANGE_INVALID'});
   expect(calls).toBe(0);
@@ -236,5 +219,5 @@ it('revises selected Markdown lines with registered source material while preser
   expect(region.before.content).toBe(originalLines.slice(region.before.startLine-1,region.before.startLine-1+region.before.lineCount).join(''));
   const reconstructed=originalLines.slice(0,region.before.startLine-1).join('')+region.after.content+originalLines.slice(region.before.startLine-1+region.before.lineCount).join('');
   expect(reconstructed).toBe(await readFile(join(root,'works/script/source/script.md'),'utf8'));
- }finally{server.closeAllConnections();await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));await rm(root,{recursive:true,force:true});}
+ }finally{await rm(root,{recursive:true,force:true});}
 },15000);

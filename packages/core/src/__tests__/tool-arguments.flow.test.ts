@@ -1,16 +1,46 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent } from "@mariozechner/pi-agent-core";
-import { createAssistantMessageEventStream, type AssistantMessage, type ToolCall } from "@mariozechner/pi-ai";
-import { expect, it } from "vitest";
+import { Agent } from "../codex/agent.js";
+import { type ToolCall } from "@mariozechner/pi-ai";
+import { expect, it, vi } from "vitest";
 import { preserveToolArgumentTypes } from "../agent/tool-arguments.js";
 import { createAddVariableTool, createConnectChoiceTool, createSetWorldAnchorTool } from "../agent/film-authoring-tools.js";
 import { createLLMClient } from "../llm/provider.js";
 import { loadStoryGraph } from "../interactive-film/graph-store.js";
 import { initVarState, applyEffects, visibleChoices } from "../interactive-film/evaluator.js";
 
-it("persists original scalar types through Pi and rejects coercible invalid input before mutation", async () => {
+let fixtureCalls: ToolCall[] = [];
+vi.mock("../codex/client.js", () => ({ createCodexClient: async () => createFixtureClient() }));
+
+function createFixtureClient() {
+  const notifications = new Set<(method: string, params: unknown) => void>();
+  let handleRequest: ((method: string, params: unknown) => unknown) | undefined;
+  const notify = (method: string, params: unknown) => { for (const handler of notifications) handler(method, params); };
+  return {
+    cwd: "/tmp/isolated-codex-fixture",
+    onNotification(handler: (method: string, params: unknown) => void) { notifications.add(handler); return () => notifications.delete(handler); },
+    onRequest(handler: (method: string, params: unknown) => unknown) { handleRequest = handler; return () => { handleRequest = undefined; }; },
+    onClose() { return () => {}; },
+    async close() {},
+    async request(method: string) {
+      if (method === "account/read") return { account: { type: "chatgpt", email: "fixture@example.test", planType: "plus" }, requiresOpenaiAuth: false };
+    if (method === "model/list") return { data: [{ id: "fixture", model: "fixture", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "medium" }] }] };
+      if (method === "thread/start") return { thread: { id: "thread-fixture" }, model: "fixture" };
+      if (method === "turn/start") {
+        queueMicrotask(() => { void (async () => {
+          notify("turn/started", { threadId: "thread-fixture", turn: { id: "turn-fixture" } });
+          for (const call of fixtureCalls) await handleRequest?.("item/tool/call", { threadId: "thread-fixture", turnId: "turn-fixture", callId: call.id, tool: call.name, arguments: call.arguments });
+          notify("turn/completed", { threadId: "thread-fixture", turn: { id: "turn-fixture", status: "completed" } });
+        })(); });
+        return { turn: { id: "turn-fixture" } };
+      }
+      throw new Error(`Unexpected Codex fixture request: ${method}`);
+    },
+  };
+}
+
+it("persists original scalar types through Codex and rejects coercible invalid input before mutation", async () => {
   const root = await mkdtemp(join(tmpdir(), "inkos-tool-arguments-"));
   try {
     const values = [true, false, 1, 0, "1", "0"];
@@ -34,28 +64,14 @@ it("persists original scalar types through Pi and rejects coercible invalid inpu
       baseUrl: "https://example.invalid/v1", apiKey: "fixture", apiFormat: "chat",
       temperature: 0, stream: true, thinkingBudget: 0,
     });
-    let turns = 0;
+    fixtureCalls = calls;
     const agent = new Agent({
-      initialState: { model: client._piModel!, tools: [
+      projectRoot: root,
+      initialState: { model: client._piModel!, systemPrompt: "Apply fixture tools", messages: [], tools: [
         createAddVariableTool(root, "film"), createConnectChoiceTool(root, "film"),
         createSetWorldAnchorTool(root, "film"),
       ] },
       beforeToolCall: preserveToolArgumentTypes,
-      toolExecution: "sequential",
-      streamFn: (model) => {
-        const stream = createAssistantMessageEventStream();
-        const first = turns++ === 0;
-        const message: AssistantMessage = {
-          role: "assistant", content: first ? calls : [], model: model.id,
-          api: model.api, provider: model.provider, timestamp: Date.now(),
-          stopReason: first ? "toolUse" : "stop",
-          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-        };
-        stream.push({ type: "done", reason: first ? "toolUse" : "stop", message });
-        stream.end(message);
-        return stream;
-      },
     });
     await agent.prompt("Apply the supplied fixture changes.");
     const graph = (await loadStoryGraph(root, "film"))!;

@@ -1,4 +1,4 @@
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage } from "../codex/contracts.js";
 import { readTranscriptEvents } from "./session-transcript.js";
 import {
   BookSessionSchema,

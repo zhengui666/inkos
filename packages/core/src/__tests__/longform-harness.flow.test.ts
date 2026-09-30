@@ -1,10 +1,11 @@
+import { CodexFixture } from './codex-fixture.js';
+const codex = vi.hoisted(() => ({ create: vi.fn() }));
+vi.mock('../codex/client.js', () => ({ createCodexClient: codex.create }));
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import {readFileSync} from 'node:fs';
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {createServer} from 'node:http';
-import {once} from 'node:events';
 import {ComposerAgent} from '../agents/composer.js';
 import {PipelineRunner} from '../pipeline/runner.js';
 import {createLLMClient} from '../llm/provider.js';
@@ -88,17 +89,17 @@ describe("long-form harness mini-flow", () => {
     await mkdir(join(bookDir,'story/runtime'),{recursive:true});await writeFile(planPath,plan);
     const composer=vi.spyOn(ComposerAgent.prototype,'selectTaskContext').mockResolvedValue({chapter:1,selectedContext:[]});
     let calls=0;
-    const server=createServer(async(req,res)=>{
-      const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));const body=JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const fixture=new CodexFixture(view=>{
+      const body={tools:view.tools,messages:[{role:'system',content:view.thread.baseInstructions},...view.messages]};
       const name=body.tools[0].function.name;
       const delta=chapterOutput(1).runtimeStateDelta!;
       const {chapter:_chapter,...summary}=delta.chapterSummary!;
       const result=name==='submit_chapter_review'?{summary:'Reviewed the chapter.',observations:[]}:{postSettlement:'The witness leaves.',factOps:delta.factOps,hookOps:delta.hookOps,newHookCandidates:[],chapterSummary:summary};
-      calls++;res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({choices:[{finish_reason:'tool_calls',message:{tool_calls:[{id:'settle-'+calls,type:'function',function:{name,arguments:JSON.stringify(result)}}]}}]}));
+      calls++;return{calls:[{name,args:result}]};
     });
-    server.listen(0,'127.0.0.1');await once(server,'listening');
+    codex.create.mockImplementation(fixture.createClient);
     try{
-      const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,apiFormat:'chat',stream:false,temperature:0,thinkingBudget:0});
+      const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:'https://fixture.invalid/v1',apiFormat:'chat',stream:false,temperature:0,thinkingBudget:0});
       const pipeline=new PipelineRunner({projectRoot:root,client,model:'fixture'});
       const input={bookId:'replay',chapters:[{title:'Departure',content:chapterOutput(1).content}],resumeFrom:1};
       await expect(pipeline.importChapters({...input,chapters:[{title:'Empty boundary',content:' \n'}]}))
@@ -136,7 +137,7 @@ describe("long-form harness mini-flow", () => {
       expect(await readFile(planPath)).toEqual(plan);
       expect(composer.mock.calls.map(([request])=>request.chapterNumber)).toEqual([1,1,1]);
       expect(calls).toBe(3);
-    }finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}
+    }finally{codex.create.mockReset();}
   },20000);
 
   it.each([

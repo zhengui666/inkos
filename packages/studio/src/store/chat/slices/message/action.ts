@@ -226,13 +226,8 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
       };
     }),
 
-  setSelectedModel: (model, service) => set((state) => ({
-    selectedModel: model,
-    selectedService: service,
-    ...(state.activeSessionId
-      ? { sessions: updateSession(state.sessions, state.activeSessionId, () => ({ modelOverride: model, serviceOverride: service })) }
-      : {}),
-  })),
+  // Retained for legacy callers; Codex runtime settings are server-owned.
+  setSelectedModel: (model, service) => set({ selectedModel: model, selectedService: service }),
 
   loadSessionList: async (bookId) => {
     const query = bookId === null ? "null" : encodeURIComponent(bookId);
@@ -266,8 +261,6 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
         bookId,
         sessionKind,
         playMode,
-        ...(get().selectedModel ? { modelOverride: get().selectedModel } : {}),
-        ...(get().selectedService ? { serviceOverride: get().selectedService } : {}),
         ...binding,
       }),
     });
@@ -285,8 +278,8 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
         workId: data.session?.workId ?? binding?.workId,
         proposalAction: data.session?.proposalAction ?? binding?.proposalAction,
         playMode: data.session?.playMode,
-        modelOverride: data.session?.modelOverride ?? get().selectedModel ?? undefined,
-        serviceOverride: data.session?.serviceOverride ?? get().selectedService ?? undefined,
+        modelOverride: data.session?.modelOverride,
+        serviceOverride: data.session?.serviceOverride,
         title: data.session?.title ?? null,
       });
       return {
@@ -582,13 +575,6 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
       }));
     };
 
-    if (!get().selectedModel) {
-      get().addUserMessage(sessionId, formatUserMessageForDisplay(userInstruction, attachments));
-      get().addErrorMessage(sessionId, tr("请先选择一个模型", "Select a model first"));
-      rememberFailedSend();
-      return;
-    }
-
     // 草稿会话：第一条消息发送时才真正把 session 文件写到磁盘。
     // 后端 POST /sessions 支持接受客户端传入的 sessionId，所以 id 保持一致，
     // 前端 store 里的 runtime 不用 remount，只需要把 isDraft 翻成 false。
@@ -597,7 +583,7 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
         await fetchJson<SessionResponse>("/sessions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId, bookId: session.bookId, sessionKind, playMode, profileId, workId, proposalAction, modelOverride: get().selectedModel }),
+          body: JSON.stringify({ sessionId, bookId: session.bookId, sessionKind, playMode, profileId, workId, proposalAction }),
         });
         // 落盘成功：把 isDraft 翻成 false，同时把 sessionId 追加进 sessionIdsByBook
         // 让侧边栏现在才看到这条会话。
@@ -671,8 +657,6 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
           sessionId,
           clientRequestId: sourceRequestId,
           retryOfRequestId: options?.retryOfRequestId,
-          model: get().selectedModel ?? undefined,
-          service: get().selectedService ?? undefined,
         }),
       });
 
@@ -681,7 +665,7 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
       const responseToolExecutions = data.details?.toolExecutions ?? [];
       applyResponseSession(sessionId, data.session, workId ?? session.bookId);
       const hasStream = Boolean(
-        get().sessions[sessionId]?.messages.some((message) => message.timestamp === streamTs),
+        get().sessions[sessionId]?.messages.some((message) => message.role === "assistant" && message.timestamp === streamTs),
       );
       const attachResponseTools = () => {
         if (responseToolExecutions.length === 0) return;
@@ -774,7 +758,7 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
       // Always settle its remaining progress on transport failure; independent
       // background executions keep their own lifecycle.
       const hasStream = Boolean(
-        get().sessions[sessionId]?.messages.some((message) => message.timestamp === streamTs),
+        get().sessions[sessionId]?.messages.some((message) => message.role === "assistant" && message.timestamp === streamTs),
       );
       if (hasStream) {
         get().replaceStreamWithError(sessionId, streamTs, errorMessage);

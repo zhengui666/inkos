@@ -59,7 +59,7 @@ bookCommand
         if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
       }
 
-      const config = await loadConfig();
+      const config = await loadConfig({ requireApiKey: false });
       const now = new Date().toISOString();
       const book: BookConfig = {
         id: bookId,

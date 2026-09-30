@@ -1,9 +1,10 @@
-import { createServer } from "node:http";
-import { once } from "node:events";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
+import { CodexFixture } from "../../../core/src/__tests__/codex-fixture.js";
+const createCodexClient = vi.hoisted(() => vi.fn());
+vi.mock("../../../core/src/codex/client.js", () => ({ createCodexClient }));
 import { createInitialWorkManifestWrite, commitAtomicFileSet } from "@actalk/inkos-core";
 import { createStudioServer } from "../api/server.js";
 
@@ -11,21 +12,15 @@ it("runs a book-route session against a short Work with no long-form book.json",
   const root = await mkdtemp(join(tmpdir(), "inkos-short-session-"));
   let calls = 0;
   const releases: Array<() => void> = [];
-  const upstream = createServer(async (req, res) => {
-    for await (const _chunk of req) { /* Consume the real request. */ }
-    calls += 1;
-    await new Promise<void>(resolve => releases.push(resolve));
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ id: "fixture-response", choices: [{ message: { role: "assistant", tool_calls: [{ id: `finish-${calls}`, type: "function", function: { name: "finish_turn", arguments: JSON.stringify({ status: "answered", message: "Ready." }) } }] }, finish_reason: "tool_calls" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }));
+  const codex = new CodexFixture(async () => {
+    calls++;
+    await new Promise<void>((resolve) => releases.push(resolve));
+    return { calls: [{ name: "finish_turn", args: { status: "answered", message: "Ready." } }], usage: { input: 1, output: 1, total: 2 } };
   });
+  createCodexClient.mockImplementation(codex.createClient);
   try {
-    upstream.listen(0, "127.0.0.1"); await once(upstream, "listening");
-    const baseUrl = `http://127.0.0.1:${(upstream.address() as { port: number }).port}/v1`;
     await mkdir(join(root, ".inkos"));
-    await writeFile(join(root, "inkos.json"), JSON.stringify({ name: "fixture", version: "0.1.0", language: "en", llm: {
-      defaultModel: "fixture-model", services: [{ service: "custom", name: "fixture", baseUrl, apiFormat: "chat", stream: false, models: ["fixture-model"] }],
-    } }));
-    await writeFile(join(root, ".inkos/secrets.json"), JSON.stringify({ services: { "custom:fixture": { apiKey: "fixture" } } }));
+    await writeFile(join(root, "inkos.json"), JSON.stringify({ name: "fixture", version: "0.1.0", language: "en" }));
     const writes = [{ relativePath: "works/short/source/brief.md", content: "A short story." }];
     const initial = createInitialWorkManifestWrite({ workId: "short", title: "Short", profileId: "short-fiction", language: "en", writes });
     await commitAtomicFileSet({ rootDir: root, writes: [...writes, initial.write] });
@@ -56,8 +51,6 @@ it("runs a book-route session against a short Work with no long-form book.json",
     expect((await (await app.request(`/api/v1/sessions/${session.sessionId}`)).json()).chatRequest.status).toBe("cancelled");
   } finally {
     for (const release of releases) release();
-    upstream.closeAllConnections();
-    if (upstream.listening) await new Promise<void>((resolve, reject) => upstream.close(error => error ? reject(error) : resolve()));
     await rm(root, { recursive: true, force: true });
   }
 }, 20000);

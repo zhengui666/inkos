@@ -65,7 +65,7 @@ translateCommand
   .action(async (projectId: string, opts) => {
     try {
       const root = findProjectRoot();
-      const config = await loadConfig({ requireApiKey: true, projectRoot: root });
+      const config = await loadConfig({ requireApiKey: false, projectRoot: root });
       const configuredSkills = await loadAvailableAgentSkills({ projectRoot: root });
       const activatedSkills = resolveProfileSkillActivations(
         configuredSkills.skills,

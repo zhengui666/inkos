@@ -36,14 +36,18 @@ InkOS は、物語創作と多言語翻訳のための AI Agent システムで�
 
 > 💡 **主要モデルをキー 1 本で** —— InkOS には [**kkaiapi**](https://en.kkaiapi.com/) の併用がおすすめです。Claude / GPT / Gemini / DeepSeek / Kimi / Qwen / GLM と画像モデルを扱える OpenAI 互換ゲートウェイとして、base URL `https://api.kkaiapi.com/v1` をカスタムサービスに設定すれば、複数プロバイダーのアカウントを行き来せずに Studio でモデルを切り替えられます。
 
-## v2.0.0 統一 Pi Agent Harness と専門創作カーネル
+## Codex and ChatGPT sign-in
+
+Agents now run on the official Codex App Server. In Studio → Project settings → Codex, sign in with ChatGPT and select the model, reasoning effort, and supported speed. Agent chat no longer requires a legacy provider API key. Credentials stay server-side; standalone model/image services keep their existing provider settings. [Setup and security boundaries](docs/codex-runtime.md)
+
+## v2.0.0 統一 Codex Agent Harness と専門創作カーネル
 
 1.x からの移行は `inkos work migrate --json` で確認し、`inkos work migrate --apply` で実行します。書籍の既定値、ルール、状態スナップショットを変換し、元のディレクトリと未記入の履歴情報を保持します。旧執筆設定は原本に残り、2.0 は Profile の操作方針を使います。実行状態が不足する作品は、再構築が必要な下書きとして登録されます。
 
-InkOS 2.0 は、Chat Agent と各作品パイプラインを一つの pi-agent 中心 harness に統合します。モデルは理解・提案・能力呼び出しを担当し、InkOS は確認、コンテキスト、状態、原子的な保存、成果物の真実性を管理します。長編、短編、脚本、絵コンテ、インタラクティブ影遊、Play、翻訳は、それぞれの専門手法を保ちながら、実行・検索・観測・復旧基盤を共有します。
+InkOS 2.0 は、Chat Agent と各作品パイプラインを一つの Codex agent 中心 harness に統合します。モデルは理解・提案・能力呼び出しを担当し、InkOS は確認、コンテキスト、状態、原子的な保存、成果物の真実性を管理します。長編、短編、脚本、絵コンテ、インタラクティブ影遊、Play、翻訳は、それぞれの専門手法を保ちながら、実行・検索・観測・復旧基盤を共有します。
 
 - **モデル設定**：Studio はサービス設定、モデルルーティング、表紙サービス、[kkaiapi](https://en.kkaiapi.com/) / OpenRouter などのモデル集約入口、カスタム OpenAI-compatible エンドポイントに対応します。
-- **単一の production harness**：Studio Chat、TUI、`inkos interact`、production worker が pi-agent のツールループと型付き action/result 境界を共有します。既存 pipeline は並行する自然言語判断エンジンではなく、決定論的で中断可能な能力になります。
+- **単一の production harness**：Studio Chat、TUI、`inkos interact`、production worker が Codex agent のツールループと型付き action/result 境界を共有します。既存 pipeline は並行する自然言語判断エンジンではなく、決定論的で中断可能な能力になります。
 - **15 個の内蔵専門 Skills**：長編執筆 / レビュー、商業短編、Play、脚本、絵コンテ、インタラクティブ影遊、翻訳、分析、市場調査、取り込み、表紙、脱 AI 表現を専用 `SKILL.md` で提供します。
 - **統一本地検索**：物語メモリ、資料庫、Skill 参考資料を、再構築可能な SQLite FTS5 / BM25 投影で検索します。原本ファイルが正規データであり、検索結果には出典位置が残ります。
 - **書籍への参考資料バインド**：取り込んだ資料を用途付きで書籍に結び、タスクごとに関連部分だけを取得できます。
@@ -359,7 +363,7 @@ OpenAI Chat Completions、OpenAI Responses、Anthropic Messages、カスタム�
 
 ## 仕組み
 
-InkOS は pi-agent harness を共通の推論・ツール呼び出しカーネルとして使用します。Agent がユーザー意図を解釈して型付き action を生成し、host が決定論的ツールの実行、確認と権限、状態管理、実ファイルと tool result による完了判定を担当します。長編、短編、脚本、絵コンテ、インタラクティブ影遊、Play、翻訳はこの構造を共有しつつ、専用 Skill、状態モデル、制作工程を保持します。
+InkOS は Codex agent harness を共通の推論・ツール呼び出しカーネルとして使用します。Agent がユーザー意図を解釈して型付き action を生成し、host が決定論的ツールの実行、確認と権限、状態管理、実ファイルと tool result による完了判定を担当します。長編、短編、脚本、絵コンテ、インタラクティブ影遊、Play、翻訳はこの構造を共有しつつ、専用 Skill、状態モデル、制作工程を保持します。
 
 <p align="center">
   <img src="assets/arch-system.svg" width="900" alt="システム構成">
@@ -441,7 +445,7 @@ inkos review my-book --json
 inkos export my-book --format epub
 ```
 
-これらは既に確定したユーザー操作です。自然言語の意図は pi-agent Harness に入り、現在の Work Profile capability surface で解決されます。
+これらは既に確定したユーザー操作です。自然言語の意図は Codex agent Harness に入り、現在の Work Profile capability surface で解決されます。
 
 ### 3. 自然言語エージェントモード
 
@@ -555,7 +559,7 @@ pnpm typecheck    # 出力なしで型チェック
 
 ## 謝辞
 
-InkOS のエージェントランタイムは Mario Zechner 氏の [pi](https://github.com/badlogic/pi-mono)（`@mariozechner/pi-ai` と `@mariozechner/pi-agent-core`）の上に構築されています。堅実な土台を提供してくれた pi に感謝します。
+The agent runtime uses the official [Codex App Server](https://developers.openai.com/codex/app-server/). Standalone provider and image integrations retain [pi-ai](https://github.com/badlogic/pi-mono). Thanks to both open-source projects.
 
 ## ライセンス
 

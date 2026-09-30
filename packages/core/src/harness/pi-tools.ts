@@ -1,4 +1,4 @@
-import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentTool, AgentToolResult } from "../codex/contracts.js";
 import type { TSchema } from "@sinclair/typebox";
 import {
   type ActionResult,

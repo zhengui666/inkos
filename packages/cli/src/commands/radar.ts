@@ -13,7 +13,7 @@ radarCommand
   .option("--json", "Output JSON")
   .action(async (opts) => {
     try {
-      const config = await loadConfig();
+      const config = await loadConfig({ requireApiKey: false });
       const root = findProjectRoot();
 
       const pipeline = new PipelineRunner(buildPipelineConfig(config, root));

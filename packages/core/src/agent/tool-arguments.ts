@@ -1,4 +1,4 @@
-import type { BeforeToolCallContext } from "@mariozechner/pi-agent-core";
+import type { BeforeToolCallContext } from "../codex/contracts.js";
 import { Value } from "@sinclair/typebox/value";
 import type { TSchema } from "@sinclair/typebox";
 import { decodeStructuredFields } from "./structured-arguments.js";
@@ -18,9 +18,9 @@ export function toolArgumentIssues(schema: TSchema, value: unknown) {
 }
 
 /**
- * Pi validates a cloned argument object with scalar coercion enabled. A union
- * can therefore turn a valid boolean or numeric string into a number. Domain
- * actions must receive the original, schema-valid JSON types.
+ * Domain actions must receive the original, schema-valid JSON types. Do not
+ * allow a union schema to coerce a valid boolean or numeric string into a
+ * different scalar type at the Codex dynamic-tool boundary.
  */
 export async function preserveToolArgumentTypes(context: BeforeToolCallContext): Promise<undefined> {
   const tool = context.context.tools?.find((candidate) => candidate.name === context.toolCall.name);
@@ -32,7 +32,7 @@ export async function preserveToolArgumentTypes(context: BeforeToolCallContext):
       code: "TOOL_SCHEMA_INVALID", tool: tool.name, issues,
     })), { code: "TOOL_SCHEMA_INVALID" });
   }
-  // BeforeToolCall receives the same object Pi will pass to execute. Replace
+  // BeforeToolCall receives the same object the host will pass to execute. Replace
   // its values only after non-coercing validation; never guess missing values.
   const args = context.args;
   if (!args || typeof args !== "object" || Array.isArray(args)) {

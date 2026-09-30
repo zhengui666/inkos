@@ -1,7 +1,7 @@
 import { lstat, readFile, readdir } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { Type, type Static } from "@mariozechner/pi-ai";
-import type { AgentMessage, AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentMessage, AgentTool, AgentToolResult } from "../codex/contracts.js";
 import type { AgentSkill, SkillRegistry } from "../skills/index.js";
 import { safeChildPath } from "../utils/path-safety.js";
 import {

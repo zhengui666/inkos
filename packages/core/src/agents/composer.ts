@@ -1,3 +1,4 @@
+import { resolveCodexModel } from "../codex/model.js";
 import { readFile, mkdir, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { BaseAgent } from "./base.js";
@@ -578,7 +579,9 @@ async function loadReferenceContext(input: ComposeChapterInput): Promise<BookRef
 }
 
 export function contextBudgetFromClient(client: LLMClient): ContextBudget | undefined {
-  const contextWindowTokens = client._piModel?.contextWindow;
+  const contextWindowTokens = client._codex
+    ? resolveCodexModel(client._codex.settings).contextWindow
+    : client._piModel?.contextWindow;
   if (!Number.isFinite(contextWindowTokens) || !contextWindowTokens || contextWindowTokens <= 0) {
     return undefined;
   }

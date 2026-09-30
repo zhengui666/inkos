@@ -35,7 +35,7 @@ fanficCommand
   .option("--json", "Output JSON")
   .action(async (opts) => {
     try {
-      const config = await loadConfig();
+      const config = await loadConfig({ requireApiKey: false });
       const root = findProjectRoot();
 
       const mode = opts.mode as FanficMode;
@@ -123,7 +123,7 @@ fanficCommand
   .option("--json", "Output JSON")
   .action(async (bookIdArg: string | undefined, opts) => {
     try {
-      await loadConfig();
+      await loadConfig({ requireApiKey: false });
       const root = findProjectRoot();
       const bookId = await resolveBookId(bookIdArg, root);
       const { StateManager } = await import("@actalk/inkos-core");
@@ -161,7 +161,7 @@ fanficCommand
   .option("--json", "Output JSON")
   .action(async (bookIdArg: string | undefined, opts) => {
     try {
-      const config = await loadConfig();
+      const config = await loadConfig({ requireApiKey: false });
       const root = findProjectRoot();
       const bookId = await resolveBookId(bookIdArg, root);
       const { StateManager } = await import("@actalk/inkos-core");

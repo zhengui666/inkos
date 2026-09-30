@@ -1,9 +1,10 @@
-import { createServer } from "node:http";
-import { once } from "node:events";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
+import { CodexFixture } from "../../../core/src/__tests__/codex-fixture.js";
+const createCodexClient = vi.hoisted(() => vi.fn());
+vi.mock("../../../core/src/codex/client.js", () => ({ createCodexClient }));
 import { readTranscriptEvents } from "@actalk/inkos-core";
 import { createStudioServer } from "../api/server.js";
 import { ChatRequestStore } from "../api/chat-request-store.js";
@@ -11,20 +12,11 @@ import { ChatRequestStore } from "../api/chat-request-store.js";
 it("retains a failed submission across server recreation and exposes an interrupted request without replaying it", async () => {
   const root = await mkdtemp(join(tmpdir(), "inkos-chat-recovery-"));
   let calls = 0;
-  const upstream = createServer(async (req, res) => {
-    for await (const _chunk of req) { /* Exercise the actual HTTP adapter. */ }
-    calls++;
-    res.writeHead(401, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: { code: "fixture_unavailable", message: "Fixture rejected the request." } }));
-  });
+  const codex = new CodexFixture(() => { calls++; return { error: "Fixture rejected the request." }; });
+  createCodexClient.mockImplementation(codex.createClient);
   try {
-    upstream.listen(0, "127.0.0.1"); await once(upstream, "listening");
-    const baseUrl = `http://127.0.0.1:${(upstream.address() as { port: number }).port}/v1`;
     await mkdir(join(root, ".inkos"));
-    await writeFile(join(root, "inkos.json"), JSON.stringify({ name: "fixture", version: "0.1.0", language: "en", llm: {
-      defaultModel: "fixture-model", services: [{ service: "custom", name: "fixture", baseUrl, apiFormat: "chat", stream: false, models: ["fixture-model"] }],
-    } }));
-    await writeFile(join(root, ".inkos/secrets.json"), JSON.stringify({ services: { "custom:fixture": { apiKey: "fixture" } } }));
+    await writeFile(join(root, "inkos.json"), JSON.stringify({ name: "fixture", version: "0.1.0", language: "en" }));
     const app = createStudioServer({} as never, root);
     const post = (body: unknown) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const { session } = await (await app.request("/api/v1/sessions", post({ sessionKind: "chat" }))).json();
@@ -61,8 +53,6 @@ it("retains a failed submission across server recreation and exposes an interrup
     await restarted.request(`/api/v1/sessions/${session.sessionId}`, { method: "DELETE" });
     expect(await store.load(session.sessionId)).toBeNull();
   } finally {
-    upstream.closeAllConnections();
-    if (upstream.listening) await new Promise<void>((resolve, reject) => upstream.close(error => error ? reject(error) : resolve()));
     await rm(root, { recursive: true, force: true });
   }
 }, 20000);
