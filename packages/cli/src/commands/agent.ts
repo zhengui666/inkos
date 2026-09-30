@@ -14,7 +14,7 @@ export const agentCommand = new Command("agent")
   .option("--quiet", "Suppress non-JSON console output")
   .action(async (instruction: string, opts) => {
     try {
-      const config = await loadConfig();
+      const config = await loadConfig({ requireApiKey: false });
       const client = createClient(config);
       const root = findProjectRoot();
       const context = await resolveContext(opts);

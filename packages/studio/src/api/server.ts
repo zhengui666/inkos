@@ -10,6 +10,8 @@ import { ChatRequestStore } from "./chat-request-store.js";
 import type { ChatAttachmentPayload, StudioCompletionStatus } from "../shared/session-request.js";
 import {
   StateManager,
+  createCodexAccountService,
+  type CodexAccountService,
   recoverAtomicFileSets,
   commitAtomicFileSet,
   PipelineRunner,
@@ -33,8 +35,6 @@ import {
   resolveServiceProviderFamily,
   resolveServiceModelsBaseUrl,
   guessServiceFromBaseUrl,
-  resolveServiceModel,
-  ServiceApiKeyNotFoundError,
   LLMConfigurationError,
   loadSecrets,
   saveSecrets,
@@ -146,7 +146,6 @@ import {
   generateNodeImage,
   defaultNodeImageDeps,
   type NodeImageDeps,
-  type ResolvedModel,
   type PipelineConfig,
   type PlayMode,
   type ProjectConfig,
@@ -165,6 +164,7 @@ import { access, mkdir, readFile, readdir, rename, rm, stat, lstat, writeFile } 
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { isSafeBookId } from "./safety.js";
 import { ApiError } from "./errors.js";
+import { createCodexRoutes } from "./codex.js";
 import { buildStudioBookConfig, normalizeStudioPlatform } from "./book-create.js";
 import {
   deleteStudioTaskSnapshot,
@@ -2471,7 +2471,7 @@ async function probeServiceCapabilities(args: {
 
 // --- Server factory ---
 
-export function createStudioServer(initialConfig: ProjectConfig, root: string, overrides: { readonly nodeImageGenerator?: NodeImageDeps; readonly hostname?: string; readonly allowedOrigins?: readonly string[] } = {}) {
+export function createStudioServer(initialConfig: ProjectConfig, root: string, overrides: { readonly nodeImageGenerator?: NodeImageDeps; readonly hostname?: string; readonly allowedOrigins?: readonly string[]; readonly codexAccountService?: CodexAccountService } = {}) {
   const app = new Hono();
   const state = new StateManager(root);
   const recoveryStore = new CreativeEpisodeStore(join(root, ".inkos", "harness.sqlite"));
@@ -2637,6 +2637,8 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       500,
     );
   });
+
+  app.route("/api/v1/codex", createCodexRoutes(overrides.codexAccountService ?? createCodexAccountService({ projectDir: root })));
 
   // BookId validation middleware — blocks path traversal on all book routes
   app.use("/api/v1/books/:id/*", async (c, next) => {
@@ -4823,116 +4825,12 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         }
       };
 
-      // Resolve model — multi-service resolution
-      let resolvedModel: ResolvedModel["model"] | undefined;
-      let resolvedApiKey: string | undefined;
-
-      if (reqService && reqModel) {
-        // 1. Frontend explicitly selected a service+model — fail loudly if no key
-        try {
-          const configuredEntry = await resolveConfiguredServiceEntry(root, reqService);
-          const resolved = await resolveServiceModel(
-            reqService,
-            reqModel,
-            root,
-            await resolveConfiguredServiceBaseUrl(root, reqService),
-            configuredEntry?.apiFormat,
-          );
-          resolvedModel = resolved.model;
-          resolvedApiKey = resolved.apiKey;
-        } catch (e: unknown) {
-          if (e instanceof ServiceApiKeyNotFoundError) {
-            return c.json({
-              error: pick(language, `请先为 ${reqService} 配置 API Key`, `Configure an API Key for ${reqService} first`),
-              response: pick(
-                language,
-                `请先在模型配置中为 ${reqService} 填写 API Key，然后再试。`,
-                `Fill in an API Key for ${reqService} in the model settings, then try again.`,
-              ),
-            }, 400);
-          }
-          throw e;
-        }
-      }
-
-      if (!resolvedModel) {
-        // 2. Try defaultModel from new config format
-        const rawConfig = config.llm as unknown as Record<string, unknown>;
-        const defaultModel = rawConfig.defaultModel as string | undefined;
-        const servicesArr = normalizeServiceConfig(rawConfig.services);
-        const firstService = servicesArr[0];
-        if (firstService?.service && defaultModel && isTextChatModelId(defaultModel)) {
-          try {
-            const resolved = await resolveServiceModel(
-              serviceConfigKey(firstService),
-              defaultModel,
-              root,
-              firstService.baseUrl,
-              firstService.apiFormat,
-            );
-            resolvedModel = resolved.model;
-            resolvedApiKey = resolved.apiKey;
-          } catch { /* fall through */ }
-        }
-      }
-
-      if (!resolvedModel) {
-        // 3. Try first connected service from secrets
-        const secrets = await loadSecrets(root);
-        for (const [svcName, svcData] of Object.entries(secrets.services)) {
-          if (svcData?.apiKey) {
-            try {
-              const models = await listModelsForService(svcName, svcData.apiKey);
-              const textModels = filterTextChatModels(models);
-              if (textModels.length > 0) {
-                const configuredEntry = await resolveConfiguredServiceEntry(root, svcName);
-                const resolved = await resolveServiceModel(
-                  svcName,
-                  textModels[0].id,
-                  root,
-                  await resolveConfiguredServiceBaseUrl(root, svcName),
-                  configuredEntry?.apiFormat,
-                );
-                resolvedModel = resolved.model;
-                resolvedApiKey = resolved.apiKey;
-                break;
-              }
-            } catch { /* try next */ }
-          }
-        }
-      }
-
-      if (!resolvedModel) {
-        // 4. Use the already resolved effective project client.
-        resolvedModel = client._piModel
-          ? client._piModel
-          : { provider: config.llm.provider ?? "anthropic", modelId: config.llm.model } as any;
-        resolvedApiKey = client._apiKey;
-      }
-
-      const model = resolvedModel!;
-      const agentApiKey = resolvedApiKey;
-      const configuredEntry = reqService ? await resolveConfiguredServiceEntry(root, reqService) : undefined;
-
-      // Create pipeline with the frontend-selected model for capability workers.
-      // Don't spread config.llm — its baseUrl/provider belong to the old service.
-      // Let createLLMClient resolve baseUrl from the service preset.
-      const pipelineClient = (reqService && reqModel && resolvedModel)
-        ? createLLMClient({
-            ...config.llm,
-            service: configuredEntry?.service ?? reqService,
-            model: reqModel,
-            apiKey: resolvedApiKey ?? "",
-            ...(configuredEntry?.apiFormat ? { apiFormat: configuredEntry.apiFormat } : {}),
-            ...(configuredEntry?.stream !== undefined ? { stream: configuredEntry.stream } : {}),
-            baseUrl: configuredEntry?.baseUrl ?? "",
-          } as any)
-        : client;
-      // Only a structured action request can start a production task. Free text
-      // always stays in the Pi agent loop; the host never infers intent from prose.
+      // Both coordinator and confirmed production workers run through Codex.
+      // Legacy service selections must never gate a ChatGPT-authenticated task.
+      // Image/direct-provider tools resolve their own credentials when invoked.
       const confirmedIntent = requestedIntent && isConfirmedProductionAction(actionSource, requestedIntent)
-        ? requestedIntent
-        : undefined;
+        ? requestedIntent : undefined;
+      const pipelineClient = client;
       // 任务的 execution id 在构建 pipeline 之前生成并传入 executionIdForSSE：
       // 该 pipeline 广播的进度事件（log / llm:progress / context:compression）
       // 由此带上任务 id。同会话并行聊天轮的 pipeline 是另一次请求单独构建的、
@@ -4941,7 +4839,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 
       const pipeline = new PipelineRunner(await buildPipelineConfig({
         client: pipelineClient,
-        model: reqModel ?? config.llm.model,
+        model: config.llm.model,
         currentConfig: config,
         sessionIdForSSE: bookSession.sessionId,
         bookIdForSettings: activeBookId ?? undefined,
@@ -5070,8 +4968,6 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           const continuation = await runAgentSession({
             onWorkTransition: publishExecutionTarget,
             signal: taskController.signal,
-            model,
-            apiKey: agentApiKey,
             stream: pipelineClient.stream,
             proxyUrl: pipelineClient.proxyUrl,
             pipeline,
@@ -5204,8 +5100,8 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
               manualToolAssistantMessage(
                 message,
                 error.exec,
-                configuredEntry?.service ?? reqService ?? config.llm.provider,
-                reqModel ?? config.llm.model,
+                "openai-codex",
+                "codex",
               ),
             ], "", manualToolAppendOptions(sessionKind, error.exec)).catch(() => undefined);
             await refreshBookSessionFromTranscript().catch(() => undefined);
@@ -5226,7 +5122,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       // from the instruction; committed book/edit sessions keep the configured language.
       // Without this, an English request on a zh-default project gets Chinese replies — and
       // a Chinese play world, because play_start then infers from the rewritten premise.
-      // Run pi-agent session
+      // Run the Codex agent session
       // 后台生产任务与聊天并行时，把任务状态注入 agent 的系统提示词，
       // 让模型知道任务仍在运行、能回答进度、且不会重复发起同类任务；
       // 同时传 suppressProductionTools 在 host 层剔除会修改书籍/产物的
@@ -5237,8 +5133,6 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           signal: chatRequest?.controller.signal,
           baselineWork: chatRequest?.snapshot.baselineWork,
           onWorkTransition: publishExecutionTarget,
-          model,
-          apiKey: agentApiKey,
           stream: pipelineClient.stream,
           proxyUrl: pipelineClient.proxyUrl,
           pipeline,
@@ -6669,7 +6563,8 @@ export async function startStudioServer(
   await recoverAtomicFileSets(root, true);
   const config = await loadProjectConfig(root, { consumer: "studio", requireApiKey: false });
 
-  const app = createStudioServer(config, root, { hostname: options?.hostname, allowedOrigins: options?.allowedOrigins });
+  const codexAccountService = createCodexAccountService({ projectDir: root });
+  const app = createStudioServer(config, root, { hostname: options?.hostname, allowedOrigins: options?.allowedOrigins, codexAccountService });
 
   // Serve frontend static files — single process for API + frontend
   if (options?.staticDir) {
@@ -6712,5 +6607,11 @@ export async function startStudioServer(
 
   const hostname = options?.hostname?.trim() || "127.0.0.1";
   console.log(`InkOS Studio running on http://${hostname}:${port}`);
-  serve({ fetch: app.fetch, port, hostname });
+  const server = serve({ fetch: app.fetch, port, hostname });
+  server.once("close", () => {
+    void codexAccountService.dispose().catch(() => {
+      // Auth-related errors must never include raw process output or credentials.
+      console.warn("[studio] Codex account connection did not close cleanly.");
+    });
+  });
 }

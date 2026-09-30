@@ -259,7 +259,7 @@ export async function generatePlayImage(input: {
   try {
     if(input.prepareSceneBrief){
       const {llm}=await resolveEffectiveLLMConfig({consumer:'studio',projectRoot:input.root,envLayers:await loadLLMEnvLayers(input.root)});
-      const brief=await runWorkerAgentTool(createLLMClient(llm),llm.model,[
+      const brief=await runWorkerAgentTool(createLLMClient(llm,input.root),llm.model,[
         {role:'system',content:'Describe one illustration of the final current moment from the supplied reference. Follow the illustration guidance and explicit visual contract. Current moment and active possession/location facts take precedence over opening assumptions, earlier entity descriptions and earlier actions in the scene. Keep the established viewpoint and state explicitly where visible participants are relative to the camera and physical boundaries. Include only participants and objects visible from that viewpoint. Describe a still picture, not a sequence. Omit state identifiers, controls, unchosen options and off-screen history. Return one concise visual paragraph through the tool.'},
         {role:'user',content:sourcePrompt},
       ],{name:'submit_visual_brief',label:'Describe current illustration',description:'Submit an image prompt grounded in the current visible moment.',parameters:Type.Object({prompt:Type.String({minLength:1})})},{maxTokens:1400,signal:input.signal});

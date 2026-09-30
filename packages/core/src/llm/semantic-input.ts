@@ -1,3 +1,4 @@
+import { resolveCodexModel } from "../codex/model.js";
 import type { LLMClient } from "./provider.js";
 import { estimateTextTokens } from "./provider.js";
 
@@ -5,7 +6,9 @@ export function semanticInputBudget(
   client: LLMClient,
   options: { readonly reservedOutputTokens: number; readonly promptOverheadTokens?: number },
 ): number | undefined {
-  const contextWindow = client._piModel?.contextWindow;
+  const contextWindow = client._codex
+    ? resolveCodexModel(client._codex.settings).contextWindow
+    : client._piModel?.contextWindow;
   if (!contextWindow || !Number.isFinite(contextWindow)) return undefined;
   const overhead = options.promptOverheadTokens ?? 4096;
   return Math.max(1, contextWindow - options.reservedOutputTokens - overhead);

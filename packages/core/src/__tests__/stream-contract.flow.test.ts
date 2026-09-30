@@ -1,7 +1,8 @@
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { Type } from "@sinclair/typebox";
-import { expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { CodexFixture } from "./codex-fixture.js";
 import { createLLMClient } from "../llm/provider.js";
 import { BaseAgent } from "../agents/base.js";
 import type { StreamProgress } from "../llm/provider.js";
@@ -9,6 +10,13 @@ import { guardedPiStream, guardedPiNonStreaming } from "../agent/pi-stream.js";
 import { withExecutionEvidence } from "../harness/execution-evidence.js";
 import { compileHarnessContextText } from "../agent/agent-session.js";
 import { runWorkerAgentTool } from "../agent/worker-agent.js";
+
+// These transport fixtures bind loopback only and must not inherit a developer's
+// outbound proxy configuration. Codex protocol fixtures do not perform HTTP.
+beforeEach(() => {
+  for (const name of ['INKOS_LLM_PROXY_URL', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']) vi.stubEnv(name, '');
+});
+afterEach(() => vi.unstubAllEnvs());
 
 it.each([true, false])('enforces required tool selection without rejecting an ordinary answer (stream=%s)', async (streaming) => {
   const received: Array<{ tool_choice?: unknown }> = [];
@@ -53,30 +61,6 @@ it.each([true, false])('enforces required tool selection without rejecting an or
   } finally { server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
 }, 15000);
 
-it.each([true, false])('ends exhausted empty responses at the transport boundary without a schema-repair loop (stream=%s)', async (stream) => {
-  let requests = 0;
-  const server = createServer(async (request, response) => {
-    for await (const _chunk of request) { /* consume the request */ }
-    requests++;
-    const finishReason = requests === 1 ? 'length' : 'stop';
-    if (stream) {
-      response.writeHead(200, {'Content-Type':'text/event-stream'});
-      response.write(`data: ${JSON.stringify({id:'blank',object:'chat.completion.chunk',choices:[{index:0,delta:{role:'assistant',content:requests===1?'':' \n\t'},finish_reason:finishReason}]})}\n\n`);
-      response.end('data: [DONE]\n\n');
-    } else {
-      response.writeHead(200, {'Content-Type':'application/json'});
-      response.end(JSON.stringify({choices:[{message:{role:'assistant',content:requests===1?'':' \n\t'},finish_reason:finishReason}]}));
-    }
-  });
-  server.listen(0,'127.0.0.1'); await once(server,'listening');
-  try {
-    const client = createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,apiFormat:'chat',stream,temperature:0,thinkingBudget:0});
-    await expect(runWorkerAgentTool(client,'fixture',[{role:'user',content:'Submit the value.'}],{
-      name:'submit_value',label:'Submit',description:'Submit the result',parameters:Type.Object({value:Type.Number()}),
-    },{maxTokens:128})).rejects.toMatchObject({code:'MODEL_EMPTY_RESPONSE',attempts:1});
-    expect(requests).toBe(2);
-  } finally {server.closeAllConnections();await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));}
-},15000);
 it.each(["chat", "responses", "anthropic"] as const)("carries the required result tool through the real Pi %s streaming HTTP boundary", async (apiFormat) => {
   const submitted = { value: 2, flags: [true, false, 1, 0, "1", "0"] };
   const requests: Array<{tool_choice: unknown; max_tokens?: number; max_completion_tokens?: number; max_output_tokens?: number; input?: unknown; thinking?: unknown; messages: unknown}> = [];
@@ -120,23 +104,16 @@ it.each(["chat", "responses", "anthropic"] as const)("carries the required resul
   try {
     const address = server.address() as { port: number };
     const client = createLLMClient({ service: "custom", configSource: "studio", provider: "openai", model: "deepseek-v4-flash", baseUrl: `http://127.0.0.1:${address.port}/v1`, apiKey: "fixture-key", apiFormat, stream: true, temperature: 0, thinkingBudget: 0 });
-    const progress: StreamProgress[] = [];
-    class FixtureAgent extends BaseAgent {
-      get name() { return "fixture"; }
-      async submit() {
-        return (await this.submitStructured([{role:"user",content:"Submit the requested integer."}], {
-          name:"submit_value",label:"Submit",description:"Submit values",parameters:Type.Object({
-            value:Type.Integer(), flags:Type.Array(Type.Union([Type.Number(),Type.String(),Type.Boolean()])),
-          }),
-        }, {maxTokens:128})).result;
-      }
-    }
-    const result = await new FixtureAgent({client:{...client,defaults:{...client.defaults,maxTokens:client._piModel!.contextWindow-1}},
-      model:"deepseek-v4-flash",projectRoot:"/tmp",onStreamProgress:value=>progress.push(value),
-    }).submit();
-    expect(result).toEqual(submitted);
-    expect(progress.at(-1)?.status).toBe("done");
-    expect(progress.at(-1)?.totalChars).toBeGreaterThan(0);
+    const options = {apiKey:'fixture-key',maxTokens:128,toolChoice:'required'};
+    const stream = guardedPiStream(client._piModel!, { messages: [{role:'user',content:'Submit the requested integer.',timestamp:1}],
+      tools: [{name:'submit_value',description:'Submit values',parameters:Type.Object({
+        value:Type.Integer(),flags:Type.Array(Type.Union([Type.Number(),Type.String(),Type.Boolean()])),
+      })}],
+    }, options);
+    for await (const _event of stream) {}
+    expect((await stream.result()).content).toEqual(expect.arrayContaining([
+      expect.objectContaining({type:'toolCall',name:'submit_value',arguments:submitted}),
+    ]));
     expect(requests).toHaveLength(2);
     expect(requests[0]?.messages).toEqual(requests[1]?.messages);
     if (apiFormat === "anthropic") {
@@ -180,126 +157,126 @@ it("records received partial tool output when a live stream is cancelled", async
   } finally { server.closeAllConnections();await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve())); }
 },15000);
 
-it('bounds invalid structured submissions and returns schema paths instead of echoing the entire manuscript',async()=>{
-  const requests:Array<{messages:Array<{role:string;content:string}>}>=[];
-  const server=createServer(async(request,response)=>{
-    const chunks=[];for await(const chunk of request)chunks.push(chunk);
-    requests.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-    response.writeHead(200,{'Content-Type':'text/event-stream'});
-    const send=(choices:unknown)=>response.write(`data: ${JSON.stringify({id:'invalid',object:'chat.completion.chunk',choices})}\n\n`);
-    send([{index:0,delta:{role:'assistant',tool_calls:[{index:0,id:'call-'+requests.length,type:'function',function:{name:'submit_chapters',arguments:JSON.stringify({chapters:'[{malformed JSON}]',state:'other'})}}]},finish_reason:null}]);
-    send([{index:0,delta:{},finish_reason:'tool_calls'}]);response.end('data: [DONE]\n\n');
-  });
-  server.listen(0,'127.0.0.1');await once(server,'listening');
-  try{
-    const client=createLLMClient({service:'custom',configSource:'studio',provider:'openai',model:'test-model',baseUrl:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,apiKey:'fixture',apiFormat:'chat',stream:true,temperature:0,thinkingBudget:0});
-    await expect(runWorkerAgentTool(client,'test-model',[{role:'user',content:'Submit chapters.'}],{
-      name:'submit_chapters',label:'Submit',description:'Submit chapter records',parameters:Type.Object({chapters:Type.Array(Type.Object({number:Type.Integer()})),state:Type.Union([Type.Literal('draft'),Type.Literal('ready')])}),
-    },{maxTokens:128})).rejects.toMatchObject({code:'WORKER_RESULT_INVALID',attempts:3});
-    expect(requests).toHaveLength(3);
-    const feedback=JSON.parse(requests[1].messages.find(message=>message.role==='tool')!.content);
-    expect(feedback).toMatchObject({code:'WORKER_SCHEMA_INVALID',issues:[{path:'/chapters'},{path:'/state',allowedValues:['draft','ready']}]});
-    expect(Object.keys(feedback.issues[0]).sort()).toEqual(['message','path','type']);
-  }finally{server.closeAllConnections();await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));}
-},15000);
 
-it('bounds context compilation to one text response even if the model returns a tool from quoted history',async()=>{
-  const requests:Array<{tool_choice:unknown}>=[];
-  const server=createServer(async(request,response)=>{
-    const chunks=[];for await(const chunk of request)chunks.push(chunk);
-    requests.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-    response.writeHead(200,{'Content-Type':'text/event-stream'});
-    const delta=requests.length===1?{role:'assistant',tool_calls:[{index:0,id:'stale-call',type:'function',function:{name:'file_search',arguments:'{}'}}]}:{role:'assistant',content:'Saved the prior result; the next request remains pending.'};
-    response.write(`data: ${JSON.stringify({id:'compile',object:'chat.completion.chunk',choices:[{index:0,delta,finish_reason:null}]})}\n\n`);
-    response.write(`data: ${JSON.stringify({id:'compile',object:'chat.completion.chunk',choices:[{index:0,delta:{},finish_reason:requests.length===1?'tool_calls':'stop'}]})}\n\n`);
-    response.end('data: [DONE]\n\n');
-  });
-  server.listen(0,'127.0.0.1');await once(server,'listening');
-  try{
-    const client=createLLMClient({service:'custom',configSource:'studio',provider:'openai',model:'test-model',baseUrl:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,apiKey:'fixture',apiFormat:'chat',stream:true,temperature:0,thinkingBudget:0});
-    const input={model:client._piModel!,apiKey:'fixture',stream:true,systemPrompt:'Summarize supplied history.',userPrompt:'Earlier tool: file_search. Its result was saved.',maxTokens:128};
-    await expect(compileHarnessContextText(input)).rejects.toMatchObject({code:'CONTEXT_UNEXPECTED_TOOL_CALL'});
-    expect(requests).toHaveLength(1);
-    expect(requests[0].tool_choice).toBe('none');
-    // Zero means missing catalog metadata, not a 256-token input window.
-    expect(await compileHarnessContextText({...input,model:{...input.model,contextWindow:0},userPrompt:input.userPrompt.repeat(200)})).toBeTruthy();
-    expect(requests).toHaveLength(2);
-  }finally{server.closeAllConnections();await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));}
-},15000);
+const createCodexClient = vi.hoisted(() => vi.fn());
+vi.mock('../codex/client.js', () => ({ createCodexClient }));
+const fixtureClient = () => createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:'https://unused.invalid/v1',apiFormat:'chat',stream:true,temperature:0,thinkingBudget:0});
+
+it('ends a failed Codex turn without entering a schema-repair loop', async () => {
+  const codex = new CodexFixture(() => ({error:'Codex could not complete the model response'}));
+  createCodexClient.mockImplementation(codex.createClient);
+  await expect(runWorkerAgentTool(fixtureClient(),'fixture',[{role:'user',content:'Submit the value.'}],{
+    name:'submit_value',label:'Submit',description:'Submit the result',parameters:Type.Object({value:Type.Number()}),
+  },{maxTokens:128})).rejects.toMatchObject({code:'WORKER_MODEL_ERROR',attempts:1});
+  expect(codex.turns).toHaveLength(1);
+  expect(codex.toolResponses).toHaveLength(0);
+});
+
+it('bounds empty completed Codex turns without accepting a missing structured result', async () => {
+  const codex = new CodexFixture(() => ({text:' '}));
+  createCodexClient.mockImplementation(codex.createClient);
+  await expect(runWorkerAgentTool(fixtureClient(),'fixture',[{role:'user',content:'Submit the value.'}],{
+    name:'submit_value',label:'Submit',description:'Submit the result',parameters:Type.Object({value:Type.Number()}),
+  })).rejects.toMatchObject({code:'WORKER_RESULT_MISSING',attempts:3});
+  expect(codex.turns).toHaveLength(3);
+  expect(codex.toolResponses).toHaveLength(0);
+});
+
+it('carries the required result schema through Codex dynamic tools and preserves union scalar types', async () => {
+  const submitted={value:2,flags:[true,false,1,0,'1','0']};
+  const progress: StreamProgress[]=[];
+  const codex=new CodexFixture(()=>({text:'Submitting the requested values.',calls:[{name:'submit_value',args:submitted}]}));
+  createCodexClient.mockImplementation(codex.createClient);
+  class FixtureAgent extends BaseAgent {
+    get name(){return 'fixture';}
+    async submit(){return (await this.submitStructured([{role:'user',content:'Submit the requested integer.'}],{
+      name:'submit_value',label:'Submit',description:'Submit values',parameters:Type.Object({value:Type.Integer(),flags:Type.Array(Type.Union([Type.Number(),Type.String(),Type.Boolean()]))}),
+    },{maxTokens:128})).result;}
+  }
+  expect(await new FixtureAgent({client:fixtureClient(),model:'fixture',projectRoot:'/tmp',onStreamProgress:value=>progress.push(value)}).submit()).toEqual(submitted);
+  expect(progress.at(-1)?.status).toBe('done');
+  expect(progress.at(-1)?.totalChars).toBeGreaterThan(0);
+  const thread=codex.requests.find(request=>request.method==='thread/start')!.params;
+  expect(thread).toMatchObject({model:'fixture',ephemeral:true,approvalPolicy:'never',sandbox:'read-only'});
+  expect(codex.requests.find(request=>request.method==='turn/start')?.params.effort).toBe('medium');
+  expect(thread.dynamicTools).toHaveLength(1);
+  expect(thread.dynamicTools[0]).toMatchObject({name:'submit_value',inputSchema:{required:['value','flags']}});
+  expect(thread.baseInstructions).toContain('Finish by calling submit_value exactly once');
+  expect(codex.toolResponses).toHaveLength(1);
+  expect(codex.toolResponses[0].response.success).toBe(true);
+  expect(codex.requests.some(request=>request.method==='turn/interrupt')).toBe(true);
+});
+
+it('bounds invalid structured submissions and returns schema paths instead of echoing the entire manuscript',async()=>{
+  const codex=new CodexFixture(()=>({calls:[{name:'submit_chapters',args:{chapters:'[{malformed JSON}]',state:'other'}}]}));
+  createCodexClient.mockImplementation(codex.createClient);
+  await expect(runWorkerAgentTool(fixtureClient(),'fixture',[{role:'user',content:'Submit chapters.'}],{
+    name:'submit_chapters',label:'Submit',description:'Submit chapter records',parameters:Type.Object({chapters:Type.Array(Type.Object({number:Type.Integer()})),state:Type.Union([Type.Literal('draft'),Type.Literal('ready')])}),
+  },{maxTokens:128})).rejects.toMatchObject({code:'WORKER_RESULT_INVALID',attempts:3});
+  expect(codex.toolResponses).toHaveLength(3);
+  const feedback=JSON.parse(codex.toolResponses[0].response.contentItems[0].text);
+  expect(feedback).toMatchObject({code:'WORKER_SCHEMA_INVALID',issues:[{path:'/chapters'},{path:'/state',allowedValues:['draft','ready']}]});
+  expect(Object.keys(feedback.issues[0]).sort()).toEqual(['message','path','type']);
+  expect(codex.requests.filter(request=>request.method==='turn/start')).toHaveLength(1);
+});
+
+it('bounds context compilation to one text response even if Codex attempts a tool from quoted history',async()=>{
+  const codex=new CodexFixture(({step})=>step===1
+    ? {calls:[{name:'file_search',args:{}}],complete:true}
+    : {text:'Saved the prior result; the next request remains pending.'});
+  createCodexClient.mockImplementation(codex.createClient);
+  const client=fixtureClient();
+  const input={model:client._piModel!,apiKey:'fixture',stream:true,systemPrompt:'Summarize supplied history.',userPrompt:'Earlier tool: file_search. Its result was saved.',maxTokens:128};
+  await expect(compileHarnessContextText(input)).rejects.toMatchObject({code:'CONTEXT_UNEXPECTED_TOOL_CALL'});
+  expect(codex.turns).toHaveLength(1);
+  expect(codex.turns[0].thread.dynamicTools).toEqual([]);
+  expect(codex.toolResponses[0].response).toMatchObject({success:false});
+  expect(await compileHarnessContextText({...input,model:{...input.model,contextWindow:0},userPrompt:input.userPrompt.repeat(200)})).toBeTruthy();
+  expect(codex.turns).toHaveLength(2);
+});
 
 it('recovers an empty source selection with its address and materializes exact source punctuation', async () => {
-  const { SourcedReviewToolSchema } = await import('../agents/review-tool.js');
-  const { numberReviewSource, resolveObservationSources } = await import('../models/observation.js');
-  const source = '# Source\n\n他说：“等一下。”\n下一段。';
-  const sources = new Map([['source-a', source]]);
+  const {SourcedReviewToolSchema}=await import('../agents/review-tool.js');
+  const {numberReviewSource,resolveObservationSources}=await import('../models/observation.js');
+  const source='# Source\n\n他说：“等一下。”\n下一段。';
+  const sources=new Map([['source-a',source]]);
   expect(resolveObservationSources([{code:'comparison',summary:'Missing baseline',assessment:'unavailable',evidence:[],sourceRefs:[]}],sources)).toMatchObject([{assessment:'unavailable',sourceRefs:[]}]);
   expect(()=>resolveObservationSources([{code:'finding',summary:'Unsupported issue',assessment:'issue',evidence:[],sourceRefs:[]}],sources)).toThrow();
-  const requests: Array<{messages:Array<{role:string;content:string}>}> = [];
-  const server = createServer(async (request, response) => {
-    const chunks=[]; for await(const chunk of request)chunks.push(chunk);
-    requests.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-    response.writeHead(200, {'Content-Type':'text/event-stream'});
-    const argumentsValue = {summary:'Scoped result',observations:[{code:'finding',summary:'Source-backed finding',assessment:'observation',evidence:[],sourceRefs:[{sourceId:'source-a',startLine:requests.length===1?2:3,endLine:requests.length===1?2:3}]}]};
-    const call={id:'call-'+requests.length,type:'function',index:0,function:{name:'submit_review',arguments:JSON.stringify(argumentsValue)}};
-    response.write(`data: ${JSON.stringify({id:'review',object:'chat.completion.chunk',choices:[{index:0,delta:{role:'assistant',tool_calls:[call]},finish_reason:null}]})}\n\n`);
-    response.end(`data: ${JSON.stringify({id:'review',object:'chat.completion.chunk',choices:[{index:0,delta:{},finish_reason:'tool_calls'}]})}\n\ndata: [DONE]\n\n`);
-  });
-  server.listen(0,'127.0.0.1'); await once(server,'listening');
-  try {
-    const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,apiFormat:'chat',stream:true,temperature:0,thinkingBudget:0});
-    const result=await runWorkerAgentTool(client,'fixture',[{role:'user',content:numberReviewSource(source)}],{
-      name:'submit_review',label:'Submit',description:'Submit addressed findings',parameters:SourcedReviewToolSchema,
-      validate:result=>({...result,observations:resolveObservationSources(result.observations,sources)}),
-    },{maxTokens:1024});
-    expect(result.observations[0].sourceRefs).toEqual([{sourceId:'source-a',quote:source.split('\n')[2]}]);
-    expect(requests).toHaveLength(2);
-    const error=JSON.parse(requests[1].messages.find(message=>message.role==='tool')!.content);
-    expect(error).toMatchObject({code:'REVIEW_SOURCE_REQUIRED',path:'/observations/0/sourceRefs/0',sourceId:'source-a',startLine:2,endLine:2,lineCount:4,nearbyLines:expect.arrayContaining([{line:3,text:source.split('\n')[2]}])});
-  } finally {
-    server.closeAllConnections(); await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));
-  }
-},15000);
+  const codex=new CodexFixture(({step})=>({calls:[{name:'submit_review',args:{summary:'Scoped result',observations:[{code:'finding',summary:'Source-backed finding',assessment:'observation',evidence:[],sourceRefs:[{sourceId:'source-a',startLine:step===1?2:3,endLine:step===1?2:3}]}]}}]}));
+  createCodexClient.mockImplementation(codex.createClient);
+  const result=await runWorkerAgentTool(fixtureClient(),'fixture',[{role:'user',content:numberReviewSource(source)}],{
+    name:'submit_review',label:'Submit',description:'Submit addressed findings',parameters:SourcedReviewToolSchema,
+    validate:result=>({...result,observations:resolveObservationSources(result.observations,sources)}),
+  },{maxTokens:1024});
+  expect(result.observations[0].sourceRefs).toEqual([{sourceId:'source-a',quote:source.split('\n')[2]}]);
+  expect(codex.toolResponses).toHaveLength(2);
+  const error=JSON.parse(codex.toolResponses[0].response.contentItems[0].text);
+  expect(error).toMatchObject({code:'REVIEW_SOURCE_REQUIRED',path:'/observations/0/sourceRefs/0',sourceId:'source-a',startLine:2,endLine:2,lineCount:4,nearbyLines:expect.arrayContaining([{line:3,text:source.split('\n')[2]}])});
+});
 
 it('repairs an oversized checkpoint through bounded flat chapter submissions before completing the draft', async () => {
-  const { ShortFictionWriterAgent } = await import('../agents/short-fiction.js');
-  const requests: Array<{tools:Array<{function:{name:string}}>;messages:Array<{role:string;content:string}>}> = [];
-  const checkpoints: number[][]=[];
-  const server=createServer(async (request,response)=>{
-    const chunks=[];for await(const chunk of request)chunks.push(chunk);
-    requests.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-    const number=requests.length===1?1:requests.length-1;
-    response.writeHead(200,{'Content-Type':'text/event-stream'});
-    const args={title:`Chapter ${number}`,content:requests.length===1?Array(20).fill('word').join(' '):`A complete scene for chapter ${number}.`};
-    response.write(`data: ${JSON.stringify({id:'chapter',object:'chat.completion.chunk',choices:[{index:0,delta:{role:'assistant',tool_calls:[{id:'chapter-'+number,index:0,type:'function',function:{name:'submit_short_revision_chapter',arguments:JSON.stringify(args)}}]},finish_reason:null}]})}\n\n`);
-    response.end(`data: ${JSON.stringify({id:'chapter',object:'chat.completion.chunk',choices:[{index:0,delta:{},finish_reason:'tool_calls'}]})}\n\ndata: [DONE]\n\n`);
+  const {ShortFictionWriterAgent}=await import('../agents/short-fiction.js');
+  const checkpoints:number[][]=[];
+  const codex=new CodexFixture(({step})=>{
+    const number=step===1?1:step-1;
+    return {calls:[{name:'submit_short_revision_chapter',args:{title:`Chapter ${number}`,content:step===1?Array(20).fill('word').join(' '):`A complete scene for chapter ${number}.`}}]};
   });
-  server.listen(0,'127.0.0.1');await once(server,'listening');
-  try {
-    const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,apiFormat:'chat',stream:true,temperature:0,thinkingBudget:0});
-    const draft=await new ShortFictionWriterAgent({client,model:'fixture',projectRoot:'/tmp'}).continueDraft({direction:'Fixture',outlineMarkdown:'Two connected scenes.',chapterCount:2,charsPerChapter:10,maxChapterLength:10,maxChaptersPerCall:2,language:'en',draft:{storyTitle:'Fixture',rawContent:'',chapters:[{number:1,title:'Prior candidate',content:Array(30).fill('word').join(' '),charCount:1},{number:2,title:'',content:'',charCount:0}]},onBatchComplete:async(_draft,numbers)=>{checkpoints.push([...numbers]);}});
-    expect(draft.chapters.map(chapter=>chapter.number)).toEqual([1,2]);
-    expect(checkpoints).toEqual([[],[1],[1,2]]);
-    expect(requests.map(request=>request.tools[0].function.name)).toEqual(['submit_short_revision_chapter','submit_short_revision_chapter','submit_short_revision_chapter']);
-    expect(JSON.parse(requests[1].messages.find(message=>message.role==='tool')!.content)).toMatchObject({code:'SHORT_CHAPTER_TOO_LONG',maxChapterLength:10,chapters:[{number:1,length:20}]});
-    expect(draft.chapters.map(chapter=>chapter.charCount)).toEqual([6,6]);
-  } finally {server.closeAllConnections();await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));}
-},15000);
+  createCodexClient.mockImplementation(codex.createClient);
+  const draft=await new ShortFictionWriterAgent({client:fixtureClient(),model:'fixture',projectRoot:'/tmp'}).continueDraft({direction:'Fixture',outlineMarkdown:'Two connected scenes.',chapterCount:2,charsPerChapter:10,maxChapterLength:10,maxChaptersPerCall:2,language:'en',draft:{storyTitle:'Fixture',rawContent:'',chapters:[{number:1,title:'Prior candidate',content:Array(30).fill('word').join(' '),charCount:1},{number:2,title:'',content:'',charCount:0}]},onBatchComplete:async(_draft,numbers)=>{checkpoints.push([...numbers]);}});
+  expect(draft.chapters.map(chapter=>chapter.number)).toEqual([1,2]);
+  expect(checkpoints).toEqual([[],[1],[1,2]]);
+  expect(codex.turns.map(turn=>turn.thread.dynamicTools[0].name)).toEqual(['submit_short_revision_chapter','submit_short_revision_chapter','submit_short_revision_chapter']);
+  expect(JSON.parse(codex.toolResponses[0].response.contentItems[0].text)).toMatchObject({code:'SHORT_CHAPTER_TOO_LONG',maxChapterLength:10,chapters:[{number:1,length:20}]});
+  expect(draft.chapters.map(chapter=>chapter.charCount)).toEqual([6,6]);
+});
 
 it('requests only prose when keeping choices and retains option regeneration as a separate operation',async()=>{
- const {PlayTurnAgent}=await import('../play/play-agents.js');
- const requests:Array<{tools:Array<{function:{parameters:{properties:Record<string,unknown>}}}>}>=[];
- const server=createServer(async(req,res)=>{const chunks=[];for await(const chunk of req)chunks.push(chunk);const body=JSON.parse(Buffer.concat(chunks).toString('utf8'));requests.push(body);
-  const args={sceneText:'The player waits by the gate.',...(body.tools[0].function.parameters.properties.suggestedActions?{suggestedActions:['Advance','Watch']}: {})};
-  res.writeHead(200,{'Content-Type':'text/event-stream'});
-  res.write(`data: ${JSON.stringify({id:'render',object:'chat.completion.chunk',choices:[{index:0,delta:{role:'assistant',tool_calls:[{index:0,id:'render-call',type:'function',function:{name:'submit_play_scene',arguments:JSON.stringify(args)}}]},finish_reason:null}]})}\n\n`);
-  res.end(`data: ${JSON.stringify({id:'render',object:'chat.completion.chunk',choices:[{index:0,delta:{},finish_reason:'tool_calls'}]})}\n\ndata: [DONE]\n\n`);
- });server.listen(0,'127.0.0.1');await once(server,'listening');
- try{
-  const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,apiFormat:'chat',stream:true,temperature:0,thinkingBudget:0});
-  const agent=new PlayTurnAgent({client,model:'fixture',projectRoot:'/tmp'}),input={turn:1,input:'Wait',context:'A player at a gate.',mode:'guided' as const,language:'en' as const,choiceCount:2};
+  const {PlayTurnAgent}=await import('../play/play-agents.js');
+  const codex=new CodexFixture(({thread})=>({calls:[{name:'submit_play_scene',args:{sceneText:'The player waits by the gate.',...(thread.dynamicTools[0].inputSchema.properties.suggestedActions?{suggestedActions:['Advance','Watch']}:{})}}]}));
+  createCodexClient.mockImplementation(codex.createClient);
+  const agent=new PlayTurnAgent({client:fixtureClient(),model:'fixture',projectRoot:'/tmp'}),input={turn:1,input:'Wait',context:'A player at a gate.',mode:'guided' as const,language:'en' as const,choiceCount:2};
   const original=['Keep waiting','Leave'];
   expect((await agent.renderExisting({...input,currentSuggestedActions:original})).suggestedActions).toEqual(original);
   expect((await agent.renderExisting(input)).suggestedActions).toEqual(['Advance','Watch']);
-  expect(requests.map(r=>Object.keys(r.tools[0].function.parameters.properties).sort())).toEqual([['sceneText'],['sceneText','suggestedActions']]);
- }finally{server.closeAllConnections();await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));}
-},15000);
+  expect(codex.turns.map(turn=>Object.keys(turn.thread.dynamicTools[0].inputSchema.properties).sort())).toEqual([['sceneText'],['sceneText','suggestedActions']]);
+});

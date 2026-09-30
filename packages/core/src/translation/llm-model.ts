@@ -28,6 +28,7 @@ const TranslationReviewToolSchema = Type.Object({
 export function createLLMTranslationModel(input: {
   readonly client: LLMClient;
   readonly model: string;
+  readonly projectRoot?: string;
   readonly maxTokens?: number;
   readonly activatedSkills?: ReadonlyArray<ActivatedSkillGuidance>;
   readonly signal?: AbortSignal;
@@ -41,7 +42,7 @@ export function createLLMTranslationModel(input: {
         name:"submit_translation_revision",label:"Revise one translated paragraph",description:"Submit only the revised target paragraph.",
         parameters:Type.Object({target:Type.String({minLength:1})}),
         validate:result=>{if(!result.target.trim())throw Object.assign(new Error("A translated paragraph cannot be empty"),{code:"TRANSLATION_TARGET_EMPTY"});return{target:result.target.trim()};},
-      },{temperature:0.2,maxTokens:input.maxTokens??4096,signal:input.signal});
+      },{temperature:0.2,maxTokens:input.maxTokens??4096,signal:input.signal,projectRoot:input.projectRoot});
     },
     async translateSegments(request) {
       const parsed = await runWorkerAgentTool(input.client, input.model, await prepareWorkerMessages(input, [
@@ -71,7 +72,7 @@ export function createLLMTranslationModel(input: {
         description: "Submit translated segments and glossary updates.",
         parameters: TranslationResultToolSchema,
         validate:result=>{validateTranslatedSegments(result.segments,request.segments);return result;},
-      }, { temperature: 0.2, maxTokens: input.maxTokens ?? 8192, signal: input.signal });
+      }, { temperature: 0.2, maxTokens: input.maxTokens ?? 8192, signal: input.signal, projectRoot: input.projectRoot });
   return {
         ...(parsed.chapterTitle?.trim()
           ? { chapterTitle: parsed.chapterTitle.trim() }
@@ -112,7 +113,7 @@ export function createLLMTranslationModel(input: {
         label: "Submit translation review",
         description: "Submit the translation review.",
         parameters: TranslationReviewToolSchema,
-      }, { temperature: 0.1, maxTokens: 4096, signal: input.signal });
+      }, { temperature: 0.1, maxTokens: 4096, signal: input.signal, projectRoot: input.projectRoot });
       return {
         summary: parsed.summary,
         observations: parsed.observations,

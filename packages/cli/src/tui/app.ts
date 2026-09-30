@@ -5,8 +5,9 @@ import React from "react";
 import { InkTuiApp } from "./dashboard.js";
 import { getTuiCopy, resolveTuiLocale, type TuiLocale } from "./i18n.js";
 import { loadProjectSession } from "./session-store.js";
-import { detectModelInfo, detectProjectLanguage, ensureProject, interactiveLlmSetup } from "./setup.js";
+import { detectProjectLanguage, ensureProject } from "./setup.js";
 import { animateStartup } from "./effects.js";
+import { readCodexSettings } from "@actalk/inkos-core";
 
 export interface TuiFrameState {
   readonly locale?: TuiLocale;
@@ -71,27 +72,19 @@ export async function launchTui(
   projectRoot: string,
 ): Promise<void> {
   projectRoot = await resolveProjectRoot(projectRoot);
-  const { hasLlmConfig } = await ensureProject(projectRoot);
+  await ensureProject(projectRoot);
   const projectLanguage = await detectProjectLanguage(projectRoot);
   const locale = resolveTuiLocale(process.env, projectLanguage);
   const copy = getTuiCopy(locale);
-
-  if (!hasLlmConfig) {
-    console.log();
-    console.log(copy.notes.noLlmConfig);
-    console.log(copy.notes.setupProvider);
-    await interactiveLlmSetup(projectRoot);
-  }
 
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     return;
   }
 
   const session = await loadProjectSession(projectRoot);
-  const modelInfo = await detectModelInfo(projectRoot);
-  const modelLabel = modelInfo
-    ? `${modelInfo.model && modelInfo.model !== "unknown" ? modelInfo.model : copy.labels.unknown} (${modelInfo.provider})`
-    : copy.labels.notConfigured;
+  const codex = await readCodexSettings(projectRoot);
+  const modelInfo = { model: codex.model ?? "Codex default", provider: "Codex" };
+  const modelLabel = `${modelInfo.model} (Codex · ${codex.reasoningEffort} · ${codex.serviceTier})`;
   const version = await readVersion();
   const chatStreamBridge: { onTextDelta?: (text: string) => void } = {};
 

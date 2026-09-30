@@ -204,7 +204,10 @@ export class PipelineRunner {
   }>();
 
   constructor(config: PipelineConfig) {
-    this.config = config;
+    this.config = {
+      ...config,
+      client: { ...config.client, _codex: { ...config.client._codex, projectRoot: config.projectRoot } },
+    };
     this.state = new StateManager(config.projectRoot);
   }
 
@@ -397,7 +400,7 @@ export class PipelineRunner {
         thinkingBudget: base?.thinkingBudget ?? 0,
         apiFormat,
         stream,
-      });
+      }, this.config.projectRoot);
       this.agentClients.set(cacheKey, client);
     }
     return { model: override.model, client };

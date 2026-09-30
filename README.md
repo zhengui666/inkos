@@ -51,7 +51,11 @@ InkOS 是一个面向故事创作与多语言翻译的 AI Agent 系统：长篇�
 
 > 💡 **写小说，先给 Agent 接一层专业数据** —— 写小说不只缺模型，更缺素材。推荐搭配 [**火花数据API（huohuaapi）**](https://huohuaapi.com/)：按调用计费的小说 / 网文创作数据，让 Agent 动笔前先查小说正文、章节结构、人物设定、文风和创作方法等带来源素材，而不是只靠 Prompt 硬凑一份“剧情提纲”。
 
-## v2.0.0 - 统一 Pi Agent Harness 与专业创作内核
+## Codex 与 ChatGPT 登录
+
+Agent 已迁移到官方 Codex App Server。请在 Studio → 项目设置 → Codex 中使用 ChatGPT 登录，并选择模型、推理强度与可用速度档位；主 Agent 不再需要旧服务的 API Key。账号与密钥仅保存在服务端，旧模型服务继续用于独立模型/图像能力。[配置与安全边界](docs/codex-runtime.md)
+
+## v2.0.0 - 统一 Codex Agent Harness 与专业创作内核
 
 本分支为 2.0 开发版本，使用本地构建进行验证。旧项目先运行 `inkos work migrate --json` 查看升级清单，再运行 `inkos work migrate --apply` 导入统一创作库；原目录与早期版本清单备份会保留，冲突不会覆盖已有作品。
 
@@ -61,10 +65,10 @@ InkOS 是一个面向故事创作与多语言翻译的 AI Agent 系统：长篇�
 
 已有短篇可以在作品对话中要求按审稿意见整篇修订，或运行 `inkos short revise <story-id> --instruction "修复审稿指出的时间线与证据链问题"`。系统会更新相关章节、大纲和销售包，再次审稿，并保留原稿版本。
 
-InkOS 2.0 把“Chat Agent 调工具”和“各类作品管线”收敛成一套围绕 pi-agent 的生产 harness。模型负责理解、提议和调用能力；InkOS 负责确认、上下文、状态、原子落盘和产物真实性。长篇、短篇、剧本、分镜、互动影游、Play 与翻译继续保留各自的专业方法，但共享同一套执行、检索、观测和恢复基础设施。
+InkOS 2.0 把“Chat Agent 调工具”和“各类作品管线”收敛成一套围绕 Codex agent 的生产 harness。模型负责理解、提议和调用能力；InkOS 负责确认、上下文、状态、原子落盘和产物真实性。长篇、短篇、剧本、分镜、互动影游、Play 与翻译继续保留各自的专业方法，但共享同一套执行、检索、观测和恢复基础设施。
 
 - **模型配置**：Studio 内置多服务配置、模型路由和封面服务配置；支持 [kkaiapi](https://kkaiapi.com/) / OpenRouter 等全球主流模型聚合入口，以及自定义 OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages 服务。
-- **单一生产 Harness**：Studio Chat、TUI、`inkos interact` 与生产 worker 共用 pi-agent 工具循环和结构化 action/result；既有 pipeline 降为可直接调用、可中断、可观测的确定性能力，不再维护平行的自然语言决策内核。
+- **单一生产 Harness**：Studio Chat、TUI、`inkos interact` 与生产 worker 共用 Codex agent 工具循环和结构化 action/result；既有 pipeline 降为可直接调用、可中断、可观测的确定性能力，不再维护平行的自然语言决策内核。
 - **19 个内置专业 Skills**：长篇写作 / 审稿、商业短篇、Play、剧本、分镜、互动影游、翻译、拆稿、市场研究、导入、封面与去 AI 味都拥有独立 `SKILL.md`；各作品类型复用 Skill 架构，不复用不适合自己的长篇提示词。
 - **统一本地检索**：故事记忆、材料库和 Skill 参考资料共用 SQLite FTS5 / BM25 检索投影；原始文件仍是权威来源，索引可重建，检索结果保留来源与位置。
 - **书籍参考资料绑定**：导入材料可以显式绑定到某本书并声明用途，写作时按当前任务检索相关段落，而不是把所有文件全文塞进上下文。
@@ -424,7 +428,7 @@ Play 维护一个可持续推进的世界状态：角色、地点、物品、证
 
 ## 工作原理
 
-InkOS 以 pi-agent harness 作为统一认知与工具调用内核：Agent 理解用户意图并产生结构化 action，宿主执行确定性工具、确认权限、管理状态并以真实文件和 tool result 判定完成。长篇、短篇、剧本、分镜、互动影游、Play 和翻译复用这套架构，但保留各自的专业 Skill、状态模型与生产步骤。
+InkOS 以 Codex agent harness 作为统一认知与工具调用内核：Agent 理解用户意图并产生结构化 action，宿主执行确定性工具、确认权限、管理状态并以真实文件和 tool result 判定完成。长篇、短篇、剧本、分镜、互动影游、Play 和翻译复用这套架构，但保留各自的专业 Skill、状态模型与生产步骤。
 
 <p align="center">
   <img src="assets/arch-system.svg" width="900" alt="InkOS 整体系统架构">
@@ -509,7 +513,7 @@ inkos review 吞天魔帝 --json
 inkos export 吞天魔帝 --format epub
 ```
 
-这些命令表达已经确定的用户动作；自然语言意图仍进入 pi-agent Harness，由当前 Work Profile 的 capability surface 决策。
+这些命令表达已经确定的用户动作；自然语言意图仍进入 Codex agent Harness，由当前 Work Profile 的 capability surface 决策。
 
 ### 3. 自然语言 Agent 模式
 
@@ -656,7 +660,7 @@ pnpm typecheck    # 类型检查
 
 ## 致谢
 
-InkOS 的 agent 运行时构建在 [pi](https://github.com/badlogic/pi-mono)（`@mariozechner/pi-ai` 与 `@mariozechner/pi-agent-core`，作者 Mario Zechner）之上。感谢 pi 提供的扎实底座。
+InkOS 的 Agent 运行时使用官方 [Codex App Server](https://developers.openai.com/codex/app-server/)。独立模型服务与图像集成继续使用 [pi-ai](https://github.com/badlogic/pi-mono)。感谢两个开源项目。
 
 本开源项目已链接并认可 [LINUX DO](https://linux.do/) 社区，感谢社区成员的反馈、测试与讨论。
 

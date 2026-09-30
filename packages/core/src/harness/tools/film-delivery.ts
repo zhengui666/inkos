@@ -1,5 +1,5 @@
 import { Type } from "@sinclair/typebox";
-import type { AgentTool } from "@mariozechner/pi-agent-core";
+import type { AgentTool } from "../../codex/contracts.js";
 import { readFile } from "node:fs/promises";
 import { extname } from "node:path";
 import { loadStoryGraph } from "../../interactive-film/graph-store.js";

@@ -21,7 +21,7 @@ export async function sendCommandNotification(
   config?: ProjectConfig,
 ): Promise<void> {
   try {
-    const resolved = config ?? (await loadConfig());
+    const resolved = config ?? (await loadConfig({ requireApiKey: false }));
     const channels = resolved.notify ?? [];
     if (channels.length === 0) {
       logError("--notify: no notify channels configured in project config (notify: []), skipping notification");

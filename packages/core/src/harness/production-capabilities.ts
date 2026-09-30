@@ -8,7 +8,7 @@ import { createArtifactMethodTools, createDeliverWorkArtifactTool } from "./tool
 import { createShortProductionStageTools } from "./tools/short-production.js";
 import { createInspectPlayStateTool } from "./tools/play-state.js";
 import { createPlayImageTool } from "./tools/play-image.js";
-import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentTool, AgentToolResult } from "../codex/contracts.js";
 import { Type, type TSchema } from "@sinclair/typebox";
 import type { PipelineRunner } from "../pipeline/runner.js";
 import type { ActionPayload, RequestedIntent } from "../interaction/action-envelope.js";

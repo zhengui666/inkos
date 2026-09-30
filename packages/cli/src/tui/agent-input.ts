@@ -141,6 +141,7 @@ export async function processTuiAgentInput(params: {
       language,
       pipeline,
       projectRoot: params.projectRoot,
+      ...(params.session.modelOverride ? { codexModel: params.session.modelOverride } : {}),
       model: client._piModel
         ? client._piModel
         : { provider: config.llm.provider ?? "openai", modelId: config.llm.model },

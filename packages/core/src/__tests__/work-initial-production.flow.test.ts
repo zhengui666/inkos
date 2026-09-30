@@ -1,9 +1,10 @@
-import { createServer } from 'node:http';
-import { once } from 'node:events';
+import { CodexFixture } from './codex-fixture.js';
+const codex = vi.hoisted(() => ({ create: vi.fn() }));
+vi.mock('../codex/client.js', () => ({ createCodexClient: codex.create }));
 import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { createProductionCapabilityRegistry } from '../harness/production-capabilities.js';
 import { createBuiltInWorkProfileRegistry } from '../harness/builtin-profiles.js';
 import { CreativeHarnessRuntime } from '../harness/runtime.js';
@@ -24,27 +25,24 @@ it('produces and edits a composed Work by its capabilities while protecting exis
   const bodies: Array<{tools:Array<{function:{name:string}}>;messages:Array<{role:string;content:string}>}> = [];
   const sourceText = 'The volunteer returns the borrowed blue flashlight.\n';
   const manuscript = '| Shot | Duration | Action |\n|---|---|---|\n| 1 | 10s | Return the borrowed light. |\n';
-  const server = createServer(async (request, response) => {
-    const chunks: Buffer[]=[]; for await (const chunk of request) chunks.push(Buffer.from(chunk));
-    const body = JSON.parse(Buffer.concat(chunks).toString('utf8')); bodies.push(body);
+  const fixture = new CodexFixture(view => {
+    const body = {tools:view.tools,messages:[{role:'system',content:view.thread.baseInstructions},...view.messages]}; bodies.push(body);
     requests++;
     const toolName = body.tools[0].function.name;
-    const reviewInput=toolName==='submit_artifact_review'?JSON.parse(body.messages.findLast((message:{role:string})=>message.role==='user').content):undefined;
-    if (failReview) {response.writeHead(403, {'Content-Type':'application/json'});response.end(JSON.stringify({error:{message:'Fixture provider unavailable'}}));return;}
+    const reviewInput=toolName==='submit_artifact_review'?JSON.parse([...body.messages].reverse().find((message:{role:string})=>message.role==='user')!.content):undefined;
+    if (failReview) return {error:'Fixture provider unavailable'};
     const args = toolName==='submit_storyboard_package' ? {storyboard: manuscript, imagePrompts: ['A museum volunteer returning a blue flashlight.']}
       : {summary:'Scoped review',observations:[scopeFinding
         ? {code:'FIXTURE_SCOPE',category:'scope',assessment:'issue',summary:'The fixture reviewer identifies a change outside the selected region.',sourceRefs:[{sourceId:reviewInput.sources[0].sourceId,startLine:1,endLine:1},{sourceId:reviewInput.comparison.sourceId,startLine:1,endLine:1}]}
         : executionFindingOnly
         ? {code:'EXPORT_RECEIPT_NOT_SUPPLIED',category:'execution',assessment:'unavailable',summary:'No completed export receipt is supplied to this review.',sourceRefs:[]}
         : {code:'EXTERNAL_HISTORY_UNAVAILABLE',category:'quality',assessment:'unavailable',summary:'External comparison requires its source.',sourceRefs:[]}]};
-    response.writeHead(200, {'Content-Type':'text/event-stream'});
-    response.write(`data: ${JSON.stringify({id:'production',object:'chat.completion.chunk',choices:[{index:0,delta:{role:'assistant',tool_calls:[{index:0,id:'production-call',type:'function',function:{name:toolName,arguments:JSON.stringify(args)}}]},finish_reason:null}]})}\n\n`);
-    response.end(`data: ${JSON.stringify({id:'production',object:'chat.completion.chunk',choices:[{index:0,delta:{},finish_reason:'tool_calls'}]})}\n\ndata: [DONE]\n\n`);
+    return {calls:[{name:toolName,args}]};
   });
-  server.listen(0,'127.0.0.1'); await once(server,'listening');
+  codex.create.mockImplementation(fixture.createClient);
   let ledger: CreativeEpisodeStore | undefined;
   try {
-    const client = createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,apiFormat:'chat',stream:true,temperature:0,thinkingBudget:0});
+    const client = createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:'https://fixture.invalid/v1',apiFormat:'chat',stream:true,temperature:0,thinkingBudget:0});
     const pipeline = new PipelineRunner({client,model:'fixture',projectRoot:root});
     const profileId='mixed-board';
     await mkdir(join(root,'.inkos/profiles'),{recursive:true});
@@ -158,8 +156,7 @@ it('produces and edits a composed Work by its capabilities while protecting exis
     expect(actionResultFacts(nextReview.data).comparison).toMatchObject({scope:'episode_start',before:{revisionId:revisedId},after:{revisionId:revisedId},changedRegion:{before:{lineCount:0},after:{lineCount:0}}});
     bound.finishEpisode(nextEpisode,'completed');
   } finally {
-    ledger?.close(); server.closeAllConnections();
-    await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));
+    ledger?.close();
     await rm(root,{recursive:true,force:true});
   }
 },15000);

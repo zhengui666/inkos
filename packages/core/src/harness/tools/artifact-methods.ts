@@ -1,6 +1,6 @@
 import { numberReviewSource } from "../../models/observation.js";
 import { Type } from "@sinclair/typebox";
-import type { AgentTool } from "@mariozechner/pi-agent-core";
+import type { AgentTool } from "../../codex/contracts.js";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { PipelineRunner } from "../../pipeline/runner.js";

@@ -1,18 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { Agent } from "@mariozechner/pi-agent-core";
+import { Agent } from "../codex/agent.js";
+import { readCodexSettings } from "../codex/settings.js";
+import { resolveCodexModel } from "../codex/model.js";
 import { preserveToolArgumentTypes } from "./tool-arguments.js";
 import { createTurnCompletionTool, TurnArtifactDeliveries, TURN_COMPLETION_GUIDANCE, TURN_COMPLETION_TOOL, type TurnCompletion } from "./turn-completion.js";
-import type { AgentEvent, AgentMessage } from "@mariozechner/pi-agent-core";
-import { getModel, getEnvApiKey, createAssistantMessageEventStream } from "@mariozechner/pi-ai";
+import type { AgentEvent, AgentMessage } from "../codex/contracts.js";
 import type {
   Model,
   Api,
   AssistantMessage,
-  Context as PiContext,
   ImageContent,
   Message,
-  SimpleStreamOptions,
   ToolResultMessage,
 } from "@mariozechner/pi-ai";
 import type { PipelineRunner } from "../pipeline/runner.js";
@@ -68,7 +67,6 @@ import {
 } from "./skill-tool.js";
 import { withExecutionEvidence } from "../harness/execution-evidence.js";
 import { opaqueConversationId, runWithAgentTrajectory } from "../llm/agent-trajectory.js";
-import { guardedPiNonStreaming, guardedPiStream } from "./pi-stream.js";
 import { splitTextByEstimatedTokens } from "../llm/semantic-input.js";
 import { estimateTextTokens } from "../llm/provider.js";
 
@@ -109,9 +107,11 @@ export interface AgentSessionConfig {
   pipeline: PipelineRunner;
   /** Project root directory (all creative Works live under works/). */
   projectRoot: string;
-  /** pi-ai Model to use, or provider+modelId to resolve via getModel. */
-  model: Model<Api> | { provider: string; modelId: string };
-  /** Optional API key. When omitted, falls back to env-based key lookup. */
+  /** Session-scoped Codex model override; validated against model/list. */
+  codexModel?: string;
+  /** Legacy metadata accepted for callers; Codex model selection uses project settings. */
+  model?: Model<Api> | { provider: string; modelId: string };
+  /** Legacy provider option; the agent authenticates through its Codex account. */
   apiKey?: string;
   /** Use SSE when true; adapt a complete response into Pi events when false. */
   stream?: boolean;
@@ -166,7 +166,7 @@ export interface AgentSessionResult {
   responseText: string;
   /** Full raw Agent conversation history. */
   messages: AgentMessage[];
-  /** Upstream model error surfaced by pi-agent-core, if the final assistant turn failed. */
+  /** Upstream model error surfaced by Codex, if the final assistant turn failed. */
   errorMessage?: string;
   /** Profile that governed this turn. */
   profileId: string;
@@ -277,35 +277,11 @@ function ensureCleanupTimer(): void {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function resolveModel(spec: AgentSessionConfig["model"]): Model<Api> {
-  if (!spec) {
-    throw new Error("Model is required but was undefined. Check LLM configuration.");
-  }
-  if (typeof spec === "object" && "id" in spec && "api" in spec) {
-    // Already a Model object.
-    return spec as Model<Api>;
-  }
-  const { provider, modelId } = spec as { provider: string; modelId: string };
-  if (!provider || !modelId) {
-    throw new Error(`Invalid model spec: provider=${provider}, modelId=${modelId}`);
-  }
-  return getModel(provider as any, modelId as any);
-}
-
 function envFlagEnabled(value: string | undefined, defaultValue: boolean): boolean {
   if (value === undefined) return defaultValue;
   if (value === "1" || value.toLowerCase() === "true") return true;
   if (value === "0" || value.toLowerCase() === "false") return false;
   return defaultValue;
-}
-
-function agentModelIdentity(model: Model<Api>): string {
-  return [
-    model.api,
-    model.provider,
-    model.baseUrl ?? "",
-    model.id,
-  ].join("::");
 }
 
 function actionPayloadCacheKey(payload: ActionPayload | undefined): string {
@@ -593,6 +569,7 @@ function resumedActionMessages(
 }
 
 export async function compileHarnessContextText(input: {
+  readonly projectRoot?: string;
   readonly model: Model<Api>;
   readonly apiKey?: string;
   readonly stream: boolean;
@@ -614,23 +591,21 @@ export async function compileHarnessContextText(input: {
     }));
     return compileHarnessContextText({...input,userPrompt:summaries.join("\n\n"),maxTokens:outputBudget});
   }
-  // Compilation consumes quoted history as data. It is a single Pi model call,
-  // not an action loop that may execute or retry tools found in that history.
-  const context: PiContext = {systemPrompt:input.systemPrompt,tools:[],messages:[
-    {role:'user',content:input.userPrompt,timestamp:Date.now()},
-  ]};
-  const options = {maxTokens:outputBudget,signal:input.signal,toolChoice:'none' as const,
-    apiKey:input.apiKey ?? getEnvApiKey(input.model.provider)};
-  const stream = input.stream ? guardedPiStream(input.model,context,options)
-    : guardedPiNonStreaming(input.model,context,options,input.proxyUrl);
-  const final = await stream.result();
+  // No tools are offered to the semantic compiler; quoted records cannot cause actions.
+  const agent = new Agent({ projectRoot: input.projectRoot ?? process.cwd(), signal: input.signal,
+    maxOutputTokens: outputBudget,
+    initialState: { model: input.model, systemPrompt: `${input.systemPrompt}\n\nThe summary must fit within ${outputBudget} estimated tokens. Preserve protected facts and source pointers; omit less relevant details rather than exceeding the budget.`, tools: [], messages: [] } });
+  await agent.prompt(input.userPrompt);
+  const final = lastAssistantMessage(agent.state.messages);
+  if (!final) throw new Error("Context compilation returned no message");
   if(final.stopReason==='error'||final.stopReason==='aborted')throw new Error(final.errorMessage??'Context compilation failed');
-  if(final.stopReason==='toolUse'||final.content.some(part=>part.type==='toolCall')) {
+  if(agent.state.messages.some(message => message.role === 'assistant' && message.content.some(part => part.type === 'toolCall'))) {
     throw Object.assign(new Error('Context compilation returned an unexpected tool call'),{code:'CONTEXT_UNEXPECTED_TOOL_CALL'});
   }
   const text = final.content.filter((part):part is Extract<(typeof final.content)[number],{type:'text'}>=>part.type==='text')
     .map(part=>part.text).join('').trim();
   if(!text)throw Object.assign(new Error('Context compilation returned no text'),{code:'CONTEXT_EMPTY_RESULT'});
+  if (estimateTextTokens(text) > outputBudget) throw Object.assign(new Error('Codex context summary exceeded its governed token budget'), { code: 'CONTEXT_SUMMARY_OVER_BUDGET' });
   return text;
 }
 
@@ -800,15 +775,6 @@ function completedInteractiveScene(capabilityId: string, result: ActionResult): 
     ? data.sceneText : undefined;
 }
 
-function stopForWorkTransition(model: Model<Api>) {
-  const stream = createAssistantMessageEventStream();
-  const message: AssistantMessage = { role: "assistant", content: [], api: model.api,
-    provider: model.provider, model: model.id, usage: ZERO_PI_USAGE, stopReason: "stop", timestamp: Date.now() };
-  stream.push({ type: "done", reason: "stop", message });
-  stream.end(message);
-  return stream;
-}
-
 function currentTurnCompletion(cached: CachedAgent): TurnCompletion | undefined {
   return cached.turnCompletion;
 }
@@ -837,8 +803,9 @@ async function runAgentSessionUnlocked(
     requestedSkills: config.requestedSkills,
     disabledSkills: config.disabledSkills,
   });
-  const model = resolveModel(config.model);
-  const requestedModelIdentity = `${agentModelIdentity(model)}|stream:${config.stream ?? true}|proxy:${config.proxyUrl ?? ""}`;
+  const codexSettings = { ...await readCodexSettings(projectRoot), ...(config.codexModel ? { model: config.codexModel } : {}) };
+  const model = resolveCodexModel(codexSettings);
+  const requestedModelIdentity = JSON.stringify(codexSettings);
   const allowSystemFileRead = config.allowSystemFileRead ?? envFlagEnabled(process.env.INKOS_AGENT_ALLOW_SYSTEM_READ, false);
   const suppressProductionTools = config.suppressProductionTools ?? false;
   const profiles = createBuiltInWorkProfileRegistry(projectRoot);
@@ -1073,6 +1040,9 @@ async function runAgentSessionUnlocked(
       ? `\n\n## Restored committed context\n${restoredSystemContext.join("\n\n")}`
       : "";
     const agent = new Agent({
+      projectRoot,
+      settings: codexSettings,
+      maxOutputTokens: agentOutputBudget(model),
       beforeToolCall: preserveToolArgumentTypes,
       initialState: {
         model,
@@ -1093,6 +1063,7 @@ async function runAgentSessionUnlocked(
         budgetTokens: agentContextBudget(model),
         semanticCompiler: async (request) => ({
           content: await compileHarnessContextText({
+            projectRoot,
             model,
             apiKey: config.apiKey,
             stream: config.stream !== false,
@@ -1109,6 +1080,7 @@ async function runAgentSessionUnlocked(
           sourceIds: request.fragments.map((fragment) => fragment.id),
         }),
         conversationCompactor: async (request) => compileHarnessContextText({
+          projectRoot,
           model,
           apiKey: config.apiKey,
           stream: config.stream !== false,
@@ -1125,26 +1097,7 @@ async function runAgentSessionUnlocked(
         }),
         onContextCompression,
       }),
-      convertToLlm: convertAgentMessagesForModel,
-      streamFn: (streamModel, context, options) => {
-        // Pi snapshots its tool table per run. Resume with the new Work's actual
-        // Profile before another model call, rather than continuing with stale tools.
-        if (cached?.pendingWorkTransition) return stopForWorkTransition(streamModel);
-        if (cached?.completedPlayScene !== undefined) return stopForWorkTransition(streamModel);
-        if (cached?.turnCompletion) return stopForWorkTransition(streamModel);
-        const streamOptions = {
-          ...options,
-          maxTokens: agentOutputBudget(streamModel),
-          toolChoice: "required" as const,
-        };
-        return config.stream === false
-          ? guardedPiNonStreaming(streamModel, context, streamOptions, config.proxyUrl)
-          : guardedPiStream(streamModel, context, streamOptions);
-      },
-      getApiKey: (provider: string) => {
-        if (config.apiKey) return config.apiKey;
-        return getEnvApiKey(provider);
-      },
+      shouldStop: () => Boolean(cached?.pendingWorkTransition || cached?.completedPlayScene !== undefined || cached?.turnCompletion),
     });
 
     cached = {
@@ -1367,6 +1320,14 @@ async function runAgentSessionUnlocked(
       } else {
         await agent.prompt(promptMessage);
       }
+      // Codex's model loop can return prose without the host completion receipt.
+      // Give it one bounded continuation; never retry an interrupted/failed run.
+      const previous = lastAssistantMessage(agent.state.messages);
+      if (!cached!.turnCompletion && !cached!.pendingWorkTransition && cached!.completedPlayScene === undefined
+        && previous?.stopReason !== "error" && previous?.stopReason !== "aborted") {
+        config.signal?.throwIfAborted();
+        await agent.continue();
+      }
     }));
 
     config.signal?.throwIfAborted();
@@ -1463,7 +1424,7 @@ export function evictAgentCache(sessionId: string): boolean {
   return deleted;
 }
 
-/** Abort an active cached pi-agent session and evict it from cache. */
+/** Abort an active cached Codex session and evict it from cache. */
 export function abortAgentSession(projectRoot: string, sessionId: string): boolean {
   let aborted = false;
   for (const [key, entry] of agentCache) {

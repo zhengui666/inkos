@@ -1,5 +1,5 @@
 import { Type, type Static } from "@mariozechner/pi-ai";
-import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentTool, AgentToolResult } from "../codex/contracts.js";
 import { applyGraphDelta } from "../interactive-film/authoring-store.js";
 import type { LLMClient } from "../llm/provider.js";
 import { runWorkerAgentTool } from "./worker-agent.js";

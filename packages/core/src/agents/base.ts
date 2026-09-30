@@ -1,3 +1,4 @@
+import { resolveCodexModel } from "../codex/model.js";
 import { compileContext, ContextSourceRegistry } from "../harness/context-compiler.js";
 import { createBuiltInWorkProfileRegistry } from "../harness/builtin-profiles.js";
 import { createHash } from "node:crypto";
@@ -44,6 +45,7 @@ export abstract class BaseAgent {
   ): Promise<LLMResponse> {
     return runWorkerAgent(this.ctx.client, this.ctx.model, await this.appendTaskSkillGuidance(messages, options?.maxTokens), {
       ...options,
+      projectRoot: this.ctx.projectRoot,
       onStreamProgress: this.ctx.onStreamProgress,
       signal: this.ctx.signal,
     });
@@ -62,6 +64,7 @@ export abstract class BaseAgent {
       resultTool,
       {
         ...options,
+        projectRoot: this.ctx.projectRoot,
         signal: this.ctx.signal,
         onStreamProgress: this.ctx.onStreamProgress,
         onUsage: (value) => { usage = value; },
@@ -142,7 +145,9 @@ export async function prepareWorkerMessages(
       references: resources.map(resource => ({ path: resource.path, charStart: resource.charStart, charEnd: resource.charEnd,
         hash: createHash("sha256").update(resource.body).digest("hex") })),
     })) ?? [] });
-    const window = context.client._piModel?.contextWindow;
+    const window = context.client._codex
+      ? resolveCodexModel(context.client._codex.settings).contextWindow
+      : context.client._piModel?.contextWindow;
     if (window) {
       const sources = new ContextSourceRegistry();
       sources.register({ id: "task", load: async () => messages.map((message, index) => ({

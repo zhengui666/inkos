@@ -9,7 +9,7 @@ export const analyticsCommand = new Command("analytics")
   .option("--json", "Output JSON")
   .action(async (bookIdArg: string | undefined, opts) => {
     try {
-      await loadConfig();
+      await loadConfig({ requireApiKey: false });
       const root = findProjectRoot();
       const bookId = await resolveBookId(bookIdArg, root);
       const state = new StateManager(root);

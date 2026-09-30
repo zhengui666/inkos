@@ -38,6 +38,7 @@ export async function compileStyleGuide(input: {
     },
   ], undefined, "style-guide"), {
     temperature: 0.3,
+    projectRoot: input.projectRoot,
     signal: input.signal,
   });
   const guide = response.content.trim();

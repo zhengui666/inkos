@@ -1,7 +1,7 @@
 import { withWorkMutationScope } from "../../utils/work-mutation-scope.js";
 import { StateManager } from "../../state/manager.js";
 import { Type, type Static } from "@mariozechner/pi-ai";
-import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentTool, AgentToolResult } from "../../codex/contracts.js";
 import type { PipelineRunner } from "../../pipeline/runner.js";
 import {
   createLLMTranslationModel,

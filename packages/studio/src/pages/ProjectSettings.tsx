@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { CodexSettings } from "./CodexSettings";
 import { Bell, Bot, FolderUp, MessageSquare, Radar, Search, Settings2, Plus, Trash2 } from "lucide-react";
 import { fetchJson, postApi, putApi, useApi } from "../hooks/use-api";
 import { usePreferencesStore } from "../store/preferences";
@@ -15,7 +16,6 @@ import {
   type DetectionDraft,
   type NotifyChannelDraft,
   type NotifyType,
-  type OverrideRow,
 } from "./project-settings-model";
 import {
   serializeSkillFolder,
@@ -89,7 +89,6 @@ const fieldClass = "w-full rounded-lg border border-border bg-secondary/30 px-3 
 export function ProjectSettings({ nav, theme, t }: { nav: Nav; theme: Theme; t: TFunction }) {
   const c = useColors(theme);
   const isZh = t("nav.connected") === "\u5DF2\u8FDE\u63A5";
-  const { data: overridesData, refetch: refetchOverrides } = useApi<{ overrides: Record<string, unknown> }>("/project/model-overrides");
   const { data: defaultModelData, refetch: refetchDefaultModel } = useApi<{ service: string | null; defaultModel: string | null }>("/project/default-model");
   const { data: researchSearchData, refetch: refetchResearchSearch } = useApi<{ researchSearch: Partial<ResearchSearchDraft> }>("/project/research-search");
   const { data: notifyData, refetch: refetchNotify } = useApi<{ channels: unknown[] }>("/project/notify");
@@ -98,7 +97,6 @@ export function ProjectSettings({ nav, theme, t }: { nav: Nav; theme: Theme; t: 
   const [defaultService, setDefaultService] = useState("");
   const [defaultModel, setDefaultModel] = useState("");
   const [researchSearch, setResearchSearch] = useState<ResearchSearchDraft>({ ...DEFAULT_RESEARCH_SEARCH });
-  const [overrideRows, setOverrideRows] = useState<OverrideRow[]>([]);
   const [notifyChannels, setNotifyChannels] = useState<NotifyChannelDraft[]>([]);
   const [det, setDet] = useState<DetectionDraft>({ ...DEFAULT_DETECTION });
   const [notice, setNotice] = useState<{ tone: NoticeTone; message: string } | null>(null);
@@ -107,15 +105,6 @@ export function ProjectSettings({ nav, theme, t }: { nav: Nav; theme: Theme; t: 
   const toolDetailsDefaultOpen = usePreferencesStore((s) => s.toolDetailsDefaultOpen);
   const setToolDetailsDefaultOpen = usePreferencesStore((s) => s.setToolDetailsDefaultOpen);
   const skills = skillsData?.skills ?? [];
-
-  useEffect(() => {
-    if (!overridesData) return;
-    setOverrideRows(Object.entries(overridesData.overrides ?? {}).map(([agent, val]) => {
-      if (typeof val === "string") return { agent, model: val };
-      const { model, ...rest } = (val ?? {}) as { model?: string };
-      return { agent, model: model ?? "", rest };
-    }));
-  }, [overridesData]);
 
   useEffect(() => {
     if (!defaultModelData) return;
@@ -201,6 +190,8 @@ export function ProjectSettings({ nav, theme, t }: { nav: Nav; theme: Theme; t: 
           {notice.message}
         </div>
       )}
+
+      <CodexSettings isZh={isZh} />
 
       {/* Chat UI preferences — applied immediately, persisted in this browser's localStorage */}
       <SettingsCard title={t("settings.chatUi")} description={t("settings.chatUiHint")} icon={<MessageSquare size={18} />}>
@@ -301,8 +292,8 @@ export function ProjectSettings({ nav, theme, t }: { nav: Nav; theme: Theme; t: 
         </div>
       </SettingsCard>
 
-      {/* Model routing — per-agent model overrides */}
-      <SettingsCard title={t("settings.modelOverrides")} description={t("settings.modelOverridesHint")} icon={<Bot size={18} />}>
+      {/* Existing provider defaults apply only to standalone direct API calls. */}
+      <SettingsCard title={isZh ? "独立 API 服务默认值" : "Direct API Provider Defaults"} description={t("settings.globalDefaultModelHint")} icon={<Bot size={18} />}>
         <div className="rounded-xl border border-border/60 bg-secondary/20 p-3 space-y-2">
           <div>
             <div className="text-sm font-semibold">{t("settings.globalDefaultModel")}</div>
@@ -336,59 +327,7 @@ export function ProjectSettings({ nav, theme, t }: { nav: Nav; theme: Theme; t: 
             </button>
           </div>
         </div>
-        <div className="space-y-2">
-          {overrideRows.length === 0 && (
-            <p className="text-xs text-muted-foreground italic">{t("settings.noOverrides")}</p>
-          )}
-          {overrideRows.map((row, i) => (
-            <div key={i} className="flex items-center gap-2">
-              <input
-                value={row.agent}
-                onChange={(e) => setOverrideRows((prev) => prev.map((r, j) => (j === i ? { ...r, agent: e.target.value } : r)))}
-                placeholder={t("settings.agentName")}
-                className={`${fieldClass} flex-1`}
-              />
-              <span className="text-muted-foreground">→</span>
-              <input
-                value={row.model}
-                onChange={(e) => setOverrideRows((prev) => prev.map((r, j) => (j === i ? { ...r, model: e.target.value } : r)))}
-                placeholder={t("settings.modelId")}
-                className={`${fieldClass} flex-1 font-mono`}
-              />
-              <button
-                onClick={() => setOverrideRows((prev) => prev.filter((_, j) => j !== i))}
-                className="shrink-0 rounded-lg p-2 text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors"
-                aria-label="remove"
-              >
-                <Trash2 size={15} />
-              </button>
-            </div>
-          ))}
-        </div>
         <div className="flex flex-wrap gap-2">
-          <button
-            onClick={() => setOverrideRows((prev) => [...prev, { agent: "", model: "" }])}
-            className={`flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium ${c.btnSecondary}`}
-          >
-            <Plus size={14} /> {t("settings.addOverride")}
-          </button>
-          <button
-            onClick={() => runSave("overrides", async () => {
-              const overrides: Record<string, unknown> = {};
-              for (const r of overrideRows) {
-                const agent = r.agent.trim();
-                const model = r.model.trim();
-                if (!agent || !model) continue;
-                overrides[agent] = r.rest && Object.keys(r.rest).length > 0 ? { ...r.rest, model } : model;
-              }
-              await putApi("/project/model-overrides", { overrides });
-              await refetchOverrides();
-            }, t("settings.saved"))}
-            disabled={saving === "overrides"}
-            className={`rounded-lg px-4 py-2 text-sm font-bold ${c.btnPrimary} disabled:opacity-40`}
-          >
-            {saving === "overrides" ? t("config.saving") : t("config.save")}
-          </button>
           <button onClick={nav.toServices} className={`rounded-lg px-4 py-2 text-sm font-bold ${c.btnSecondary}`}>
             {t("settings.openModelConfig")}
           </button>

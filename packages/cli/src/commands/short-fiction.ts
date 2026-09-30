@@ -33,7 +33,7 @@ shortCommand.command("revise")
   .option("--json","Output JSON")
   .action(async(storyId:string,opts)=>{
     try {
-      const root=findProjectRoot();const config=await loadConfig({projectRoot:root});
+      const root=findProjectRoot();const config=await loadConfig({requireApiKey:false,projectRoot:root});
       config.modelOverrides={...config.modelOverrides,"short-reviser":opts.model};
       const pipeline=new PipelineRunner(buildPipelineConfig(config,root,{quiet:opts.json}));
       const skills=await resolveCliProfileSkills(root,"short-fiction");
@@ -93,7 +93,7 @@ shortCommand
         createBuiltInWorkProfileRegistry().require("short-fiction"),
       );
 
-      const config = await loadConfig({ projectRoot: root });
+      const config = await loadConfig({ requireApiKey: false, projectRoot: root });
       if (opts.llmBaseUrl) config.llm.baseUrl = opts.llmBaseUrl;
       if (opts.model) config.llm.model = opts.model;
       const modelOverrides = { ...(config.modelOverrides ?? {}) };

@@ -19,7 +19,7 @@ export const detectCommand = new Command("detect")
   .option("--json", "Output JSON")
   .action(async (bookIdArg: string | undefined, chapterStr: string | undefined, opts) => {
     try {
-      const config = await loadConfig();
+      const config = await loadConfig({ requireApiKey: false });
       const root = findProjectRoot();
 
       if (!config.detection?.enabled) {

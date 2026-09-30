@@ -1,4 +1,4 @@
-import type { AgentTool } from "@mariozechner/pi-agent-core";
+import type { AgentTool } from "../codex/contracts.js";
 import { join } from "node:path";
 import type { ActionResult } from "./contracts.js";
 import { CreativeEpisodeStore } from "./episode-store.js";

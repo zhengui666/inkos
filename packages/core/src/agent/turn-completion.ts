@@ -1,5 +1,5 @@
 import { Type, type Static } from "@sinclair/typebox";
-import type { AgentTool } from "@mariozechner/pi-agent-core";
+import type { AgentTool } from "../codex/contracts.js";
 import type { ActionResult } from "../harness/contracts.js";
 import { loadWorkManifest } from "../harness/work-store.js";
 

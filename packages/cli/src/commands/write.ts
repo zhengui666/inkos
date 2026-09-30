@@ -49,7 +49,7 @@ writeCommand
       const language = resolveCliLanguage(book.language);
       notifyLanguage = language;
       notifyBookName = book.title ?? bookId;
-      const config = await loadConfig();
+      const config = await loadConfig({ requireApiKey: false });
 
       const pipeline = new PipelineRunner(buildPipelineConfig(config, root, {
         externalContext: context,
@@ -221,7 +221,7 @@ writeCommand
 
       const wordCount = opts.words ? parseInt(opts.words, 10) : undefined;
 
-      const config = await loadConfig();
+      const config = await loadConfig({ requireApiKey: false });
       const pipeline = new PipelineRunner(buildPipelineConfig(config, root, {
         externalContext: opts.brief,
       }));
@@ -310,7 +310,7 @@ writeCommand
       const state = new StateManager(root);
       const book = await state.loadBookConfig(bookId);
       const language = resolveCliLanguage(book.language);
-      const config = await loadConfig();
+      const config = await loadConfig({ requireApiKey: false });
       const pipeline = new PipelineRunner(buildPipelineConfig(config, root, {
         externalContext: opts.brief,
       }));

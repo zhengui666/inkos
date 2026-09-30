@@ -1,4 +1,4 @@
-import type { AgentTool } from "@mariozechner/pi-agent-core";
+import type { AgentTool } from "../../codex/contracts.js";
 import { Type, type Static } from "@sinclair/typebox";
 import { writeExportArtifact, type ExportStateLike } from "../../interaction/export-artifact.js";
 

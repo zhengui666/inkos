@@ -1,7 +1,7 @@
 import { access } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Type } from '@sinclair/typebox';
-import type { AgentTool } from '@mariozechner/pi-agent-core';
+import type { AgentTool } from '../../codex/contracts.js';
 import { PlayStore } from '../../play/play-store.js';
 import { createPlayDB } from '../../play/play-db-factory.js';
 

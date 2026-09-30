@@ -1,21 +1,20 @@
-import {createServer} from 'node:http';
-import {once} from 'node:events';
 import {mkdtemp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {it,expect} from 'vitest';
+import {it,expect,vi} from 'vitest';
+import {CodexFixture} from '../../../core/src/__tests__/codex-fixture.js';
+const createCodexClient=vi.hoisted(()=>vi.fn());
+vi.mock('../../../core/src/codex/client.js',()=>({createCodexClient}));
 import {createWorkManifest,saveWorkManifest,syncWorkSourceArtifacts,loadWorkManifest,StateManager} from '@actalk/inkos-core';
 import {createStudioServer} from '../api/server.js';
 
-it('preserves a confirmed source revision and chapter bounds through the actual API before a producer failure',async()=>{
+it('reaches confirmed Codex production without a legacy API key and preserves source revision and chapter bounds before a producer failure',async()=>{
  const root=await mkdtemp(join(tmpdir(),'inkos-confirmed-source-'));let calls=0;
- const upstream=createServer(async(req,res)=>{for await(const _chunk of req){}calls++;res.writeHead(401,{'Content-Type':'application/json'});res.end(JSON.stringify({error:{message:'Fixture unavailable'}}));});
- upstream.listen(0,'127.0.0.1');await once(upstream,'listening');
+ const codex=new CodexFixture(()=>{calls++;return {error:'Fixture unavailable'};});
+ createCodexClient.mockImplementation(codex.createClient);
  try{
   await mkdir(join(root,'.inkos'));
-  const baseUrl=`http://127.0.0.1:${(upstream.address() as {port:number}).port}/v1`;
-  await writeFile(join(root,'inkos.json'),JSON.stringify({name:'fixture',version:'0.1.0',language:'en',llm:{defaultModel:'fixture-model',services:[{service:'custom',name:'fixture',baseUrl,apiFormat:'chat',stream:false,models:['fixture-model']}]}}));
-  await writeFile(join(root,'.inkos/secrets.json'),JSON.stringify({services:{'custom:fixture':{apiKey:'fixture'}}}));
+  await writeFile(join(root,'inkos.json'),JSON.stringify({name:'fixture',version:'0.1.0',language:'en'}));
   await saveWorkManifest(root,createWorkManifest({id:'parent',title:'Gallery',profileId:'longform-novel',language:'en'}));
   await mkdir(join(root,'works/parent/source'),{recursive:true});
   const manuscript='Nora returns the borrowed green map.\n';
@@ -31,5 +30,5 @@ it('preserves a confirmed source revision and chapter bounds through the actual 
   expect(await new StateManager(root).loadBookConfig('parallel')).toMatchObject({chapterWordCount:25,minChapterLength:20,maxChapterLength:30});
   expect((await loadWorkManifest(root,'parallel')).lineage).toEqual([{relation:'derived-from',sourceWorkId:source.workId,sourceArtifactId:source.artifactId,sourceRevisionId:source.revisionId}]);
   expect(await readFile(join(root,'works/parallel/source/source-material.md'),'utf8')).toBe(manuscript);
- }finally{upstream.closeAllConnections();await new Promise<void>(resolve=>upstream.close(()=>resolve()));await rm(root,{recursive:true,force:true});}
+ }finally{await rm(root,{recursive:true,force:true});}
 },20000);

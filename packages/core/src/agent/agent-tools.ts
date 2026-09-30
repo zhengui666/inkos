@@ -1,6 +1,6 @@
 import { createBuiltInWorkProfileRegistry } from "../harness/builtin-profiles.js";
 import { Type, type Static } from "@mariozechner/pi-ai";
-import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@mariozechner/pi-agent-core";
+import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "../codex/contracts.js";
 import type { PipelineRunner } from "../pipeline/runner.js";
 import { defaultChapterLength } from "../utils/length-metrics.js";
 import { mkdir, readFile, writeFile, readdir, rm, stat } from "node:fs/promises";

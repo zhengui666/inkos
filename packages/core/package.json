@@ -1,7 +1,7 @@
 {
   "name": "@actalk/inkos-core",
   "version": "2.0.0",
-  "description": "InkOS pi-agent production harness for story creation, governed context, retrieval, review, and interactive worlds",
+  "description": "InkOS Codex agent production harness for story creation, governed context, retrieval, review, and interactive worlds",
   "keywords": [
     "story-creation-ai-agent",
     "story-agent",
@@ -44,7 +44,7 @@
   },
   "files": [
     "dist",
-    "!dist/__tests__",
+    "!dist/**/__tests__",
     "skills"
   ],
   "license": "AGPL-3.0-only",
@@ -64,7 +64,6 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@mariozechner/pi-agent-core": "0.67.1",
     "@mariozechner/pi-ai": "0.67.1",
     "@sinclair/typebox": "^0.34.49",
     "dotenv": "^16.4.0",
@@ -73,7 +72,8 @@
     "js-yaml": "^4.1.1",
     "undici": "6.21.3",
     "unpdf": "^1.6.2",
-    "zod": "^3.25.76"
+    "zod": "^3.25.76",
+    "@openai/codex": "0.159.2"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",

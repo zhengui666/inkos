@@ -29,7 +29,7 @@ importCommand
     try {
       const root = findProjectRoot();
       const targetBookId = await resolveBookId(targetBookIdArg, root);
-      const config = await loadConfig();
+      const config = await loadConfig({ requireApiKey: false });
       const state = new StateManager(root);
       const targetBook = await state.loadBookConfig(targetBookId);
       const language = resolveCliLanguage(targetBook.language);
@@ -80,7 +80,7 @@ importCommand
     try {
       const root = findProjectRoot();
       const bookId = await resolveBookId(bookIdArg, root);
-      const config = await loadConfig();
+      const config = await loadConfig({ requireApiKey: false });
 
       const state = new StateManager(root);
       const book = await state.loadBookConfig(bookId);

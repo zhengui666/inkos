@@ -1,6 +1,6 @@
 import { loadWorkManifest } from "../work-store.js";
 import { Type } from "@sinclair/typebox";
-import type { AgentTool } from "@mariozechner/pi-agent-core";
+import type { AgentTool } from "../../codex/contracts.js";
 import type { PipelineRunner } from "../../pipeline/runner.js";
 import { runShortFictionStage, type ShortProductionStage } from "../../pipeline/short-fiction-runner.js";
 import { readShortProductionState } from "../../pipeline/short-production-state.js";

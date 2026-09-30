@@ -1,3 +1,6 @@
+import { CodexFixture } from './codex-fixture.js';
+const codex = vi.hoisted(() => ({ create: vi.fn() }));
+vi.mock('../codex/client.js', () => ({ createCodexClient: codex.create }));
 import{Type}from'@sinclair/typebox';
 import{createServer}from'node:http';import{once}from'node:events';import{mkdtemp,readFile,writeFile,rm}from'node:fs/promises';
 import{tmpdir}from'node:os';import{join}from'node:path';import{createHash}from'node:crypto';import{it,expect,vi}from'vitest';
@@ -34,6 +37,7 @@ it('records illustration methods and versioned output, invalidates stale scene i
  let releaseImage!:()=>void, markPending!:()=>void;
  const imageGate=new Promise<void>(r=>{releaseImage=r;}), imagePending=new Promise<void>(r=>{markPending=r;});
  const briefInputs:any[]=[];
+ const fixture=new CodexFixture(view=>{const body={tools:view.tools,messages:[{role:'system',content:view.thread.baseInstructions},...view.messages]};briefInputs.push(body);return{calls:[{name:view.tools[0]!.function.name,args:{prompt:'A worker beside a toolbox. Illustration '+briefInputs.length}}]};});codex.create.mockImplementation(fixture.createClient);
  const server=createServer(async(req,res)=>{const chunks=[];for await(const chunk of req)chunks.push(chunk);const bytes=Buffer.concat(chunks);
   let body:any;
   if(req.headers['content-type']?.startsWith('multipart/form-data')){
@@ -41,7 +45,6 @@ it('records illustration methods and versioned output, invalidates stale scene i
    const reference=form.get('image') as File;
    body={prompt:String(form.get('prompt')),model:String(form.get('model')),reference:Buffer.from(await reference.arrayBuffer())};
   }else body=JSON.parse(bytes.toString('utf8'));
-  if(req.url?.endsWith('/chat/completions')){briefInputs.push(body);res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({choices:[{finish_reason:'tool_calls',message:{tool_calls:[{id:'brief-'+briefInputs.length,type:'function',function:{name:body.tools[0].function.name,arguments:JSON.stringify({prompt:'A worker beside a toolbox. Illustration '+briefInputs.length})}}]}}]}));return;}
   requests.push({...body,route:req.url});
   if(requests.length===3){markPending();await imageGate;}
   res.writeHead(requests.length<=3?200:503,{'Content-Type':'application/json'});res.end(JSON.stringify(requests.length<=3?{data:[{b64_json:(requests.length===1?png:secondPng).toString('base64')}]}:{error:{message:'fixture unavailable'}}));});

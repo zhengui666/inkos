@@ -1,3 +1,4 @@
+import type { CodexSettings } from "../codex/settings.js";
 import type { LLMConfig } from "../models/project.js";
 import {
   streamSimple as piStreamSimple,
@@ -319,6 +320,8 @@ export interface LLMClient {
   readonly proxyUrl?: string;
   readonly _piModel?: PiModel<PiApi>;
   readonly _apiKey?: string;
+  /** Agent workers use Codex account/settings; provider fields remain for non-agent calls. */
+  readonly _codex?: { readonly projectRoot: string; readonly settings?: CodexSettings };
   readonly defaults: {
     readonly temperature: number;
     /**
@@ -333,7 +336,7 @@ export interface LLMClient {
 
 // === Factory ===
 
-export function createLLMClient(config: LLMConfig): LLMClient {
+export function createLLMClient(config: LLMConfig, projectRoot?: string): LLMClient {
   const _earlyCard = lookupModel(config.service ?? "custom", config.model);
   const defaults = {
     temperature: config.temperature ?? 0.7,
@@ -390,6 +393,7 @@ export function createLLMClient(config: LLMConfig): LLMClient {
   };
 
   return {
+    ...(projectRoot ? { _codex: { projectRoot } } : {}),
     provider,
     service: serviceName,
     configSource: config.configSource,
