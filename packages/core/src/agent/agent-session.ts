@@ -4,7 +4,7 @@ import { Agent } from "../codex/agent.js";
 import { readCodexSettings } from "../codex/settings.js";
 import { resolveCodexModel } from "../codex/model.js";
 import { preserveToolArgumentTypes } from "./tool-arguments.js";
-import { createTurnCompletionTool, TurnArtifactDeliveries, TURN_COMPLETION_GUIDANCE, TURN_COMPLETION_TOOL, type TurnCompletion } from "./turn-completion.js";
+import { createTurnCompletionTool, TurnArtifactDeliveries, TURN_COMPLETION_GUIDANCE, TURN_COMPLETION_TOOL, TurnCompletionSchema, parseTurnCompletion, type TurnCompletion } from "./turn-completion.js";
 import type { AgentEvent, AgentMessage } from "../codex/contracts.js";
 import type {
   Model,
@@ -65,7 +65,7 @@ import {
   sanitizeSkillTurnMessage,
   type ActivatedSkillGuidance,
 } from "./skill-tool.js";
-import { withExecutionEvidence } from "../harness/execution-evidence.js";
+import { withExecutionEvidence, recordExecutionEvidence } from "../harness/execution-evidence.js";
 import { opaqueConversationId, runWithAgentTrajectory } from "../llm/agent-trajectory.js";
 import { splitTextByEstimatedTokens } from "../llm/semantic-input.js";
 import { estimateTextTokens } from "../llm/provider.js";
@@ -168,6 +168,8 @@ export interface AgentSessionResult {
   messages: AgentMessage[];
   /** Upstream model error surfaced by Codex, if the final assistant turn failed. */
   errorMessage?: string;
+  /** Bounded operational facts, without assistant text or tool argument payloads. */
+  completionDiagnostics?: { code: string; modelTurns: number; finalResponses: number; completionCalls: number; rejectedCompletionCalls: number };
   /** Profile that governed this turn. */
   profileId: string;
   /** Work bound to this turn, if any. */
@@ -1043,6 +1045,7 @@ async function runAgentSessionUnlocked(
       projectRoot,
       settings: codexSettings,
       maxOutputTokens: agentOutputBudget(model),
+      outputSchema: JSON.parse(JSON.stringify(TurnCompletionSchema)),
       beforeToolCall: preserveToolArgumentTypes,
       initialState: {
         model,
@@ -1154,6 +1157,7 @@ async function runAgentSessionUnlocked(
   let piTurnIndex = 0;
   let lastAssistantUuid: string | null = null;
   let skillTurnActive = cached.turnSkills.size > 0;
+  let completionPersisted = false;
 
   // ----- Prepare transcript persistence -----
   const requestId = randomUUID();
@@ -1256,6 +1260,9 @@ async function runAgentSessionUnlocked(
     const controlMessage = role === "assistant"
       ? (event.message as AssistantMessage).content.some(part => part.type === "toolCall" && part.name === TURN_COMPLETION_TOOL)
       : role === "toolResult" && (event.message as ToolResultMessage).toolName === TURN_COMPLETION_TOOL;
+    // Main-agent prose is provisional until the explicit completion is
+    // accepted. Keep raw structured output in model history, never the UI.
+    const provisionalText = role === "assistant" && (event.message as AssistantMessage).content.some(part => part.type === "text");
     const completion = role === "assistant" && cached?.turnCompletion
       && (event.message as AssistantMessage).content.length === 0 ? cached.turnCompletion : undefined;
     const uuid = randomUUID();
@@ -1270,7 +1277,7 @@ async function runAgentSessionUnlocked(
       parentUuid: isToolResult && lastAssistantUuid ? lastAssistantUuid : parentUuid,
       seq,
       role,
-      ...(controlMessage ? { visibility: "model" as const } : {}),
+      ...(controlMessage || provisionalText ? { visibility: "model" as const } : {}),
       ...(completion ? { display: { completion } } : {}),
       timestamp: messageTimestamp(event.message),
       piTurnIndex,
@@ -1285,6 +1292,7 @@ async function runAgentSessionUnlocked(
       message: persistedMessage,
     }));
 
+    if (completion) completionPersisted = true;
     if (role === "assistant") lastAssistantUuid = uuid;
     parentUuid = uuid;
   };
@@ -1292,6 +1300,7 @@ async function runAgentSessionUnlocked(
   // ----- Subscribe to events (transcript persistence + SSE forwarding) -----
   const unsubscribe = agent.subscribe(async (event: AgentEvent) => {
     await persistAgentEvent(event);
+    if (event.type === "message_update" && ["text_start", "text_delta", "text_end"].includes(event.assistantMessageEvent.type)) return;
     if ((event.type === "tool_execution_start" || event.type === "tool_execution_end" || event.type === "tool_execution_update")
       && event.toolName === TURN_COMPLETION_TOOL) return;
     onEvent?.(event);
@@ -1300,6 +1309,9 @@ async function runAgentSessionUnlocked(
   // ----- Execute the turn -----
   let finalAssistant: AssistantMessage | undefined;
   let errorMessage: string | undefined;
+  let completionError: (Error & { code?: string }) | undefined;
+  let finalResponses = 0;
+  let completionDiagnostics: AgentSessionResult["completionDiagnostics"];
   const turnMessageStartIndex = agent.state.messages.length;
   const abortContainingWorkflow = () => agent.abort();
   config.signal?.addEventListener("abort", abortContainingWorkflow, { once: true });
@@ -1320,13 +1332,52 @@ async function runAgentSessionUnlocked(
       } else {
         await agent.prompt(promptMessage);
       }
-      // Codex's model loop can return prose without the host completion receipt.
-      // Give it one bounded continuation; never retry an interrupted/failed run.
+      const acceptNativeCompletion = async () => {
+        config.signal?.throwIfAborted();
+        const last = lastAssistantMessage(agent.state.messages);
+        if (cached!.turnCompletion || cached!.pendingWorkTransition || cached!.completedPlayScene !== undefined
+          || last?.stopReason === "error" || last?.stopReason === "aborted" || !agent.finalOutput?.trim()) return;
+        finalResponses += 1;
+        try {
+          const parameters = parseTurnCompletion(agent.finalOutput);
+          const completionTool = agent.state.tools.find(tool => tool.name === TURN_COMPLETION_TOOL);
+          if (!completionTool) throw new Error("The host completion validator is unavailable.");
+          // Run the identical domain validator, without inventing a model tool
+          // call or replaying any production action from the final response.
+          await completionTool.execute("native-completion", parameters, config.signal);
+          config.signal?.throwIfAborted();
+        } catch (error) {
+          config.signal?.throwIfAborted();
+          completionError = error instanceof Error ? error : new Error(String(error));
+          recordExecutionEvidence("turn-completion-rejected", { code: completionError.code ?? "TURN_COMPLETION_INVALID" });
+          return;
+        }
+        // Persistence failures are fatal, never schema-repair feedback after
+        // the completion validator has already accepted the result.
+        recordExecutionEvidence("turn-completion-accepted", { transport: "outputSchema", status: cached!.turnCompletion!.status });
+
+      };
+      await acceptNativeCompletion();
+      // Preserve the existing one-correction budget. Give concrete contract
+      // feedback in host instructions, not a new synthetic author request.
       const previous = lastAssistantMessage(agent.state.messages);
       if (!cached!.turnCompletion && !cached!.pendingWorkTransition && cached!.completedPlayScene === undefined
         && previous?.stopReason !== "error" && previous?.stopReason !== "aborted") {
         config.signal?.throwIfAborted();
-        await agent.continue();
+        const original = agent.state.systemPrompt;
+        agent.state.systemPrompt = `${original}\n\nThe host did not accept a completion. ${completionError?.message ?? "No final completion was received."} Continue unfinished work from the recorded tool receipts without repeating successful operations. When the request is answered, delivered, blocked or needs input, return the complete declared completion object or use finish_turn.`;
+        try { await agent.continue(); } finally { agent.state.systemPrompt = original; }
+        await acceptNativeCompletion();
+      }
+      const terminal = lastAssistantMessage(agent.state.messages);
+      if (cached!.turnCompletion && !completionPersisted && terminal?.stopReason !== "error" && terminal?.stopReason !== "aborted") {
+        // Persist exactly one host display receipt for either transport. A
+        // trailing model message after finish_turn must not hide its response.
+        const receipt: AssistantMessage = { ...terminal!, content: [], timestamp: Date.now(), stopReason: "stop",
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+        agent.state.messages.push(receipt);
+        await persistAgentEvent({ type: "message_end", message: receipt });
       }
     }));
 
@@ -1344,9 +1395,16 @@ async function runAgentSessionUnlocked(
     errorMessage = assistantErrorMessage(finalAssistant)
       ?? (turnAborted ? "Agent turn aborted." : undefined)
       ?? (!cached.pendingWorkTransition && cached.completedPlayScene === undefined && !completion
-        ? "Agent ended without an explicit completion result." : undefined)
+        ? completionError?.message ?? "Agent ended without an explicit completion result." : undefined)
       ?? (!turnHasObservableOutcome(turnMessages) ? "Agent returned no text or tool result." : undefined);
     if (errorMessage) {
+      if (!completion && !cached.pendingWorkTransition && cached.completedPlayScene === undefined
+        && finalAssistant?.stopReason !== "error" && !turnAborted) {
+        const receipts = turnMessages.filter((message): message is ToolResultMessage => message.role === "toolResult" && message.toolName === TURN_COMPLETION_TOOL);
+        completionDiagnostics = { code: completionError?.code ?? "TURN_COMPLETION_MISSING", modelTurns: piTurnIndex,
+          finalResponses, completionCalls: receipts.length, rejectedCompletionCalls: receipts.filter(message => message.isError).length };
+        errorMessage = `${errorMessage} [${Object.entries(completionDiagnostics).map(([key, value]) => `${key}=${value}`).join(", ")}]`;
+      }
       const failedError = errorMessage;
       await appendAgentTranscriptEvent(projectRoot, sessionId, (seq) => ({
         type: "request_failed",
@@ -1369,6 +1427,13 @@ async function runAgentSessionUnlocked(
         timestamp: Date.now(),
       }));
       cached.lastCommittedSeq = committed.seq;
+      // Publish only the host-validated message, once, after durable commit.
+      if (completion) {
+        const message = { ...finalAssistant!, content: [{ type: "text" as const, text: completion.message }] };
+        onEvent?.({ type: "message_update", message, assistantMessageEvent: {
+          type: "text_delta", contentIndex: 0, delta: completion.message, partial: message,
+        } });
+      }
       finishEpisode(completion?.status === "blocked" ? "failed" : "completed");
     }
   } catch (error) {
@@ -1407,6 +1472,7 @@ async function runAgentSessionUnlocked(
     ...(completion ? { completion } : {}),
     ...(cached.pendingWorkTransition ? { workTransition: cached.pendingWorkTransition } : {}),
     ...(errorMessage ? { errorMessage } : {}),
+    ...(completionDiagnostics ? { completionDiagnostics } : {}),
   };
 }
 

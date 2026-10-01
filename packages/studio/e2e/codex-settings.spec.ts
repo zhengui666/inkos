@@ -304,3 +304,70 @@ for (const failure of ["transport", "conflict"] as const) {
     expect(scans).toBe(1);
   });
 }
+
+for (const outcome of ['answered', 'blocked'] as const) {
+  test(`main chat shows one validated ${outcome} response across SSE, HTTP and reload`, async ({ page }) => {
+    // Exercise the real chat UI while fixture endpoints supply the same public
+    // SSE/HTTP contract verified against the real main Agent in backend tests.
+    await page.addInitScript(() => {
+      class FixtureEvents extends EventTarget {
+        static CONNECTING = 0; static OPEN = 1; static CLOSED = 2;
+        readyState = 1; onopen: ((event: Event) => void) | null = null; onerror = null;
+        constructor(_url: string) {
+          super();
+          const browser = window as unknown as { fixtureEvents: FixtureEvents[] };
+          (browser.fixtureEvents ??= []).push(this);
+          queueMicrotask(() => this.onopen?.(new Event('open')));
+        }
+        close() { this.readyState = 2; }
+      }
+      (window as unknown as { EventSource: unknown }).EventSource = FixtureEvents;
+    });
+    await mockCodex(page);
+    let session: Record<string, any> | undefined;
+    let sends = 0;
+    const response = outcome === 'answered' ? 'A scene is a unit of dramatic action.' : 'The required source is unavailable; no work has been created.';
+    await page.route('**/api/v1/sessions**', route => {
+      const url = new URL(route.request().url());
+      if (url.pathname === '/api/v1/sessions' && route.request().method() === 'POST') {
+        const requested = route.request().postDataJSON();
+        session = { ...requested, bookId: null, sessionKind: 'chat', profileId: 'workspace-default', workId: null,
+          title: 'Completion fixture', updatedAt: Date.now(), createdAt: Date.now(), messageCount: 0, messages: [] };
+        return route.fulfill({ json: { session } });
+      }
+      if (url.pathname === '/api/v1/sessions') return route.fulfill({ json: { sessions: session ? [session] : [] } });
+      return route.fulfill({ json: { session } });
+    });
+    await page.route('**/api/v1/agent', async route => {
+      sends++;
+      const request = route.request().postDataJSON();
+      const sessionId = request.sessionId;
+      session = { ...session, sessionId, messageCount: 2, messages: [
+        { role: 'user', content: request.instruction, timestamp: Date.now() },
+        { role: 'assistant', content: response, timestamp: Date.now() + 1 },
+      ] };
+      await page.evaluate(({ sessionId, response, outcome }) => {
+        for (const stream of (window as unknown as { fixtureEvents: Array<EventTarget & { readyState: number }> }).fixtureEvents) {
+          if (stream.readyState !== 1) continue;
+          stream.dispatchEvent(new MessageEvent('draft:delta', { data: JSON.stringify({ sessionId, text: response }) }));
+          if (outcome === 'answered') stream.dispatchEvent(new MessageEvent('agent:complete', { data: JSON.stringify({ sessionId }) }));
+        }
+      }, { sessionId, response, outcome });
+      await route.fulfill({ status: outcome === 'blocked' ? 422 : 200, json: {
+        response, completionStatus: outcome, session, details: { toolExecutions: [] },
+        ...(outcome === 'blocked' ? { error: { code: 'AGENT_TASK_INCOMPLETE', message: response } } : {}),
+      } });
+    });
+    await page.goto('/#/chat');
+    const input = page.getByPlaceholder('Enter command...');
+    await expect(input).toBeEnabled();
+    await input.fill(outcome === 'answered' ? 'Explain a scene.' : 'Use the unavailable source.');
+    await input.press('Enter');
+    await expect(page.getByText(response, { exact: true })).toHaveCount(1);
+    await expect(page.getByText(/Agent ended without an explicit completion result/)).toHaveCount(0);
+    await expect(page.getByText(/"status"\s*:\s*"(answered|blocked)"/)).toHaveCount(0);
+    await page.reload();
+    await expect(page.getByText(response, { exact: true })).toHaveCount(1);
+    expect(sends).toBe(1);
+  });
+}

@@ -34,7 +34,7 @@ jobs:
         if: runner.os == 'Linux'
         env:
           INKOS_CODEX_INTEGRATION: '1'
-        run: pnpm --filter @actalk/inkos-core exec vitest run src/codex/__tests__/isolation.integration.test.ts src/codex/__tests__/worker-output.integration.test.ts
+        run: pnpm --filter @actalk/inkos-core exec vitest run src/codex/__tests__/isolation.integration.test.ts src/codex/__tests__/worker-output.integration.test.ts src/codex/__tests__/code-mode.integration.test.ts src/codex/__tests__/main-completion.integration.test.ts
 
   codex-browser:
     runs-on: ubuntu-latest

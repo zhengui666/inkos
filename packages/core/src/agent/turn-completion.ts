@@ -1,20 +1,37 @@
 import { Type, type Static } from "@sinclair/typebox";
+import { Value } from "@sinclair/typebox/value";
 import type { AgentTool } from "../codex/contracts.js";
 import type { ActionResult } from "../harness/contracts.js";
 import { loadWorkManifest } from "../harness/work-store.js";
 
 export const TURN_COMPLETION_TOOL = "finish_turn";
 export const TurnCompletionSchema = Type.Object({
-  status: Type.Union([Type.Literal("answered"), Type.Literal("delivered"), Type.Literal("needs_input"), Type.Literal("blocked")]),
-  message: Type.String({ minLength: 1 }),
+  status: Type.Union([
+    Type.Literal("answered", { description: "An informational or discussion request was answered. Not an execution request with actions still outstanding." }),
+    Type.Literal("delivered", { description: "The requested actions actually completed, grounded in successful host action and artifact receipts." }),
+    Type.Literal("needs_input", { description: "A necessary user decision or genuinely missing input prevents further work; ask a concrete question." }),
+    Type.Literal("blocked", { description: "A concrete current blocker prevents the requested work; explain it and distinguish saved work from unfinished work." }),
+  ]),
+  message: Type.String({ minLength: 1, description: "User-facing result, necessary question, or concrete blocker. A plan or promised future action is not a delivery." }),
 }, { additionalProperties: false });
 export type TurnCompletion = Static<typeof TurnCompletionSchema>;
 
 export const TURN_COMPLETION_GUIDANCE = `## Turn completion
-Use finish_turn to return the final response after answering the request, delivering its requested actions, or identifying a concrete blocker or necessary user decision.
+Return the terminal response through the declared native outputSchema (status and message), or call finish_turn for immediate host validation, after answering the request, delivering its requested actions, or identifying a concrete blocker or necessary user decision. Both channels use the same host completion checks.
 Announcing planned work is not completion. When work remains possible, call the relevant execution tool and continue from saved results.
 Use answered only for information or discussion; delivered for completed action results; needs_input for a necessary user decision; blocked when the request cannot currently proceed.
-Call finish_turn alone after other operations finish. Ground delivery claims in actual tool results. A recoverable tool error does not complete the original request.`;
+The final output must be the complete status/message object without prose outside it or Markdown fences. Submit only after other operations finish; a successful finish_turn already completes the response. Ground delivery claims in actual tool results. A recoverable tool error does not complete the original request.`;
+
+/** Decode only the explicitly requested whole final response, never extract JSON
+ * from prose or infer a delivery from an ordinary assistant message. */
+export function parseTurnCompletion(text: string): TurnCompletion {
+  let value: unknown;
+  try { value = JSON.parse(text); } catch { /* Report a bounded contract error. */ }
+  if (!Value.Check(TurnCompletionSchema, value)) throw Object.assign(new Error(
+    "The final response did not match the required status/message completion contract."
+  ), { code: "TURN_COMPLETION_INVALID" });
+  return value;
+}
 
 /** Current-version reviews and exports become stale when their source changes.
  * Historical reviews are intentional snapshots and create no refresh obligation.
@@ -82,6 +99,7 @@ export function createTurnCompletionTool(options: {
         throw Object.assign(new Error("Delivery requires successful production or artifact results. Continue unfinished work or report the concrete blocker."), { code: "TURN_DELIVERY_UNPROVEN" });
       }
       if (input.status === "delivered") await options.validateDelivery?.();
+      signal?.throwIfAborted();
       options.complete(input);
       return { content: [{ type: "text", text: input.message }], details: { kind: "turn_completion", ...input } };
     },
