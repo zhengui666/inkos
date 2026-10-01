@@ -57,6 +57,7 @@ describe("chat message actions", () => {
 
   afterEach(() => {
     closeStudioEventConnections();
+    vi.useRealTimers();
     (globalThis as any).EventSource = originalEventSource;
   });
 
@@ -1327,6 +1328,147 @@ describe("chat message actions", () => {
 
     resolveAgent({ response: "聊完了。", session: { sessionId, sessionKind: "short" } });
     await sent;
+  });
+
+  for (const outcome of ["answered", "blocked"] as const) {
+    for (const flushBeforeHttp of [false, true]) {
+      it(`settles ${outcome} once when text is ${flushBeforeHttp ? "rendered" : "still batched"} before HTTP`, async () => {
+        const store = createTestStore();
+        fetchJson.mockResolvedValueOnce({ session: { sessionId: "settlement", bookId: null, sessionKind: "chat" } });
+        const sessionId = await store.getState().createSession(null, "chat");
+        let resolveAgent!: (value: unknown) => void, rejectAgent!: (error: Error) => void;
+        fetchJson.mockImplementationOnce(() => new Promise((resolve, reject) => { resolveAgent = resolve; rejectAgent = reject; }));
+        vi.useFakeTimers();
+        const sent = store.getState().sendMessage(sessionId, "Use the source");
+        const events = fakeEventSources.at(-1)!;
+        const response = outcome === "blocked" ? "Source unavailable; nothing saved." : "Source explained.";
+        events.emit("draft:delta", { sessionId, text: response });
+        if (flushBeforeHttp) vi.advanceTimersByTime(100);
+        const payload = { response, completionStatus: outcome, session: { sessionId, sessionKind: "chat" } };
+        if (outcome === "blocked") rejectAgent(Object.assign(new Error(response), { payload: {
+          ...payload, error: { code: "AGENT_TASK_INCOMPLETE", message: response },
+        } }));
+        else resolveAgent(payload);
+        await sent;
+        // The original bug appears AFTER HTTP settles, when its pending 48ms
+        // timer creates another assistant message. Never assert transient count.
+        vi.advanceTimersByTime(1_000);
+        expect(store.getState().sessions[sessionId]?.messages.filter(message => message.role === "assistant"))
+          .toEqual([expect.objectContaining({ content: response, ...(outcome === "blocked" ? { kind: "error" } : {}) })]);
+        expect(store.getState().sessions[sessionId]).toMatchObject({ isStreaming: false, isChatStreaming: false, stream: null });
+        expect(Boolean(store.getState().sessions[sessionId]?.lastFailedSend)).toBe(outcome === "blocked");
+        expect(fetchJson.mock.calls.filter(([path]) => path === "/agent")).toHaveLength(1);
+      });
+    }
+  }
+
+  it("ignores late chat text after HTTP while still receiving a background task's completion", async () => {
+    const store = createTestStore();
+    const sessionId = await setupRunningTaskSession(store);
+    fetchJson.mockResolvedValueOnce({ response: "Chat complete.", session: { sessionId, sessionKind: "short" } });
+    vi.useFakeTimers();
+    await store.getState().sendMessage(sessionId, "Explain the progress");
+    const events = fakeEventSources.at(-1)!;
+    expect(events.closed).toBe(false);
+    events.emit("draft:delta", { sessionId, text: "Chat complete." });
+    events.emit("thinking:start", { sessionId });
+    events.emit("thinking:delta", { sessionId, text: "Late reasoning" });
+    events.emit("thinking:end", { sessionId });
+    vi.advanceTimersByTime(1_000);
+    expect(store.getState().sessions[sessionId]?.messages.filter(message => message.content === "Chat complete.")).toHaveLength(1);
+    expect(store.getState().sessions[sessionId]?.messages.some(message => message.thinking?.includes("Late reasoning"))).toBe(false);
+    events.emit("tool:end", { sessionId, id: "direct-short_run-1", tool: "short_fiction_run", result: { content: [{ type: "text", text: "Saved" }] } });
+    events.emit("agent:complete", { sessionId });
+    expect(findTaskExecution(store, sessionId)?.status).toBe("completed");
+    expect(store.getState().sessions[sessionId]?.stream).toBeNull();
+  });
+
+  it("ignores a stopped chat's late HTTP success when its original stream is kept for background work", async () => {
+    const store = createTestStore();
+    const sessionId = await setupRunningTaskSession(store);
+    let resolveAgent!: (value: unknown) => void;
+    fetchJson.mockImplementationOnce(() => new Promise(resolve => { resolveAgent = resolve; }));
+    const sent = store.getState().sendMessage(sessionId, "Explain progress");
+    const events = fakeEventSources.at(-1)!;
+    const original = store.getState().sessions[sessionId]!;
+    fetchJson.mockResolvedValueOnce({ ok: true, aborted: true });
+    await store.getState().abortSession(sessionId, "chat");
+    expect(events.closed).toBe(false);
+    const stopped = store.getState().sessions[sessionId]!.messages;
+    resolveAgent({ response: "Late success", session: { sessionId, workId: "stale-work", profileId: "script" } });
+    await sent;
+    expect(store.getState().sessions[sessionId]).toMatchObject({
+      workId: original.workId, profileId: original.profileId, messages: stopped, isChatStreaming: false, isStreaming: true,
+    });
+    expect(findTaskExecution(store, sessionId)?.status).toBe("running");
+    events.emit("tool:end", { sessionId, id: "direct-short_run-1", tool: "short_fiction_run", result: { content: [{ type: "text", text: "Saved" }] } });
+    events.emit("agent:complete", { sessionId });
+    expect(findTaskExecution(store, sessionId)?.status).toBe("completed");
+    expect(store.getState().sessions[sessionId]?.stream).toBeNull();
+  });
+
+  it("drops queued chat text after stop while preserving a background task's stream", async () => {
+    const store = createTestStore();
+    const sessionId = await setupRunningTaskSession(store);
+    let rejectAgent!: (error: Error) => void;
+    fetchJson.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectAgent = reject; }));
+    vi.useFakeTimers();
+    const sent = store.getState().sendMessage(sessionId, "Explain progress");
+    const events = fakeEventSources.at(-1)!;
+    events.emit("draft:delta", { sessionId, text: "Stopped text" });
+    fetchJson.mockResolvedValueOnce({ ok: true, aborted: true });
+    await store.getState().abortSession(sessionId, "chat");
+    vi.advanceTimersByTime(1_000);
+    expect(events.closed).toBe(false);
+    expect(store.getState().sessions[sessionId]?.messages.some(message => message.content === "Stopped text")).toBe(false);
+    rejectAgent(Object.assign(new Error("Aborted"), { name: "AbortError" }));
+    await sent;
+    expect(findTaskExecution(store, sessionId)?.status).toBe("running");
+  });
+
+  it("does not revive buffered text or a late HTTP success after stop and a newer request", async () => {
+    const store = createTestStore();
+    fetchJson.mockResolvedValueOnce({ session: { sessionId: "superseded", bookId: null, sessionKind: "chat" } });
+    const sessionId = await store.getState().createSession(null, "chat");
+    let finishOld!: (value: unknown) => void, finishNew!: (value: unknown) => void;
+    fetchJson.mockImplementationOnce(() => new Promise(resolve => { finishOld = resolve; }));
+    vi.useFakeTimers();
+    const oldSend = store.getState().sendMessage(sessionId, "Old request");
+    fakeEventSources.at(-1)!.emit("draft:delta", { sessionId, text: "Old response" });
+    fetchJson.mockResolvedValueOnce({ ok: true, aborted: true });
+    await store.getState().abortSession(sessionId, "chat");
+    vi.advanceTimersByTime(1);
+    fetchJson.mockImplementationOnce(() => new Promise(resolve => { finishNew = resolve; }));
+    const newSend = store.getState().sendMessage(sessionId, "New request");
+    const before = store.getState().sessions[sessionId]!.messages;
+    finishOld({ response: "Old response", session: { sessionId, workId: "stale-work" } });
+    await oldSend;
+    vi.advanceTimersByTime(1_000);
+    expect(store.getState().sessions[sessionId]!.messages).toEqual(before);
+    expect(store.getState().sessions[sessionId]).toMatchObject({ isChatStreaming: true, workId: undefined });
+    finishNew({ response: "New response" });
+    await newSend;
+  });
+
+  it("restores a saved blocked completion as one error with retry without duplicating its text", async () => {
+    const store = createTestStore();
+    const sessionId = "saved-blocked", response = "Source unavailable; nothing saved.";
+    const snapshot = { session: { sessionId, bookId: null, sessionKind: "chat" as const, messages: [
+      { role: "user" as const, content: "Use the source", timestamp: 10 },
+      { role: "assistant" as const, content: response, timestamp: 20 },
+    ] }, chatRequest: { sessionId, requestId: "blocked-round", startedAt: 10, completedAt: 30,
+      status: "failed" as const, completionStatus: "blocked" as const,
+      error: { code: "AGENT_TASK_INCOMPLETE", message: response }, retry: { text: "Use the source" } } };
+    await store.getState().loadSessionDetail(sessionId, true, snapshot);
+    await store.getState().loadSessionDetail(sessionId, true, snapshot);
+    expect(store.getState().sessions[sessionId]?.messages).toEqual([
+      expect.objectContaining({ role: "user" }), expect.objectContaining({ role: "assistant", content: response, kind: "error" }),
+    ]);
+    expect(store.getState().sessions[sessionId]).toMatchObject({ lastError: response, lastFailedSend: snapshot.chatRequest.retry });
+    // Identical wording from an earlier request is not this round's receipt.
+    await store.getState().loadSessionDetail(sessionId, true, { ...snapshot,
+      chatRequest: { ...snapshot.chatRequest, startedAt: 25 } });
+    expect(store.getState().sessions[sessionId]?.messages).toHaveLength(3);
   });
 
   it("records the failed send with its original text and options when /agent rejects", async () => {

@@ -142,6 +142,8 @@ export interface SessionRuntime {
   readonly isChatStreaming: boolean;
   /** The server owns this round after its HTTP response connection was lost. */
   readonly detachedChatRequestId?: string;
+  /** Local HTTP send that may still update this session, even after task handoff. */
+  readonly pendingSendId?: string;
   readonly lastError: string | null;
   // 上一条失败的聊天轮发送记录：请求失败（fetch 拒绝、/agent 返回 error 等）时写入，
   // 新一轮发送开始时清除。用户主动停止与后台生产任务轮的失败不记录

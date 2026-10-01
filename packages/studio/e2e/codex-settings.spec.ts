@@ -306,9 +306,12 @@ for (const failure of ["transport", "conflict"] as const) {
 }
 
 for (const outcome of ['answered', 'blocked'] as const) {
-  test(`main chat shows one validated ${outcome} response across SSE, HTTP and reload`, async ({ page }) => {
+  for (const timing of ['buffered', 'flushed', 'terminal'] as const) {
+  test(`main chat settles ${outcome} once with ${timing} SSE text, HTTP and reload`, async ({ page }) => {
     // Exercise the real chat UI while fixture endpoints supply the same public
     // SSE/HTTP contract verified against the real main Agent in backend tests.
+    // Freeze timers after setup to control the 48ms batch/HTTP race explicitly.
+    await page.clock.install({ time: new Date('2026-01-01T00:00:00Z') });
     await page.addInitScript(() => {
       class FixtureEvents extends EventTarget {
         static CONNECTING = 0; static OPEN = 1; static CLOSED = 2;
@@ -325,6 +328,7 @@ for (const outcome of ['answered', 'blocked'] as const) {
     });
     await mockCodex(page);
     let session: Record<string, any> | undefined;
+    let chatRequest: Record<string, any> | undefined;
     let sends = 0;
     const response = outcome === 'answered' ? 'A scene is a unit of dramatic action.' : 'The required source is unavailable; no work has been created.';
     await page.route('**/api/v1/sessions**', route => {
@@ -336,23 +340,29 @@ for (const outcome of ['answered', 'blocked'] as const) {
         return route.fulfill({ json: { session } });
       }
       if (url.pathname === '/api/v1/sessions') return route.fulfill({ json: { sessions: session ? [session] : [] } });
-      return route.fulfill({ json: { session } });
+      return route.fulfill({ json: { session, chatRequest } });
     });
     await page.route('**/api/v1/agent', async route => {
       sends++;
       const request = route.request().postDataJSON();
       const sessionId = request.sessionId;
+      const startedAt = Date.now();
       session = { ...session, sessionId, messageCount: 2, messages: [
-        { role: 'user', content: request.instruction, timestamp: Date.now() },
-        { role: 'assistant', content: response, timestamp: Date.now() + 1 },
+        { role: 'user', content: request.instruction, timestamp: startedAt },
+        { role: 'assistant', content: response, timestamp: startedAt + 1 },
       ] };
-      await page.evaluate(({ sessionId, response, outcome }) => {
+      chatRequest = { sessionId, requestId: request.clientRequestId, startedAt, completedAt: startedAt + 2,
+        status: outcome === 'blocked' ? 'failed' : 'completed', completionStatus: outcome,
+        ...(outcome === 'blocked' ? { error: { code: 'AGENT_TASK_INCOMPLETE', message: response }, retry: { text: request.instruction } } : {}),
+      };
+      await page.evaluate(({ sessionId, response, outcome, timing }) => {
         for (const stream of (window as unknown as { fixtureEvents: Array<EventTarget & { readyState: number }> }).fixtureEvents) {
           if (stream.readyState !== 1) continue;
           stream.dispatchEvent(new MessageEvent('draft:delta', { data: JSON.stringify({ sessionId, text: response }) }));
-          if (outcome === 'answered') stream.dispatchEvent(new MessageEvent('agent:complete', { data: JSON.stringify({ sessionId }) }));
+          if (timing === 'terminal') stream.dispatchEvent(new MessageEvent(outcome === 'answered' ? 'agent:complete' : 'agent:error', { data: JSON.stringify({ sessionId }) }));
         }
-      }, { sessionId, response, outcome });
+      }, { sessionId, response, outcome, timing });
+      if (timing === 'flushed') await page.clock.fastForward(100);
       await route.fulfill({ status: outcome === 'blocked' ? 422 : 200, json: {
         response, completionStatus: outcome, session, details: { toolExecutions: [] },
         ...(outcome === 'blocked' ? { error: { code: 'AGENT_TASK_INCOMPLETE', message: response } } : {}),
@@ -361,13 +371,24 @@ for (const outcome of ['answered', 'blocked'] as const) {
     await page.goto('/#/chat');
     const input = page.getByPlaceholder('Enter command...');
     await expect(input).toBeEnabled();
+    await page.clock.pauseAt(new Date('2026-01-01T00:01:00Z'));
     await input.fill(outcome === 'answered' ? 'Explain a scene.' : 'Use the unavailable source.');
+    const reply = page.waitForResponse(result => result.url().endsWith('/api/v1/agent'));
     await input.press('Enter');
+    await (await reply).finished();
+    // Wait for HTTP settlement, then run every buffered text timer before the
+    // uniqueness assertion. A fleeting single response cannot pass this test.
+    if (outcome === 'blocked') await expect(page.getByRole('button', { name: 'Retry last message' })).toBeVisible();
+    else await expect(page.getByRole('button', { name: 'Add skill', exact: true })).toBeEnabled();
+    await page.clock.fastForward(1_000);
     await expect(page.getByText(response, { exact: true })).toHaveCount(1);
     await expect(page.getByText(/Agent ended without an explicit completion result/)).toHaveCount(0);
     await expect(page.getByText(/"status"\s*:\s*"(answered|blocked)"/)).toHaveCount(0);
+    await page.clock.resume();
     await page.reload();
     await expect(page.getByText(response, { exact: true })).toHaveCount(1);
+    await expect(page.getByRole('button', { name: 'Retry last message' })).toHaveCount(outcome === 'blocked' ? 1 : 0);
     expect(sends).toBe(1);
   });
+  }
 }
