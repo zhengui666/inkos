@@ -91,6 +91,25 @@ tool arguments before executing them. This is not a provider-side billing cap or
 an exact tokenizer limit. Native web access stays disabled; research uses the
 permissioned host capability.
 
+## Long-running workers
+
+Text and structured workers have a **60-minute total deadline per worker**,
+including any result-correction turns. Set `INKOS_WORKER_TIMEOUT_MS` in the InkOS
+server/CLI environment before starting it to change this budget; for example,
+`INKOS_WORKER_TIMEOUT_MS=7200000` allows two hours. Restart Studio after changing
+its environment. An explicit worker `timeoutMs` takes precedence. Values must be
+integer milliseconds from 1 to 2147483647; invalid values fail clearly rather than
+silently overflowing Node's timer to one millisecond.
+
+This is a worker budget, not a whole novel's duration: sequential workers each
+receive their own budget. User cancellation still interrupts immediately, and a
+real timeout still closes the Codex peer and preserves draft/candidate artifacts
+for recovery. Increasing the deadline does not automatically retry a failed Work.
+Codex's 60-second JSON-RPC timeout covers request acknowledgements, not the running
+turn, which waits for completion notifications under the worker's abort signal.
+The main chat does not impose a separate ten-minute generation deadline. Market
+radar retains its separate five-minute scan budget.
+
 ## Boundaries and persistence
 
 - InkOS exposes only its current Work Profile's host-owned dynamic tools. Existing

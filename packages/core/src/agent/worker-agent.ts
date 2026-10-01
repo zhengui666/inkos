@@ -18,7 +18,7 @@ import { preserveToolArgumentTypes, toolArgumentIssues } from "./tool-arguments.
 export interface WorkerAgentOptions {
   /** Resolve the same persisted Codex account/model settings as the parent workflow. */
   readonly projectRoot?: string;
-  /** Total worker deadline, including correction turns (default: ten minutes). */
+  /** Total worker deadline, including correction turns; overrides INKOS_WORKER_TIMEOUT_MS (default: one hour). */
   readonly timeoutMs?: number;
   /** @deprecated Codex controls sampling; retained for source compatibility and not sent. */
   readonly temperature?: number;
@@ -288,8 +288,14 @@ async function runStructuredWorker<TParameters extends TSchema>(
 }
 
 async function withWorkerDeadline<T>(options: WorkerAgentOptions, run: (bounded: WorkerAgentOptions) => Promise<T>): Promise<T> {
-  const timeoutMs = options.timeoutMs ?? 10 * 60_000;
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("Worker timeout must be positive");
+  // Resolve in the host, not the sanitized Codex child environment. Keep one
+  // budget across correction turns rather than resetting it for every request.
+  const configured = process.env.INKOS_WORKER_TIMEOUT_MS?.trim();
+  const timeoutMs = options.timeoutMs ?? (configured ? Number(configured) : 60 * 60_000);
+  // Node clamps overflowing timers to 1ms, which would immediately kill a worker.
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 2_147_483_647) {
+    throw new Error("Worker timeout (timeoutMs / INKOS_WORKER_TIMEOUT_MS) must be an integer between 1 and 2147483647 milliseconds");
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(Object.assign(new Error("Worker exceeded its execution deadline"), {
     code: "WORKER_TIMEOUT",
