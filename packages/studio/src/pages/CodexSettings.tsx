@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Bot, ExternalLink, Loader2, RefreshCw } from "lucide-react";
-import { fetchJson, postApi, putApi } from "../hooks/use-api";
+import { fetchJson, postApi, putApi, invalidateApiPaths } from "../hooks/use-api";
 import { isCodexVerificationUrl, type StudioCodexAccount, type StudioCodexLogin, type StudioCodexModel, type StudioCodexSettings } from "../shared/codex";
 import { changeCodexModel, selectedCodexModel, validCodexSettings } from "./codex-settings-state";
 
@@ -42,6 +42,7 @@ export function CodexSettings({ isZh }: { readonly isZh: boolean }) {
       ]);
       if (!mounted.current || generation.current !== version) return;
       setAccount(status); setSettings(saved.settings); setDraft(saved.settings);
+      invalidateApiPaths(["/api/v1/codex/account", "/api/v1/codex/settings", "/api/v1/doctor"]);
       await loadCatalog(version);
     } catch (cause) {
       if (mounted.current && generation.current === version) setError(cause instanceof Error ? cause.message : "Codex unavailable.");
@@ -67,7 +68,10 @@ export function CodexSettings({ isZh }: { readonly isZh: boolean }) {
         const status = await fetchJson<StudioCodexAccount>("/codex/account");
         if (cancelled || !mounted.current || version !== generation.current) return;
         setAccount(status); setError(null);
-        if (status.connected) { await loadCatalog(); return; }
+        if (status.connected) {
+          invalidateApiPaths(["/api/v1/codex/account", "/api/v1/doctor"]);
+          await loadCatalog(); return;
+        }
         if (status.login?.status !== "pending") return;
       } catch (cause) {
         if (cancelled || !mounted.current || version !== generation.current) return;
@@ -156,7 +160,7 @@ export function CodexSettings({ isZh }: { readonly isZh: boolean }) {
         {!models.length && !catalogError && !loading && <p className="text-sm text-muted-foreground">{t("登录后刷新以加载可用模型。", "Sign in and refresh to load available models.")}</p>}
         {draft && <div className="grid gap-4 md:grid-cols-3">
           <label className="space-y-1 text-sm">{t("Codex 模型", "Codex model")}
-            <select aria-label={t("Codex 模型", "Codex model")} value={draft.model ?? ""} disabled={!!busy || !models.length} className={fieldClass} onChange={(event) => setDraft(changeCodexModel(models, draft, event.target.value))}>
+            <select aria-label={t("Codex 模型", "Codex model")} value={draft.model ? selected?.model ?? draft.model : ""} disabled={!!busy || !models.length} className={fieldClass} onChange={(event) => setDraft(changeCodexModel(models, draft, event.target.value))}>
               <option value="">{t("Codex 默认模型", "Codex default model")}</option>
               {draft.model && !selected && <option value={draft.model} disabled>{draft.model} ({t("不可用", "unavailable")})</option>}
               {models.map((model) => <option key={model.id} value={model.model}>{model.displayName}</option>)}

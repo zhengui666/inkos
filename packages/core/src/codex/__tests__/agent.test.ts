@@ -18,6 +18,7 @@ class FakeClient {
   closes = new Set<() => void>();
   run: () => Promise<void> = async () => { this.finish(); };
   request = vi.fn(async (method: string, _params?: unknown) => {
+    if (method === "account/read") return { account: { type: "chatgpt" }, requiresOpenaiAuth: true };
     if (method === "model/list") return { data: [{ id: "fixture", model: "fixture", isDefault: true,
       supportedReasoningEfforts: [{ reasoningEffort: "medium" }], serviceTiers: [{ id: "fast" }] }] };
     if (method === "thread/start") return { thread: { id: "thread-1" }, model: "fixture" };
@@ -176,8 +177,16 @@ describe("Codex Agent bridge", () => {
   it("rejects unsupported effort/speed without invoking the model", async () => {
     const agent = new Agent({ projectRoot: "/project", initialState: make().state,
       settings: { model: "fixture", reasoningEffort: "ultra", serviceTier: "fast" } });
-    await expect(agent.prompt("Go")).rejects.toThrow("reasoning effort is unsupported");
+    await expect(agent.prompt("Go")).rejects.toMatchObject({ code: "CODEX_SETTINGS_UNSUPPORTED" });
     expect(client.request.mock.calls.some(([method]) => method === "turn/start")).toBe(false);
+  });
+
+  it("fails closed for malformed account replies instead of treating process connectivity as login", async () => {
+    const original = client.request.getMockImplementation()!;
+    client.request.mockImplementation(async (method, params) => method === "account/read" ? {} : original(method, params));
+    await expect(make().prompt("Go")).rejects.toMatchObject({ code: "CODEX_AUTH_REQUIRED" });
+    expect(client.request.mock.calls.some(([method]) => method === "thread/start")).toBe(false);
+    expect(client.closed).toBe(true);
   });
 
   it("keeps assistant history as quoted records and sends current images as multimodal input", () => {

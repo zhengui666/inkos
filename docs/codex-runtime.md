@@ -28,6 +28,38 @@ CLI/TUI agent conversations share the same project account and settings. TUI
 available Codex catalog. Legacy provider model selectors do not select the Codex
 agent model. Separate provider settings still apply to direct LLM/image services.
 
+## Which settings a task uses
+
+All production text paths use the same Codex account and current saved model
+settings: market radar, style analysis, planning/outlining, chapter writing and
+revision, reviews/state reconstruction, research workers, translation, interactive
+story/Play text, image scene-brief preparation, and context compaction. Studio,
+CLI/TUI, and daemon production do not require `INKOS_LLM_API_KEY` or a legacy
+Studio text-service key. The configuration loader explicitly selects the Codex
+capability before reading provider settings, so a stale service/model/endpoint or
+per-worker provider override cannot block a Codex task or alter its model budget.
+The original provider configuration on disk is not rewritten.
+
+Codex settings are reread for the next invocation, including after a restart.
+A connected process is not proof of account authentication: missing ChatGPT login,
+unavailable models, and unsupported effort/speed combinations fail with Codex
+configuration errors. Changing a legacy service selector does not change the
+Codex model. Use the Codex settings panel (or the TUI session `/model` override).
+
+Direct external-provider verification remains separate and still requires that
+provider's credentials (except explicitly supported local endpoints). Image
+creation still requires its configured image service and key; a ChatGPT login
+does not substitute for those credentials. An image-only project no longer needs
+obsolete text-provider fields just to validate its image settings. No request is
+silently retried against another provider or funded by an unrelated key.
+
+Studio Doctor and `inkos doctor` inspect the Codex account, model catalog, and
+saved settings without sending an inference request. This verifies configuration
+readiness, not end-to-end generation or remaining account quota. To explicitly
+run the legacy external-provider connectivity probes, use `inkos doctor --provider`;
+those probes can incur provider API usage. Real market scans also require usable
+ranking/source evidence, independently of model authentication.
+
 ## Reasoning and speed
 
 These are separate settings. Effort values come from the selected model's

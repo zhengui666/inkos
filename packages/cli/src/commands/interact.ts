@@ -59,7 +59,7 @@ export function createInteractCommand(hooks: InteractCommandHooks = {}): Command
       const input = await readInteractionInput(messageArgs, opts.message, hooks.readInput);
       const projectRoot = findProjectRoot();
       const config = await loadConfig({ requireApiKey: false, projectRoot });
-      const client = createClient(config);
+      const client = createClient(config, projectRoot);
       const bookId = typeof opts.book === "string" && opts.book.trim() ? opts.book.trim() : null;
       if (bookId && opts.work) throw new Error("Use either --book or --work, not both.");
       const work = typeof opts.work === "string" && opts.work.trim()

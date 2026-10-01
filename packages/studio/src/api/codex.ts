@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { CodexAccountService } from "@actalk/inkos-core";
+import { selectCodexModel, CodexConfigurationError, type CodexAccountService } from "@actalk/inkos-core";
 import { ApiError } from "./errors.js";
 import { isCodexVerificationUrl } from "../shared/codex.js";
 
@@ -81,12 +81,13 @@ export function createCodexRoutes(service: CodexAccountService) {
     const current = await service.readSettings();
     const models = await service.listModels();
     const modelId = body.model === null ? undefined : body.model ?? current.model;
-    const model = modelId ? models.find((item) => item.model === modelId) : models.find((item) => item.isDefault) ?? models[0];
-    const reasoningEffort = body.reasoningEffort ?? current.reasoningEffort;
-    const serviceTier = body.serviceTier ?? current.serviceTier;
-    if (!model || !model.supportedReasoningEfforts.some((item) => item.reasoningEffort === reasoningEffort)
-      || (serviceTier !== "default" && !model.serviceTiers.some((item) => item.id === serviceTier))) {
-      throw new ApiError(400, "CODEX_UNSUPPORTED_SETTINGS", "Choose a model, reasoning effort, and speed supported by the current Codex catalog.");
+    try {
+      selectCodexModel(models, { model: modelId as string | undefined,
+        reasoningEffort: (body.reasoningEffort ?? current.reasoningEffort) as typeof current.reasoningEffort,
+        serviceTier: (body.serviceTier ?? current.serviceTier) as string });
+    } catch (error) {
+      if (error instanceof CodexConfigurationError) throw new ApiError(400, "CODEX_UNSUPPORTED_SETTINGS", error.message);
+      throw error;
     }
     const settings = await service.updateSettings(body as Parameters<CodexAccountService["updateSettings"]>[0]);
     return c.json({ settings });

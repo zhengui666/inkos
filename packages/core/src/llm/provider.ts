@@ -337,6 +337,14 @@ export interface LLMClient {
 // === Factory ===
 
 export function createLLMClient(config: LLMConfig, projectRoot?: string): LLMClient {
+  if (config.service === "codex") {
+    return {
+      provider: "openai", service: "codex", configSource: config.configSource,
+      apiFormat: "responses", stream: true,
+      _codex: { projectRoot: projectRoot ?? process.cwd() },
+      defaults: { temperature: 0.7, maxTokens: UNKNOWN_MODEL_FALLBACK_MAX_TOKENS, thinkingBudget: 0, extra: {} },
+    };
+  }
   const _earlyCard = lookupModel(config.service ?? "custom", config.model);
   const defaults = {
     temperature: config.temperature ?? 0.7,
@@ -1487,6 +1495,9 @@ export async function chatCompletion(
     readonly retry?: boolean;
   },
 ): Promise<LLMResponse> {
+  if (client.service === "codex") {
+    throw new Error("Direct provider calls require explicit provider configuration. Codex text tasks use the Codex worker runtime.");
+  }
   const resolved = {
     temperature: clampTemperatureForModel(
       client.service,

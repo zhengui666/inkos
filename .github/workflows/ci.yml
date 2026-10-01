@@ -36,6 +36,36 @@ jobs:
           INKOS_CODEX_INTEGRATION: '1'
         run: pnpm --filter @actalk/inkos-core exec vitest run src/codex/__tests__/isolation.integration.test.ts
 
+  codex-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @actalk/inkos-studio exec playwright install --with-deps chromium
+      - run: pnpm build
+      - name: Initialize a ChatGPT-only project without legacy API keys
+        run: |
+          mkdir -p test-project
+          printf '%s\n' '{"name":"Codex browser tests","version":"0.1.0","language":"en"}' > test-project/inkos.json
+      - name: Verify Codex settings, Doctor and radar UI with mocked account APIs
+        run: pnpm --filter @actalk/inkos-studio exec playwright test codex-settings.spec.ts
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: codex-browser-results
+          path: packages/studio/test-results/
+          retention-days: 7
+
   verify-pack:
     runs-on: ubuntu-latest
     needs: build-and-test

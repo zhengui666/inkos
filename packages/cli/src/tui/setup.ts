@@ -344,7 +344,7 @@ export async function detectModelInfo(projectRoot: string): Promise<ModelInfo | 
     return {
       provider,
       model,
-      baseUrl: config.llm.baseUrl ?? "",
+      baseUrl: service === "codex" ? "" : config.llm.baseUrl ?? "",
     };
   } catch {
     return undefined;

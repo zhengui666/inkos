@@ -3,6 +3,7 @@ import { Value } from "@sinclair/typebox/value";
 import { estimateTextTokens } from "../llm/provider.js";
 import { createCodexClient, type CodexClient } from "./client.js";
 import { readCodexSettings, type CodexSettings } from "./settings.js";
+import { CodexConfigurationError, readCodexModels, selectCodexModel } from "./account.js";
 import type { AgentEvent, AgentMessage, AgentTool, AgentToolResult, BeforeToolCallContext } from "./contracts.js";
 
 interface AgentState {
@@ -131,8 +132,8 @@ export class Agent {
       signal.throwIfAborted();
       const client = this.client;
       const account = object(await client.request("account/read", { refreshToken: false }, { signal }));
-      if (account.requiresOpenaiAuth === true && object(account.account).type !== "chatgpt") {
-        throw new Error("Sign in with ChatGPT in Studio → Project settings → Codex before starting an agent.");
+      if (account.requiresOpenaiAuth !== false && object(account.account).type !== "chatgpt") {
+        throw new CodexConfigurationError("CODEX_AUTH_REQUIRED", "Sign in with ChatGPT in Studio → Project settings → Codex before starting a text task.");
       }
       const selected = await selectModel(client, settings, signal);
       signal.throwIfAborted();
@@ -394,27 +395,8 @@ export function encodeContext(messages: AgentMessage[]): Array<Record<string, un
   return input;
 }
 
-async function selectModel(client: CodexClient, settings: CodexSettings, signal: AbortSignal): Promise<{ model?: string; effort?: string; serviceTier: string | null }> {
-  const models: Array<Record<string, any>> = [];
-  let cursor: string | undefined;
-  const cursors = new Set<string>();
-  do {
-    signal.throwIfAborted();
-    if (cursors.size >= 100 || (cursor && cursors.has(cursor))) throw new Error("Codex model catalog pagination did not terminate");
-    if (cursor) cursors.add(cursor);
-    const response = object(await client.request("model/list", { ...(cursor ? { cursor } : {}), limit: 100 }, { signal }));
-    if (Array.isArray(response.data)) models.push(...response.data);
-    cursor = response.nextCursor || undefined;
-  } while (cursor);
-  const selected = settings.model ? models.find(model => model.model === settings.model || model.id === settings.model)
-    : models.find(model => model.isDefault) ?? models[0];
-  if (!selected) throw new Error("The configured Codex model is unavailable. Sign in and choose an available model in Codex settings.");
-  const effort = settings.reasoningEffort ?? selected.defaultReasoningEffort;
-  if (effort && !selected.supportedReasoningEfforts?.some((option: Record<string, unknown>) => option.reasoningEffort === effort)) {
-    throw new Error("The configured reasoning effort is unsupported by this Codex model. Update Codex settings.");
-  }
-  const tier = settings.serviceTier;
-  if (tier && tier !== "default" && !selected.serviceTiers?.some((option: Record<string, unknown>) => option.id === tier)
-    && !selected.additionalSpeedTiers?.includes(tier)) throw new Error("The configured speed is unsupported by this Codex model. Update Codex settings.");
-  return { model: selected.model, effort, serviceTier: !tier || tier === "default" ? null : tier };
+async function selectModel(client: CodexClient, settings: CodexSettings, signal: AbortSignal): Promise<{ model: string; effort: string; serviceTier: string | null }> {
+  const selected = selectCodexModel(await readCodexModels(client, signal), settings);
+  return { model: selected.model, effort: settings.reasoningEffort,
+    serviceTier: settings.serviceTier === "default" ? null : settings.serviceTier };
 }

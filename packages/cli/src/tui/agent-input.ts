@@ -48,7 +48,7 @@ export async function processTuiAgentInput(params: {
     projectRoot: params.projectRoot,
     ...(params.session.modelOverride ? { cli: { model: params.session.modelOverride } } : {}),
   });
-  const client = createLLMClient(config.llm);
+  const client = createLLMClient(config.llm, params.projectRoot);
   const pipeline = new (await import("@actalk/inkos-core")).PipelineRunner(
     buildPipelineConfig(config, params.projectRoot, { quiet: true }),
   );

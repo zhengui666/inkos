@@ -2,7 +2,7 @@ import { useApi } from "../hooks/use-api";
 import type { Theme } from "../hooks/use-theme";
 import type { TFunction } from "../hooks/use-i18n";
 import { useColors } from "../hooks/use-colors";
-import { Stethoscope, CheckCircle2, XCircle, Loader2 } from "lucide-react";
+import { Stethoscope, CheckCircle2, XCircle, MinusCircle, Loader2 } from "lucide-react";
 
 interface DoctorChecks {
   readonly inkosJson: boolean;
@@ -15,11 +15,13 @@ interface DoctorChecks {
 
 interface Nav { toDashboard: () => void }
 
-function CheckRow({ label, ok, detail }: { label: string; ok: boolean; detail?: string }) {
+function CheckRow({ label, ok, detail, optional }: { label: string; ok: boolean; detail?: string; optional?: boolean }) {
   return (
     <div className="flex items-center gap-3 py-3 border-b border-border/30 last:border-0">
       {ok ? (
         <CheckCircle2 size={18} className="text-emerald-500 shrink-0" />
+      ) : optional ? (
+        <MinusCircle size={18} className="text-muted-foreground shrink-0" />
       ) : (
         <XCircle size={18} className="text-destructive shrink-0" />
       )}
@@ -58,8 +60,8 @@ export function DoctorView({ nav, theme, t }: { nav: Nav; theme: Theme; t: TFunc
       ) : (
         <div className={`border ${c.cardStatic} rounded-lg p-5`}>
           <CheckRow label={t("doctor.inkosJson")} ok={data.inkosJson} />
-          <CheckRow label={t("doctor.projectEnv")} ok={data.projectEnv} />
-          <CheckRow label={t("doctor.globalEnv")} ok={data.globalEnv} />
+          <CheckRow label={t("doctor.projectEnv")} ok={data.projectEnv} optional detail={t("doctor.optionalProvider")} />
+          <CheckRow label={t("doctor.globalEnv")} ok={data.globalEnv} optional detail={t("doctor.optionalProvider")} />
           <CheckRow label={t("doctor.booksDir")} ok={data.booksDir} detail={`${data.bookCount} book(s)`} />
           <CheckRow label={t("doctor.llmApi")} ok={data.llmConnected} detail={data.llmConnected ? t("doctor.connected") : t("doctor.failed")} />
         </div>
@@ -67,11 +69,11 @@ export function DoctorView({ nav, theme, t }: { nav: Nav; theme: Theme; t: TFunc
 
       {data && (
         <div className={`px-4 py-3 rounded-lg text-sm font-medium ${
-          data.inkosJson && (data.projectEnv || data.globalEnv) && data.llmConnected
+          data.inkosJson && data.llmConnected
             ? "bg-emerald-500/10 text-emerald-600"
             : "bg-amber-500/10 text-amber-600"
         }`}>
-          {data.inkosJson && (data.projectEnv || data.globalEnv) && data.llmConnected
+          {data.inkosJson && data.llmConnected
             ? t("doctor.allPassed")
             : t("doctor.someFailed")
           }
