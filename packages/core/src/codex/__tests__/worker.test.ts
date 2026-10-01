@@ -85,3 +85,57 @@ describe("Codex worker runtime integration", () => {
     expect(start.input[1]!.text).toBe("Update it");
   });
 });
+
+function completeOutput(value: unknown, phase = "final_answer") {
+  client.notify("item/completed", { item: { id: "final", type: "agentMessage", phase,
+    text: JSON.stringify({ resultJson: JSON.stringify(value) }) } });
+  client.finish();
+}
+
+describe("native structured worker results", () => {
+  it("accepts the declared native output envelope through the same domain validator", async () => {
+    const validate = vi.fn((value: { value: number }) => ({ value: value.value + 1 }));
+    client.run = async () => completeOutput({ value: 7 });
+    await expect(runWorkerAgentTool(llmClient, "ignored", [{ role: "user", content: "Submit" }], { ...resultTool, validate })).resolves.toEqual({ value: 8 });
+    expect(validate).toHaveBeenCalledExactlyOnceWith({ value: 7 });
+    expect(client.request.mock.calls.find(([method]) => method === "turn/start")?.[1]).toMatchObject({ outputSchema: { required: ["resultJson"], additionalProperties: false } });
+    expect(client.request.mock.calls.filter(([method]) => method === "turn/start")).toHaveLength(1);
+  });
+  it("corrects a schema-invalid native result without coercing scalar types", async () => {
+    let turn = 0;
+    const validate = vi.fn((value: { value: number }) => value);
+    client.run = async () => completeOutput({ value: ++turn === 1 ? "7" : 7 });
+    await expect(runWorkerAgentTool(llmClient, "ignored", [{ role: "user", content: "Submit" }], { ...resultTool, validate })).resolves.toEqual({ value: 7 });
+    expect(turn).toBe(2);
+    expect(validate).toHaveBeenCalledExactlyOnceWith({ value: 7 });
+  });
+  it("does not execute a result twice when a dynamic submission already succeeded", async () => {
+    const validate = vi.fn((value: { value: number }) => value);
+    client.run = async () => { await client.tool("submit-once", { value: 3 }); completeOutput({ value: 9 }); };
+    await expect(runWorkerAgentTool(llmClient, "ignored", [{ role: "user", content: "Submit" }], { ...resultTool, validate })).resolves.toEqual({ value: 3 });
+    expect(validate).toHaveBeenCalledOnce();
+  });
+  it("rejects commentary, fenced JSON and JSON outside the declared envelope", async () => {
+    client.run = async () => completeOutput({ value: 7 }, "commentary");
+    await expect(runWorkerAgentTool(llmClient, "ignored", [{ role: "user", content: "Submit" }], resultTool)).rejects.toMatchObject({ code: "WORKER_RESULT_MISSING" });
+    for (const text of ['{"value":7}', '```json\n{"resultJson":"{\\"value\\":7}"}\n```']) {
+      client.run = async () => { client.notify("item/completed", { item: { id: "final", type: "agentMessage", text } }); client.finish(); };
+      await expect(runWorkerAgentTool(llmClient, "ignored", [{ role: "user", content: "Submit" }], resultTool)).rejects.toMatchObject({ code: "WORKER_RESULT_INVALID" });
+    }
+  });
+  it("retains a non-retryable error even when a later notification says completed", async () => {
+    const validate = vi.fn((value: { value: number }) => value);
+    client.run = async () => {
+      client.notify("error", { willRetry: false, error: { message: "Fixture model request failed" } });
+      completeOutput({ value: 7 });
+    };
+    await expect(runWorkerAgentTool(llmClient, "ignored", [{ role: "user", content: "Submit" }], { ...resultTool, validate })).rejects.toMatchObject({ code: "WORKER_MODEL_ERROR", message: "Fixture model request failed" });
+    expect(validate).not.toHaveBeenCalled();
+    expect(client.request.mock.calls.filter(([method]) => method === "turn/start")).toHaveLength(1);
+  });
+  it("times out a silent peer and closes it without correction turns", async () => {
+    await expect(runWorkerAgentTool(llmClient, "ignored", [{ role: "user", content: "Submit" }], resultTool, { timeoutMs: 20 })).rejects.toMatchObject({ code: "WORKER_TIMEOUT" });
+    expect(client.close).toHaveBeenCalledOnce();
+    expect(client.request.mock.calls.filter(([method]) => method === "turn/start")).toHaveLength(1);
+  });
+});

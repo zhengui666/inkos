@@ -11,12 +11,15 @@ import {
 } from "../llm/provider.js";
 import { resolveCodexModel } from "../codex/model.js";
 import { recordExecutionEvidence } from "../harness/execution-evidence.js";
+import { decodeWorkerOutput, workerOutputSchema } from "./worker-output.js";
 import { decodeStructuredFields } from "./structured-arguments.js";
 import { preserveToolArgumentTypes, toolArgumentIssues } from "./tool-arguments.js";
 
 export interface WorkerAgentOptions {
   /** Resolve the same persisted Codex account/model settings as the parent workflow. */
   readonly projectRoot?: string;
+  /** Total worker deadline, including correction turns (default: ten minutes). */
+  readonly timeoutMs?: number;
   /** @deprecated Codex controls sampling; retained for source compatibility and not sent. */
   readonly temperature?: number;
   /** Estimated visible output/tool-argument limit enforced by InkOS before acceptance. */
@@ -105,7 +108,7 @@ function watchWorker(agent: Agent, options: WorkerAgentOptions, resultTool?: str
   };
 }
 
-export async function runWorkerAgent(
+async function runTextWorker(
   client: LLMClient,
   _modelId: string,
   messages: ReadonlyArray<LLMMessage>,
@@ -117,6 +120,7 @@ export async function runWorkerAgent(
   if (promptMessages.length === 0) throw new Error("Worker Agent requires at least one non-system message");
   const agent = new Agent({
     projectRoot: options.projectRoot ?? client._codex?.projectRoot ?? process.cwd(),
+    signal: options.signal,
     maxOutputTokens: options.maxTokens ?? client.defaults?.maxTokens ?? 32_768,
     ...(client._codex?.settings ? { settings: client._codex.settings } : {}),
     initialState: {
@@ -150,8 +154,8 @@ export async function runWorkerAgent(
   }
 }
 
-/** Host-consumed state is accepted only through the validated Codex dynamic tool. */
-export async function runWorkerAgentTool<TParameters extends TSchema>(
+/** Both declared result transports share the same schema and domain validation. */
+async function runStructuredWorker<TParameters extends TSchema>(
   client: LLMClient,
   _modelId: string,
   messages: ReadonlyArray<LLMMessage>,
@@ -212,18 +216,22 @@ export async function runWorkerAgentTool<TParameters extends TSchema>(
   };
   const agent = new Agent({
     projectRoot: options.projectRoot ?? client._codex?.projectRoot ?? process.cwd(),
+    signal: options.signal,
     maxOutputTokens: options.maxTokens ?? client.defaults?.maxTokens ?? 32_768,
     ...(client._codex?.settings ? { settings: client._codex.settings } : {}),
     initialState: {
       model,
       systemPrompt: [
         ...messages.filter(message => message.role === "system").map(message => message.content),
-        `Finish by calling ${resultTool.name} exactly once. Do not print the result as prose or JSON.`,
+        `Return the complete result through the native outputSchema envelope: resultJson is a JSON-serialized argument object for ${resultTool.name}. The tool schema defines the required contents. Do not output prose or Markdown.`,
+        `Result argument JSON Schema: ${JSON.stringify(resultTool.parameters)}`,
+        `Alternatively, call ${resultTool.name} for immediate host validation. A successful submission completes this operation; never submit it again.`,
         "If the tool reports a validation error, correct the identified fields and resubmit the complete result.",
       ].join("\n\n"),
       tools: [tool],
       messages: [],
     },
+    outputSchema: workerOutputSchema(resultTool.name),
     beforeToolCall: preserveToolArgumentTypes,
     onModelTurn: () => { modelTurns += 1; },
     // This is checked after each dynamic-tool response, including within a single
@@ -234,19 +242,35 @@ export async function runWorkerAgentTool<TParameters extends TSchema>(
   try {
     options.signal?.throwIfAborted();
     await agent.prompt(promptMessages);
-    options.signal?.throwIfAborted();
-    while (!hasSubmitted && !exhausted()) {
+    const acceptFinalOutput = async () => {
+      options.signal?.throwIfAborted();
       const failure = modelFailure(lastAssistant(agent.state.messages));
       if (failure) throw Object.assign(failure, { resultTool: resultTool.name, attempts: Math.max(modelTurns, resultAttempts) });
-      await agent.prompt(`You did not call ${resultTool.name} successfully. Call it now with the complete corrected result.`);
-      options.signal?.throwIfAborted();
+      if (hasSubmitted || resultAttempts >= MAX_RESULT_ATTEMPTS || !agent.finalOutput?.trim()) return;
+      try {
+        const parameters = decodeWorkerOutput(agent.finalOutput);
+        const prepared = await tool.prepareArguments!(parameters as Static<TParameters>);
+        // Execute the host's result validator, not a simulated model tool call.
+        await tool.execute("structured-output", prepared as Static<TParameters>, options.signal);
+        recordExecutionEvidence("worker-result-accepted", { resultTool: resultTool.name, transport: "outputSchema" });
+      } catch (error) {
+        options.signal?.throwIfAborted();
+        lastValidationError = error instanceof Error ? error : new Error(String(error));
+      }
+    };
+    await acceptFinalOutput();
+    while (!hasSubmitted && !exhausted()) {
+      await agent.prompt(`No valid ${resultTool.name} result was accepted. Return the complete corrected result through the declared outputSchema envelope or the result tool.${lastValidationError ? ` Validation feedback: ${lastValidationError.message}` : ""}`);
+      await acceptFinalOutput();
     }
     if (!hasSubmitted) {
       const last = lastAssistant(agent.state.messages);
-      const failure = lastValidationError ?? modelFailure(last);
-      throw Object.assign(new Error(failure?.message ?? `Worker Agent completed without calling ${resultTool.name}`), {
+      const failure = modelFailure(last) ?? lastValidationError;
+      const rejectedTools = agent.state.messages.filter(message => message.role === "toolResult" && message.isError).length;
+      throw Object.assign(new Error(failure?.message ?? `Worker completed without a valid ${resultTool.name} result (model turns: ${modelTurns}; submissions: ${resultAttempts}; rejected tools: ${rejectedTools})`), {
         code: failure?.code ?? (resultAttempts > 0 ? "WORKER_RESULT_INVALID" : "WORKER_RESULT_MISSING"),
         attempts: Math.max(modelTurns, resultAttempts),
+        submissions: resultAttempts, rejectedTools,
         resultTool: resultTool.name,
         stopReason: last?.stopReason,
         lastToolError: [...agent.state.messages].reverse().find(message => message.role === "toolResult" && message.isError),
@@ -261,4 +285,25 @@ export async function runWorkerAgentTool<TParameters extends TSchema>(
   } finally {
     stopWatching();
   }
+}
+
+async function withWorkerDeadline<T>(options: WorkerAgentOptions, run: (bounded: WorkerAgentOptions) => Promise<T>): Promise<T> {
+  const timeoutMs = options.timeoutMs ?? 10 * 60_000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("Worker timeout must be positive");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(Object.assign(new Error("Worker exceeded its execution deadline"), {
+    code: "WORKER_TIMEOUT",
+  })), timeoutMs);
+  const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+  try { return await run({ ...options, signal }); }
+  finally { clearTimeout(timer); }
+}
+
+export function runWorkerAgent(client: LLMClient, modelId: string, messages: ReadonlyArray<LLMMessage>, options: WorkerAgentOptions = {}): Promise<LLMResponse> {
+  return withWorkerDeadline(options, bounded => runTextWorker(client, modelId, messages, bounded));
+}
+
+export function runWorkerAgentTool<TParameters extends TSchema>(client: LLMClient, modelId: string,
+  messages: ReadonlyArray<LLMMessage>, resultTool: WorkerResultTool<TParameters>, options: WorkerAgentOptions = {}): Promise<Static<TParameters>> {
+  return withWorkerDeadline(options, bounded => runStructuredWorker(client, modelId, messages, resultTool, bounded));
 }

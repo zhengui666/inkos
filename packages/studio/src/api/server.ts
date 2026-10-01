@@ -6178,17 +6178,32 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 
   // --- Radar Scan ---
 
+  let radarStatus: { running: boolean; phase: string; startedAt?: number; result?: unknown; error?: string } = { running: false, phase: "idle" };
+  app.get("/api/v1/radar/status", c => { c.header("Cache-Control", "no-store"); return c.json(radarStatus); });
   app.post("/api/v1/radar/scan", async (c) => {
-    broadcast("radar:start", {});
+    if (radarStatus.running) return c.json({ error: "A market scan is already running. Wait for its result." }, 409);
+    radarStatus = { running: true, phase: "fetching", startedAt: Date.now() };
+    broadcast("radar:start", radarStatus);
     try {
       const pipeline = new PipelineRunner(await buildPipelineConfig());
-      const result = await pipeline.runRadar();
+      const result = await pipeline.runRadar({ onProgress: phase => { radarStatus = { ...radarStatus, phase }; } });
+      radarStatus = { ...radarStatus, phase: "saving" };
       await saveRadarScan(root, result);
+      radarStatus = { ...radarStatus, running: false, phase: "complete", result };
       broadcast("radar:complete", { result });
       return c.json(result);
     } catch (e) {
-      broadcast("radar:error", { error: String(e) });
-      return c.json({ error: String(e) }, 500);
+      // Deliberately expose only bounded operational fields, never provider
+      // payloads, assistant manuscripts, or raw lastToolError objects.
+      const error = e instanceof Error ? e.message : String(e);
+      const details = e as { code?: unknown; resultTool?: unknown; attempts?: unknown; submissions?: unknown; rejectedTools?: unknown; stopReason?: unknown };
+      const diagnostics = Object.fromEntries(Object.entries({ code: details?.code, resultTool: details?.resultTool,
+        attempts: details?.attempts, submissions: details?.submissions, rejectedTools: details?.rejectedTools, stopReason: details?.stopReason })
+        .filter(([, value]) => typeof value === "number" || (typeof value === "string" && /^[a-zA-Z0-9_-]{1,100}$/.test(value))));
+      const display = Object.keys(diagnostics).length ? `${error} (${Object.entries(diagnostics).map(([key, value]) => `${key}=${value}`).join(", ")})` : error;
+      radarStatus = { ...radarStatus, running: false, phase: "error", error: display };
+      broadcast("radar:error", { error: display, diagnostics });
+      return c.json({ error: display, diagnostics }, 500);
     }
   });
 

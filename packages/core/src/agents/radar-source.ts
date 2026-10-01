@@ -17,7 +17,7 @@ export interface PlatformRankings {
  */
 export interface RadarSource {
   readonly name: string;
-  fetch(): Promise<PlatformRankings>;
+  fetch(signal?: AbortSignal): Promise<PlatformRankings>;
 }
 
 /**
@@ -33,7 +33,7 @@ export class TextRadarSource implements RadarSource {
     this.text = text;
   }
 
-  async fetch(): Promise<PlatformRankings> {
+  async fetch(_signal?: AbortSignal): Promise<PlatformRankings> {
     return {
       platform: this.name,
       entries: [{ title: this.text, author: "", category: "", extra: "[外部分析]" }],
@@ -53,13 +53,14 @@ const FANQIE_RANK_TYPES = [
 export class FanqieRadarSource implements RadarSource {
   readonly name = "fanqie";
 
-  async fetch(): Promise<PlatformRankings> {
+  async fetch(signal?: AbortSignal): Promise<PlatformRankings> {
     const entries: RankingEntry[] = [];
 
     for (const { sideType, label } of FANQIE_RANK_TYPES) {
       try {
         const url = `https://api-lf.fanqiesdk.com/api/novel/channel/homepage/rank/rank_list/v2/?aid=13&limit=15&offset=0&side_type=${sideType}`;
         const res = await globalThis.fetch(url, {
+          signal,
           headers: { "User-Agent": "Mozilla/5.0 (compatible; InkOS/0.1)" },
         });
         if (!res.ok) continue;
@@ -77,6 +78,7 @@ export class FanqieRadarSource implements RadarSource {
           });
         }
       } catch {
+        signal?.throwIfAborted();
         // skip on network error
       }
     }
@@ -88,12 +90,13 @@ export class FanqieRadarSource implements RadarSource {
 export class QidianRadarSource implements RadarSource {
   readonly name = "qidian";
 
-  async fetch(): Promise<PlatformRankings> {
+  async fetch(signal?: AbortSignal): Promise<PlatformRankings> {
     const entries: RankingEntry[] = [];
 
     try {
       const url = "https://www.qidian.com/rank/";
       const res = await globalThis.fetch(url, {
+          signal,
         headers: {
           "User-Agent":
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -115,6 +118,7 @@ export class QidianRadarSource implements RadarSource {
         if (entries.length >= 20) break;
       }
     } catch {
+      signal?.throwIfAborted();
       // skip on network error
     }
 
