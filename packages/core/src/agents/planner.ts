@@ -1,6 +1,7 @@
 import { writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { BaseAgent } from "./base.js";
+import { fitGovernedContext } from "./governed-context-budget.js";
 import type { BookConfig } from "../models/book.js";
 import type { LengthSpec } from "../models/length-governance.js";
 import { buildLengthSpec } from "../utils/length-metrics.js";
@@ -126,31 +127,31 @@ export class PlannerAgent extends BaseAgent {
   }): Promise<ChapterMemo> {
     const language = input.language ?? "zh";
 
-    const userMessage = buildPlannerUserMessage({
+    const systemPrompt = getPlannerMemoSystemPrompt(language);
+    const render = (contextPackage: ContextPackage) => [{ role: "system" as const, content: systemPrompt },
+      { role: "user" as const, content: buildPlannerUserMessage({
       chapterNumber: input.chapterNumber,
-      contextPackage: input.contextPackage,
+      contextPackage,
       currentInstruction: input.currentInstruction,
       lengthBudget: {
         target: input.lengthSpec.target,
         unit: input.lengthSpec.countingMode === "en_words" ? "words" : "字",
       },
       language,
-    });
-
-    const systemPrompt = getPlannerMemoSystemPrompt(language);
+    }) }];
+    const maxTokens = Math.min(8192, this.ctx.client.defaults.maxTokens);
+    const contextPackage = await fitGovernedContext({ context: this.ctx, worker: this.name, language,
+      contextPackage: input.contextPackage, maxTokens, intent: input.currentInstruction ?? `Plan chapter ${input.chapterNumber}`, render });
 
     const { result } = await this.submitStructured(
-      [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userMessage },
-      ],
+      render(contextPackage),
       {
         name: "submit_chapter_memo",
         label: "Submit chapter memo",
         description: "Submit the complete semantic chapter plan for host persistence.",
         parameters: ChapterMemoToolSchema,
       },
-      { temperature: 0.7, maxTokens: Math.min(8192, this.ctx.client.defaults.maxTokens) },
+      { temperature: 0.7, maxTokens },
     );
     return ChapterMemoSchema.parse({
       chapter: input.chapterNumber,

@@ -1,10 +1,10 @@
 import { resolveCodexModel } from "../codex/model.js";
 import { readFile, mkdir, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { BaseAgent } from "./base.js";
+import { BaseAgent, prepareWorkerInput } from "./base.js";
 import { SemanticContextCompilerAgent } from "./semantic-context-compiler.js";
-import type { ContextFragment } from "../harness/context-compiler.js";
-import { semanticInputBudget, splitTextByEstimatedTokens } from "../llm/semantic-input.js";
+import { ProtectedContextOverflowError, type ContextFragment } from "../harness/context-compiler.js";
+import { splitTextByEstimatedTokens } from "../llm/semantic-input.js";
 import type { BookConfig } from "../models/book.js";
 import {
   ContextPackageSchema,
@@ -385,46 +385,31 @@ export class ComposerAgent extends BaseAgent {
   }
 
   async selectMemoryCandidates(request: MemorySemanticSelectionRequest): Promise<ReadonlyArray<string>> {
-    const budget = semanticInputBudget(this.ctx.client, {
-      reservedOutputTokens: 2048,
-      promptOverheadTokens: 2048,
-    });
-    const groups = groupMemoryCandidates(request.candidates, budget);
-    const selected = new Set<string>();
-    for (const group of groups) {
-      const candidates = group.map((entry) => [
-        `id: ${entry.selectionId}`,
-        `kind: ${entry.candidate.kind}`,
-        `source: ${entry.candidate.source}`,
-        `title: ${entry.candidate.title}`,
-        entry.excerpt,
-      ].join("\n")).join("\n\n");
-      const ids = await this.submitSelectedSources([
-        {
-          role: "system",
-          content: "Select story-memory candidates that materially help the current chapter task. Understand corrections, causality, aliases, and paraphrases. An empty selection is valid.",
-        },
-        {
-          role: "user",
-          content: [`Chapter: ${request.chapterNumber}`, "Current task:", request.query, "", "Candidates:", candidates].join("\n"),
-        },
-      ], new Set(group.map((entry) => entry.selectionId)), 2048);
-      for (const id of ids) {
-        const entry = group.find((candidate) => candidate.selectionId === id);
-        if (entry) selected.add(entry.candidate.id);
-      }
-    }
-    return [...selected];
+    return this.submitSelectedSources((candidates) => [
+      {
+        role: "system",
+        content: "Select story-memory candidates that materially help the current chapter task. Understand corrections, causality, aliases, and paraphrases. An empty selection is valid.",
+      },
+      {
+        role: "user",
+        content: [`Chapter: ${request.chapterNumber}`, "Current task:", request.query, "", "Candidates:", candidates].join("\n"),
+      },
+    ], request.candidates.map((candidate) => ({
+      sourceId: candidate.id,
+      content: [
+        `id: ${candidate.id}`,
+        `kind: ${candidate.kind}`,
+        `source: ${candidate.source}`,
+        `title: ${candidate.title}`,
+        candidate.excerpt,
+      ].join("\n"),
+    })), 2048);
   }
 
   async selectOutlineSections(request: OutlineSectionSelectionRequest): Promise<ReadonlyArray<string>> {
+    this.ctx.signal?.throwIfAborted();
     if (request.candidates.length <= 1) return request.candidates.map((candidate) => candidate.source);
-    const candidates = request.candidates.map((candidate) => [
-      `source_id: ${candidate.source}`,
-      `heading: ${candidate.heading}`,
-      candidate.excerpt,
-    ].join("\n")).join("\n\n");
-    return this.submitSelectedSources([
+    return this.submitSelectedSources((candidates) => [
       {
         role: "system",
         content: request.language === "en"
@@ -441,18 +426,14 @@ export class ComposerAgent extends BaseAgent {
           candidates,
         ].join("\n"),
       },
-    ], new Set(request.candidates.map((candidate) => candidate.source)), 1024);
+    ], request.candidates.map((candidate) => ({
+      sourceId: candidate.source,
+      content: [`source_id: ${candidate.source}`, `heading: ${candidate.heading}`, candidate.excerpt].join("\n"),
+    })), 1024);
   }
 
   async selectReferenceSections(request: ReferenceSectionSelectionRequest): Promise<ReadonlyArray<string>> {
-    const candidates = request.candidates.map((candidate) => [
-      `source_id: ${candidate.source}`,
-      `title: ${candidate.title}`,
-      `heading: ${candidate.heading}`,
-      `user-defined uses: ${candidate.uses.join("; ")}`,
-      candidate.note ? `user note: ${candidate.note}` : undefined,
-    ].filter(Boolean).join("\n")).join("\n\n");
-    return this.submitSelectedSources([
+    return this.submitSelectedSources((candidates) => [
       {
         role: "system",
         content: request.language === "en"
@@ -463,30 +444,133 @@ export class ComposerAgent extends BaseAgent {
         role: "user",
         content: [`Chapter: ${request.chapterNumber}`, `Goal: ${request.goal}`, "", candidates].join("\n"),
       },
-    ], new Set(request.candidates.map((candidate) => candidate.source)), 2048);
+    ], request.candidates.map((candidate) => ({
+      sourceId: candidate.source,
+      content: [
+        `source_id: ${candidate.source}`,
+        `title: ${candidate.title}`,
+        `heading: ${candidate.heading}`,
+        `user-defined uses: ${candidate.uses.join("; ")}`,
+        candidate.note ? `user note: ${candidate.note}` : undefined,
+      ].filter(Boolean).join("\n"),
+    })), 2048);
   }
 
   private async submitSelectedSources(
-    messages: ReadonlyArray<{ readonly role: "system" | "user"; readonly content: string }>,
-    allowed: ReadonlySet<string>,
+    render: (candidates: string) => ReadonlyArray<{ readonly role: "system" | "user"; readonly content: string }>,
+    candidates: ReadonlyArray<SourceSelectionCandidate>,
     maxTokens: number,
   ): Promise<ReadonlyArray<string>> {
-    const allowedIds = [...allowed];
-    if (allowedIds.length === 0) return [];
-    const selectedSourcesToolSchema = Type.Object({
-      selectedIndices: Type.Array(Type.Integer({minimum:1,maximum:allowedIds.length}), { uniqueItems: true }),
-    });
-    const { result } = await this.submitStructured(
-      [...messages,{role:'user',content:JSON.stringify({candidateIndex:allowedIds.map((sourceId,index)=>({number:index+1,sourceId})),instruction:'Submit the selected candidate numbers in selectedIndices. The host resolves them to exact source identifiers; do not rewrite identifiers or names.'})}],
-      {
+    this.ctx.signal?.throwIfAborted();
+    if (candidates.length === 0) return [];
+    const chunks = candidates.map((candidate, index): SourceSelectionChunk => ({
+      ...candidate, selectionId: candidate.sourceId, ordinal: index + 1,
+    }));
+    const messagesFor = (group: ReadonlyArray<SourceSelectionChunk>) => [
+      ...render(group.map((chunk) => chunk.part
+        ? `Candidate fragment ${chunk.selectionId}:\n${chunk.content}`
+        : chunk.content).join("\n\n")),
+      { role: "user" as const, content: JSON.stringify({
+        candidateIndex: group.map((chunk, index) => ({ number: index + 1, sourceId: chunk.selectionId })),
+        instruction: "Submit the selected candidate numbers in selectedIndices. The host resolves them to exact source identifiers; do not rewrite identifiers or names. Candidate fragments are lossless parts of a larger source; selecting any part selects the original source. An empty selection is valid.",
+      }) },
+    ];
+    const prepare = (group: ReadonlyArray<SourceSelectionChunk>) => prepareWorkerInput(
+      this.ctx, messagesFor(group), maxTokens, this.name, false,
+    );
+    const batches: SourceSelectionChunk[][] = [];
+    let fixedEnvelopeChecked = false;
+    const failClosed = (error: ProtectedContextOverflowError): never => {
+      const failure = new ProtectedContextOverflowError(error.protectedTokens, error.budgetTokens, error.sources);
+      failure.message += ". Source selection has no room for candidate text after its protected author request, task, and selection protocol; these inputs will not be truncated.";
+      throw failure;
+    };
+    const planBatch = async (group: SourceSelectionChunk[]): Promise<void> => {
+      this.ctx.signal?.throwIfAborted();
+      // Every candidate may be relevant. Bound the largest valid selection,
+      // including a small protocol allowance, rather than hoping for few ids.
+      const fullSelectionTokens = estimateTextTokens(JSON.stringify({
+        selectedIndices: group.map((_, index) => index + 1),
+      }));
+      if (fullSelectionTokens + 128 > maxTokens) {
+        if (group.length < 2) throw new Error("Source selection has no output space for its complete selection result.");
+        const middle = Math.ceil(group.length / 2);
+        await planBatch(group.slice(0, middle));
+        await planBatch(group.slice(middle));
+        return;
+      }
+      let overflow: ProtectedContextOverflowError | undefined;
+      // Only a rejected input preparation may cause repartitioning. Worker or
+      // transport failures must propagate without replaying already-run calls.
+      try {
+        await prepare(group);
+      } catch (error) {
+        this.ctx.signal?.throwIfAborted();
+        if (!(error instanceof ProtectedContextOverflowError)) throw error;
+        overflow = error;
+      }
+      if (!overflow) {
+        batches.push(group);
+        return;
+      }
+      if (!fixedEnvelopeChecked) {
+        try {
+          await prepare([]);
+        } catch (error) {
+          if (error instanceof ProtectedContextOverflowError) failClosed(error);
+          throw error;
+        }
+        fixedEnvelopeChecked = true;
+      }
+      if (group.length > 1) {
+        const middle = Math.ceil(group.length / 2);
+        await planBatch(group.slice(0, middle));
+        await planBatch(group.slice(middle));
+        return;
+      }
+      const chunk = group[0]!;
+      // Split the whole candidate, including arbitrarily long metadata. Opaque
+      // fragment ids keep the index bounded while the exact source stays in the
+      // lossless text and host-side mapping, even when its identifier is huge.
+      const part = chunk.part ? `${chunk.part}.` : "";
+      const fragment = { ...chunk, part: `${part}1`, selectionId: `candidate-${chunk.ordinal}-part-${part}1` };
+      let empty;
+      try {
+        empty = await prepare([{ ...fragment, content: "" }]);
+      } catch (error) {
+        if (error instanceof ProtectedContextOverflowError) failClosed(error);
+        throw error;
+      }
+      const remaining = (empty.budgetTokens ?? 0) - empty.inputTokens;
+      if (remaining <= 0) failClosed(overflow);
+      const contentBudget = Math.min(remaining, Math.max(1, Math.floor(estimateTextTokens(chunk.content) / 2)));
+      const parts = splitTextByEstimatedTokens(chunk.content, contentBudget);
+      if (parts.length < 2 || parts.some((content) => content.length >= chunk.content.length)) failClosed(overflow);
+      for (const [index, content] of parts.entries()) {
+        await planBatch([{
+          ...chunk, content, part: `${part}${index + 1}`,
+          selectionId: `candidate-${chunk.ordinal}-part-${part}${index + 1}`,
+        }]);
+      }
+    };
+    // Validate every batch before the first model call.
+    await planBatch(chunks);
+    const selected = new Set<string>();
+    for (const group of batches) {
+      this.ctx.signal?.throwIfAborted();
+      const selectedSourcesToolSchema = Type.Object({
+        selectedIndices: Type.Array(Type.Integer({ minimum: 1, maximum: group.length }), { uniqueItems: true }),
+      });
+      const { result } = await this.submitStructured(messagesFor(group), {
         name: "submit_selected_sources",
         label: "Submit selected sources",
         description: "Submit the numbers of the selected entries in candidateIndex.",
         parameters: selectedSourcesToolSchema,
-      },
-      { temperature: 0.1, maxTokens },
-    );
-    return result.selectedIndices.map(index=>allowedIds[index-1]!);
+      }, { temperature: 0.1, maxTokens, professionalGuidance: false });
+      this.ctx.signal?.throwIfAborted();
+      for (const index of result.selectedIndices) selected.add(group[index - 1]!.sourceId);
+    }
+    return [...selected];
   }
   async compileCompressibleContext(request: CompressibleContextCompileRequest): Promise<string> {
     const fragments: ContextFragment[] = request.compressibleEntries.map((entry, index) => ({
@@ -521,50 +605,15 @@ function semanticCandidateLabel(
   return "大纲段落";
 }
 
-interface MemorySelectionChunk {
-  readonly selectionId: string;
-  readonly candidate: MemorySemanticSelectionRequest["candidates"][number];
-  readonly excerpt: string;
+interface SourceSelectionCandidate {
+  readonly sourceId: string;
+  readonly content: string;
 }
 
-function groupMemoryCandidates(
-  candidates: MemorySemanticSelectionRequest["candidates"],
-  budgetTokens: number | undefined,
-): MemorySelectionChunk[][] {
-  if (candidates.length === 0) return [];
-  const chunks = candidates.flatMap((candidate): MemorySelectionChunk[] => {
-    if (budgetTokens === undefined) return [{ selectionId: candidate.id, candidate, excerpt: candidate.excerpt }];
-    const metadata = [candidate.id, candidate.kind, candidate.source, candidate.title].join("\n");
-    const excerptBudget = Math.max(1, budgetTokens - estimateTextTokens(metadata) - 64);
-    const excerpts = splitTextByEstimatedTokens(candidate.excerpt, excerptBudget);
-    return excerpts.map((excerpt, index) => ({
-      selectionId: excerpts.length === 1 ? candidate.id : `${candidate.id}:part-${index + 1}`,
-      candidate,
-      excerpt,
-    }));
-  });
-  if (budgetTokens === undefined) return [chunks];
-  const groups: MemorySelectionChunk[][] = [];
-  let current: MemorySelectionChunk[] = [];
-  let currentTokens = 0;
-  for (const entry of chunks) {
-    const tokens = estimateTextTokens([
-      entry.selectionId,
-      entry.candidate.kind,
-      entry.candidate.source,
-      entry.candidate.title,
-      entry.excerpt,
-    ].join("\n"));
-    if (current.length > 0 && currentTokens + tokens > budgetTokens) {
-      groups.push(current);
-      current = [];
-      currentTokens = 0;
-    }
-    current.push(entry);
-    currentTokens += tokens;
-  }
-  if (current.length > 0) groups.push(current);
-  return groups;
+interface SourceSelectionChunk extends SourceSelectionCandidate {
+  readonly selectionId: string;
+  readonly ordinal: number;
+  readonly part?: string;
 }
 
 async function loadReferenceContext(input: ComposeChapterInput): Promise<BookReferenceContextSelection> {

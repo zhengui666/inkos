@@ -110,6 +110,26 @@ turn, which waits for completion notifications under the worker's abort signal.
 The main chat does not impose a separate ten-minute generation deadline. Market
 radar retains its separate five-minute scan budget.
 
+## Long-form context budgets
+
+Chapter settlement receives a mutable view of the exact target-chapter baseline:
+only facts whose validity extends to that chapter can be updated by its delta.
+Expired fact versions remain in the complete host snapshot and on disk. All hook
+records, including resolved and superseded history, remain available. Already
+selected historical evidence is retained. Exact duplicate selected current facts
+may use a JSON pointer to their complete record in the same request.
+
+Planner and writer input checks include their actual instructions, chapter text,
+settlement baseline, author request and activated methods. When this input would
+overflow, only evidence already classified as compressible is semantically
+compiled and checked again. Protected instructions and facts are never silently
+truncated or summarized; an irreducible protected overflow still fails closed.
+Read-only context selectors inspect lossless candidate batches before combining
+selected source IDs, so their candidate pool is not constrained to a single
+model input. A selection/compilation failure cannot commit a chapter or replay a
+completed operation. Diagnostic overflow records include worker/source IDs and
+token counts, without manuscript text.
+
 ## Boundaries and persistence
 
 - InkOS exposes only its current Work Profile's host-owned dynamic tools. Existing

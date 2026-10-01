@@ -1,4 +1,5 @@
 import { BaseAgent } from "./base.js";
+import { fitGovernedContext } from "./governed-context-budget.js";
 import {renderChapterDocument} from '../utils/chapter-document.js';
 import type { BookConfig } from "../models/book.js";
 import type { BookRules } from "../models/book-rules.js";
@@ -122,15 +123,18 @@ export class WriterAgent extends BaseAgent {
       resolvedLengthSpec,
     );
 
-    const creativeUserPrompt = this.buildGovernedUserPrompt({
+    const renderCreative = (contextPackage: ContextPackage) => [{ role: "system" as const, content: creativeSystemPrompt },
+      { role: "user" as const, content: this.buildGovernedUserPrompt({
       chapterNumber,
       chapterMemo: input.chapterMemo,
       chapterIntentData: input.chapterIntentData,
-      contextPackage: input.contextPackage,
+      contextPackage,
       externalContext: input.externalContext,
       lengthSpec: resolvedLengthSpec,
       language: book.language,
-    });
+    }) }];
+    const creativeContext = await fitGovernedContext({ context: this.ctx, worker: this.name, language: resolvedLanguage,
+      contextPackage: input.contextPackage, intent: input.chapterMemo.goal, render: renderCreative });
 
     const creativeTemperature = input.temperatureOverride ?? 0.7;
 
@@ -140,10 +144,7 @@ export class WriterAgent extends BaseAgent {
     });
 
     const { result: creativeSubmission, usage: creativeUsage } = await this.submitStructured(
-      [
-        { role: "system", content: creativeSystemPrompt },
-        { role: "user", content: creativeUserPrompt },
-      ],
+      renderCreative(creativeContext),
       {
         name: "submit_chapter_draft",
         label: resolvedLanguage === "en" ? "Submit chapter draft" : "提交章节初稿",
@@ -296,25 +297,42 @@ export class WriterAgent extends BaseAgent {
       en: `Phase 2: projecting chapter ${params.chapterNumber} facts into runtime state`,
     });
     const systemPrompt = buildSettlerSystemPrompt(params.book, params.bookRules, resolvedLang);
-    const governedControlBlock = this.buildSettlerGovernedControlBlock(
-      params.chapterIntent,
-      params.contextPackage,
-      resolvedLang,
-    );
-    const userPrompt = buildSettlerUserPrompt({
+    // Match the reducer's mutable view for this target chapter. Retired fact
+    // versions remain in the full host baseline and selected historical evidence.
+    const mutableState = { ...params.baselineSnapshot.currentState, facts: params.baselineSnapshot.currentState.facts
+      .filter(fact => fact.validUntilChapter === null || fact.validUntilChapter >= params.chapterNumber) };
+    // The selector's exact fact text is already present in the baseline. Replace
+    // only verified duplicates with an in-request JSON pointer; never summarize
+    // a protected fact or confuse a later retrieval snapshot with this baseline.
+    const mutableIndices = new Map(mutableState.facts.map((fact, index) => [fact, index]));
+    const settlementEvidence: ContextPackage = { ...params.contextPackage, selectedContext: params.contextPackage.selectedContext.map(entry => {
+      const sourceIndex = /^runtime\/current_state#(\d+)-/.exec(entry.source);
+      const fact = sourceIndex ? params.baselineSnapshot.currentState.facts[Number(sourceIndex[1]) - 1] : undefined;
+      const index = fact ? mutableIndices.get(fact) : undefined;
+      const exact = fact ? [`subject: ${fact.subject}`, `predicate: ${fact.predicate}`, `object: ${fact.object}`,
+        `validFromChapter: ${fact.validFromChapter}`,
+        fact.validUntilChapter === null ? "validUntilChapter: current" : `validUntilChapter: ${fact.validUntilChapter}`,
+      ].join("\n") : undefined;
+      return entry.reason === "Current-state fact selected for the current chapter task."
+        && index !== undefined && entry.excerpt === exact
+        ? { ...entry, excerpt: `Exact selected fact: see Settlement baseline /currentState/facts/${index}. Its complete fields below remain binding.` }
+        : entry;
+    }) };
+    const renderSettlement = (contextPackage: ContextPackage) => [{ role: "system" as const, content: systemPrompt },
+      { role: "user" as const, content: buildSettlerUserPrompt({
       chapterNumber: params.chapterNumber,
       title: params.title,
       content: params.content,
-      governedControlBlock,
+      governedControlBlock: this.buildSettlerGovernedControlBlock(params.chapterIntent, contextPackage, resolvedLang),
       validationFeedback: params.validationFeedback,
       language: resolvedLang,
-    }) + `\n\n## Settlement baseline\nApply the delta to this exact baseline. Existing hook operations may name only its hook IDs. Later projections in retrieved context are references, not the baseline to be mutated.\n${JSON.stringify({ chapter: params.baselineSnapshot.manifest.lastAppliedChapter, currentState: params.baselineSnapshot.currentState, hooks: params.baselineSnapshot.hooks, allowNewHooks: params.allowNewHooks ?? true })}`;
+    }) + `\n\n## Settlement baseline\nThis is the exact mutable-state view for the target chapter, not the entire history. The host preserves retired fact versions and applies the delta once to the full original baseline. Existing hook operations may name only the supplied hook IDs; all hook statuses are retained. Later projections in retrieved context are references, not the baseline to be mutated.\n${JSON.stringify({ chapter: params.baselineSnapshot.manifest.lastAppliedChapter, currentState: mutableState, hooks: params.baselineSnapshot.hooks, allowNewHooks: params.allowNewHooks ?? true })}` }];
+    const settlementMaxTokens = Math.min(16384, this.ctx.client.defaults.maxTokens);
+    const settlementContext = await fitGovernedContext({ context: this.ctx, worker: this.name, language: resolvedLang,
+      contextPackage: settlementEvidence, maxTokens: settlementMaxTokens, intent: params.chapterIntent, render: renderSettlement });
     const knownHookIds = new Set(params.baselineSnapshot.hooks.hooks.map((hook) => hook.hookId));
     const { result, usage } = await this.submitStructured(
-      [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
+      renderSettlement(settlementContext),
       {
         name: "submit_runtime_state_delta",
         label: resolvedLang === "en" ? "Submit runtime state delta" : "提交运行时状态变更",
@@ -324,7 +342,7 @@ export class WriterAgent extends BaseAgent {
         parameters: createSettlementToolSchema(params.allowNewHooks),
         validate: (value) => validateSettlementHookIds(value, knownHookIds),
       },
-      { temperature: 0.3, maxTokens: Math.min(16384, this.ctx.client.defaults.maxTokens) },
+      { temperature: 0.3, maxTokens: settlementMaxTokens },
     );
     const runtimeStateDelta = RuntimeStateDeltaSchema.parse({
       chapter: params.chapterNumber,

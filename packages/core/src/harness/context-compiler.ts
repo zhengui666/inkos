@@ -68,7 +68,9 @@ export interface CompiledContext {
 }
 
 export class ProtectedContextOverflowError extends Error {
-  constructor(readonly protectedTokens: number, readonly budgetTokens: number) {
+  readonly code = "PROTECTED_CONTEXT_OVERFLOW";
+  constructor(readonly protectedTokens: number, readonly budgetTokens: number,
+    readonly sources: ReadonlyArray<{ readonly id: string; readonly tokens: number }> = []) {
     super(`Protected context exceeds budget: ${protectedTokens}/${budgetTokens} tokens`);
     this.name = "ProtectedContextOverflowError";
   }
@@ -115,7 +117,7 @@ export async function compileContext(input: {
   const compressibleTokens = estimateFragments(compressibleFragments);
   const totalTokens = protectedTokens + compressibleTokens;
   if (protectedTokens > input.budgetTokens) {
-    throw new ProtectedContextOverflowError(protectedTokens, input.budgetTokens);
+    throw new ProtectedContextOverflowError(protectedTokens, input.budgetTokens, protectedFragments.map(fragment => ({ id: fragment.id, tokens: estimateFragments([fragment]) })));
   }
   if (totalTokens <= input.budgetTokens) {
     return buildResult({
