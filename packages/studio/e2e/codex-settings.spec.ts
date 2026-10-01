@@ -339,7 +339,11 @@ for (const outcome of ['answered', 'blocked'] as const) {
           title: 'Completion fixture', updatedAt: Date.now(), createdAt: Date.now(), messageCount: 0, messages: [] };
         return route.fulfill({ json: { session } });
       }
-      if (url.pathname === '/api/v1/sessions') return route.fulfill({ json: { sessions: session ? [session] : [] } });
+      if (url.pathname === '/api/v1/sessions') {
+        // Match the real list endpoint: only the detail response contains messages.
+        const { messages: _messages, ...summary } = session ?? {};
+        return route.fulfill({ json: { sessions: session ? [summary] : [] } });
+      }
       return route.fulfill({ json: { session, chatRequest } });
     });
     await page.route('**/api/v1/agent', async route => {
@@ -391,4 +395,60 @@ for (const outcome of ['answered', 'blocked'] as const) {
     expect(sends).toBe(1);
   });
   }
+}
+
+for (const outcome of ['failed', 'empty', 'partial'] as const) {
+  test(`research card preserves ${outcome} evidence status through HTTP and reload`, async ({ page }) => {
+    await mockCodex(page);
+    let session: Record<string, any> | undefined;
+    let sends = 0;
+    const failed = outcome === 'failed';
+    const text = failed ? 'The research request failed; a diagnostic report was saved.'
+      : outcome === 'empty' ? 'The search completed with no matching sources.' : 'One source was collected, with a fetch warning.';
+    const execution = { id: 'research-fixture', tool: 'workspace__research_web', label: 'workspace__research_web',
+      status: failed ? 'error' : 'completed', startedAt: Date.now(), completedAt: Date.now() + 1,
+      ...(failed ? { error: 'RESEARCH_SEARCH_FAILED: Search API unavailable.' } : { result: `Research status: ${outcome}. ${text}` }),
+      details: { kind: 'research_report', status: outcome, sourceCount: outcome === 'partial' ? 1 : 0 },
+    };
+    await page.route('**/api/v1/sessions**', route => {
+      const url = new URL(route.request().url());
+      if (url.pathname === '/api/v1/sessions' && route.request().method() === 'POST') {
+        session = { ...route.request().postDataJSON(), bookId: null, sessionKind: 'chat', title: 'Research fixture',
+          createdAt: Date.now(), updatedAt: Date.now(), messageCount: 0, messages: [] };
+        return route.fulfill({ json: { session } });
+      }
+      if (url.pathname === '/api/v1/sessions') {
+        // Match the real list endpoint: only the detail response contains messages.
+        const { messages: _messages, ...summary } = session ?? {};
+        return route.fulfill({ json: { sessions: session ? [summary] : [] } });
+      }
+      return route.fulfill({ json: { session } });
+    });
+    await page.route('**/api/v1/agent', route => {
+      sends++;
+      const request = route.request().postDataJSON();
+      session = { ...session, sessionId: request.sessionId, messageCount: 3, messages: [
+        { role: 'user', content: request.instruction, timestamp: Date.now() },
+        { role: 'assistant', content: '', timestamp: Date.now() + 1, toolExecutions: [execution] },
+        { role: 'assistant', content: text, timestamp: Date.now() + 2 },
+      ] };
+      return route.fulfill({ status: failed ? 422 : 200, json: { session, response: text,
+        completionStatus: failed ? 'blocked' : 'answered', details: { toolExecutions: [execution] },
+        ...(failed ? { error: { code: 'AGENT_TASK_INCOMPLETE', message: text } } : {}),
+      } });
+    });
+    await page.goto('/#/chat');
+    const input = page.getByPlaceholder('Enter command...');
+    await input.fill('Research the fixture topic.');
+    await input.press('Enter');
+    const label = failed ? 'Failed' : outcome === 'empty' ? 'No matching sources' : 'Partial evidence';
+    await expect(page.getByText('Web research', { exact: true })).toBeVisible();
+    await expect(page.getByText(label, { exact: true })).toBeVisible();
+    await expect(page.getByText('Completed', { exact: true })).toHaveCount(0);
+    await page.reload();
+    await expect(page.getByText('Web research', { exact: true })).toBeVisible();
+    await expect(page.getByText(label, { exact: true })).toBeVisible();
+    await expect(page.getByText('Completed', { exact: true })).toHaveCount(0);
+    expect(sends).toBe(1);
+  });
 }

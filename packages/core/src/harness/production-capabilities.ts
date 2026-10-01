@@ -1,3 +1,4 @@
+import { createListResearchReportsTool, createReadResearchReportTool } from "../agent/project-research-tools.js";
 import { createProfileWorkTools } from "./tools/work-creation.js";
 import {existsSync} from "node:fs";
 import { readdir } from "node:fs/promises";
@@ -216,6 +217,8 @@ export function createProductionCapabilityRegistry(
     readAction(createListWorksTool(environment.projectRoot)),
     readAction(createInspectWorkTool(environment.projectRoot)),
     readAction(createLsTool(environment.projectRoot)),
+    readAction(createListResearchReportsTool(environment.projectRoot)),
+    readAction(createReadResearchReportTool(environment.projectRoot)),
     readAction(createResearchWebTool(environment.projectRoot)),
     writeAction(createIngestMaterialTool(environment.projectRoot)),
     readAction(createRetrieveMaterialTool(environment.projectRoot)),

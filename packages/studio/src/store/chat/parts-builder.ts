@@ -35,6 +35,9 @@ export interface ContextCompressionStreamEvent {
 // [zh, en] tuples resolved through tr() at call time so labels follow the
 // current app language instead of the language active at module load.
 const TOOL_LABELS: Record<string, readonly [string, string]> = {
+  research_web: ["联网研究", "Web research"],
+  list_research_reports: ["查找已有研究", "Find saved research"],
+  read_research_report: ["读取已有研究", "Read saved research"],
   read: ["读取文件", "Read file"], edit: ["编辑文件", "Edit file"], grep: ["搜索", "Search"], ls: ["列目录", "List directory"],
   context_compression: ["整理上下文", "Organize context"],
   propose_action: ["确认动作", "Confirm action"],

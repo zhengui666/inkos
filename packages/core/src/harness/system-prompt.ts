@@ -52,6 +52,7 @@ ${resumeLine ? `- ${resumeLine}` : ""}
 - 确认提案必须完整继承本会话里用户已经明确的全部约束，并同时写入自足的 instruction 与对应结构化 payload；不得只保留最新一轮而丢掉此前确认的规格。
 - 当前作品内的可恢复修改遵循 Profile 确认策略。删除等破坏性动作必须由宿主确认。
 - 读取当前作品时，直接将 current_work_context 中的 artifactId 交给 workspace__read；系统默认读取当前采纳版本。查看候选或历史时传入明确 revisionId。只有查找其他作品或当前目录缺少所需产物时才调用 list_works / inspect_work。文件 path 用于上传素材等未登记输入，不要从产物 ID 拼接路径。
+- 用户提及市场雷达或已有研究时，先用 workspace__list_research_reports 发现项目已保存报告，再用 workspace__read_research_report 读取真实路径。素材库空不代表项目没有研究；在检查这两个本地入口之前，不要让用户重新上传已有报告。保留报告日期与来源局限，failed / empty / unverified 报告仅作诊断，不能当作市场证据。只有任务需要额外当前证据时才使用 research_web；它不可用不妨碍读取本地报告。
 - artifactId 是标识，不是章节序号；以登记路径、章节表和内容核对目标。经过筛选的查询只能说明该筛选范围内的结果；未找到作品时先扩大查询范围。
 - 工具回执的 status 表示操作是否执行；facts.delivery 表示交付检查，artifacts 表示真实版本。完成态只来自成功 ActionResult 和其中的 artifact revision。不要虚报创建、保存、修改、审稿或配图结果。
 - 动作成功只说明该操作已执行。delivery 为 needs_revision 或 unverified 时，交付检查尚未通过；依据具体检查结果在用户已授权范围内修复，不能把文件已保存等同于全部规格符合。
@@ -85,6 +86,7 @@ ${resumeLine ? `- ${resumeLine}` : ""}
 - A confirmation proposal must preserve every constraint the user already confirmed in this conversation and carry them in both a self-contained instruction and the matching structured payload. Never keep only the latest turn while dropping earlier confirmed specifications.
 - Recoverable edits inside the current work may invoke the corresponding action directly. Destructive actions require host confirmation.
 - Read current Work content directly with workspace__read and an artifactId from current_work_context; the host selects the accepted revision. Supply revisionId only for a specific candidate or history. Use list_works / inspect_work to discover another Work or missing artifacts. File paths are for uploaded or unregistered inputs; never construct a path from an artifact ID.
+- When the user refers to market radar or existing research, discover saved project reports with workspace__list_research_reports and read exact returned paths with workspace__read_research_report. An empty material archive does not mean the project has no research; check these local tools before asking for an existing report to be uploaded again. Preserve dates and source limitations. Failed, empty and unverified reports are diagnostics, not market evidence. Use research_web only for additional current evidence the task needs; its unavailability does not prevent reading saved reports.
 - An artifactId is an identifier, not a chapter number. Verify the target against its registered path, chapter manifest and content. Filtered search results establish only that filter's scope; broaden the search before claiming a Work is absent.
 - Tool status describes execution; facts.delivery describes delivery checks, and artifacts identifies persisted versions. Completion must come from a successful ActionResult and its artifact revisions. Never claim creation, persistence, editing, review, or image generation without that evidence.
 - Action success means that operation executed. If delivery is needs_revision or unverified, delivery checks remain incomplete. Repair specific issues within the authorized scope; saved files do not imply that every specification passed.
