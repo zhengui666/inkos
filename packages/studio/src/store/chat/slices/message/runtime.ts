@@ -16,6 +16,9 @@ const NULL_BOOK_KEY = "__null__";
 // [zh, en] tuples resolved through tr() at call time so labels follow the
 // current app language instead of the language active at module load.
 const TOOL_LABELS: Record<string, readonly [string, string]> = {
+  research_web: ["联网研究", "Web research"],
+  list_research_reports: ["查找已有研究", "Find saved research"],
+  read_research_report: ["读取已有研究", "Read saved research"],
   read: ["读取文件", "Read file"],
   edit: ["编辑文件", "Edit file"],
   grep: ["搜索", "Search"],

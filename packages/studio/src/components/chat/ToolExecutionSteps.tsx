@@ -8,6 +8,8 @@ import {
 import {
   Loader2,
   CheckCircle2,
+  AlertTriangle,
+  Search,
   XCircle,
   ChevronDown,
   Wrench,
@@ -24,7 +26,15 @@ import {
 
 // -- Status rendering helpers --
 
-function ExecStatusBadge({ status }: { status: ToolExecution["status"] }) {
+function ExecStatusBadge({ status, researchStatus }: { status: ToolExecution["status"]; researchStatus?: unknown }) {
+  if (status === "completed" && (researchStatus === "empty" || researchStatus === "partial")) {
+    return (
+      <span className={`inline-flex items-center gap-1 text-xs ${researchStatus === "partial" ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground"}`}>
+        {researchStatus === "partial" ? <AlertTriangle size={12} /> : <Search size={12} />}
+        <span>{researchStatus === "partial" ? tr("部分证据", "Partial evidence") : tr("无匹配来源", "No matching sources")}</span>
+      </span>
+    );
+  }
   switch (status) {
     case "running":
       return (
@@ -968,7 +978,7 @@ function PipelineExecution({
               ? formatDuration(exec.startedAt, exec.startedAt + elapsedMs)
               : exec.completedAt ? formatDuration(exec.startedAt, exec.completedAt) : ""}
           </span>
-          <ExecStatusBadge status={exec.status} />
+          <ExecStatusBadge status={exec.status} researchStatus={exec.tool === "research_web" ? (exec.details as { status?: unknown } | undefined)?.status : undefined} />
           <ChevronDown size={16} className={`text-muted-foreground transition-transform ${open ? "rotate-180" : ""}`} />
         </div>
       </CollapsibleTrigger>

@@ -779,8 +779,10 @@ export function createResearchWebTool(projectRoot: string): AgentTool<typeof Res
       onUpdate?: AgentToolUpdateCallback,
     ): Promise<AgentToolResult<unknown>> {
       onUpdate?.(textResult(`Researching: ${params.topic}`));
-      const searchConfig = await readResearchSearchConfig(projectRoot);
-      const searchOptions = searchConfig.enabled
+      // Invalid configuration is also a failed research attempt. Preserve a
+      // diagnostic below without exposing parser errors or configuration data.
+      const searchConfig = await readResearchSearchConfig(projectRoot).catch(() => null);
+      const searchOptions = searchConfig?.enabled
         ? {
             apiKey: searchConfig.apiKey,
             apiKeyEnv: searchConfig.apiKeyEnv,
@@ -792,22 +794,48 @@ export function createResearchWebTool(projectRoot: string): AgentTool<typeof Res
         purpose: params.purpose,
         depth: params.depth ?? "standard",
       }, {
-        search: (query, maxResults) => searchWeb(query, maxResults, searchOptions),
+        search: (query, maxResults) => {
+          if (!searchConfig) throw Object.assign(new Error("Research search configuration could not be read."), { code: "RESEARCH_CONFIGURATION_INVALID" });
+          return searchWeb(query, maxResults, searchOptions);
+        },
       });
       const reportDir = join(projectRoot, ".inkos", "research");
       await mkdir(reportDir, { recursive: true });
-      const fileName = `${new Date().toISOString().replace(/[:.]/g, "-")}-${slugResearchTopic(params.topic)}.md`;
-      const reportPath = join(reportDir, fileName);
-      await writeFile(reportPath, report.markdown, "utf-8");
+      const fileName = `${report.generatedAt.replace(/[:.]/g, "-")}-${slugResearchTopic(params.topic)}.md`;
+      const reportPath = `.inkos/research/${fileName}`;
+      await writeFile(join(reportDir, fileName), report.markdown, "utf-8");
+      const outcome = {
+        status: report.status,
+        sourceCount: report.sourceCount,
+        queryCount: report.queryCount,
+        successfulQueries: report.successfulQueries,
+        failedQueries: report.failedQueries,
+        failedFetches: report.failedFetches,
+      };
+      if (report.status === "failed") {
+        throw Object.assign(new Error(report.summary), {
+          code: "RESEARCH_SEARCH_FAILED",
+          recovery: {
+            action: "workspace__research_web",
+            reportPath,
+            ...outcome,
+            reason: "Check Studio research search configuration and provider availability, then retry. The saved report contains diagnostics only.",
+          },
+        });
+      }
       return textResult(
         [
           `Research report saved: ${reportPath}`,
+          report.summary,
+          `Research status: ${report.status}.`,
           `Sources collected: ${report.sources.length}.`,
           report.partialFailures.length > 0 ? `Partial failures: ${report.partialFailures.length}.` : "Partial failures: none.",
         ].join("\n"),
         {
           kind: "research_report",
           reportPath,
+          generatedAt: report.generatedAt,
+          ...outcome,
           topic: params.topic,
           purpose: params.purpose,
           depth: params.depth ?? "standard",
@@ -935,7 +963,7 @@ export function createRetrieveMaterialTool(projectRoot: string): AgentTool<typeo
       });
       if (results.length === 0) {
         return textResult(
-          "No matching archived materials were found. Ask the user to upload or ingest relevant material if needed.",
+          "No matching ingested material cards were found. This does not search saved radar or research reports. Check workspace__list_research_reports and workspace__read_research_report before asking the user to upload an existing project report.",
           {
             kind: "material_retrieval",
             query: params.query,

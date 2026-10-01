@@ -162,3 +162,23 @@ loopback Responses fixtures. They exercise `custom_tool_call` through
 transcript reload, and the absence of disabled native capabilities. Injecting a
 direct function call alone does not validate a code-mode-only model's execution
 path. These fixtures are not real-model quality or account-quota checks.
+
+## Saved research and market radar
+
+Main chat can discover existing project radar scans and web-research reports
+with `workspace__list_research_reports`, then read their exact catalog paths
+with `workspace__read_research_report`. This works before a Work exists and
+without a search API key. The material archive is a separate collection; an
+empty material search does not mean that saved radar or research is absent.
+The catalog stays within `radar/` and `.inkos/research/`, rejects symlinks, limits
+file sizes and summaries, and paginates report bodies. Dates describe saved
+snapshots, not new verification of current market conditions.
+
+Research outcomes distinguish complete evidence, partial evidence with warnings,
+a successful search with no matching sources, and failed search requests. If all
+search requests fail, Inkos retains a diagnostic Markdown report and returns a
+failed tool receipt. A saved diagnostic is not market evidence. Studio displays
+failed, empty, and partial outcomes separately, including after reload. New
+reports carry versioned status metadata; older reports remain readable and their
+source/failure sections are interpreted conservatively. These tools never run a
+new search or replay a creation request when reading existing reports.
