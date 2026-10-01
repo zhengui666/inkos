@@ -44,6 +44,9 @@ it("marks unavailable research as a failed tool through Codex, SSE, HTTP and res
     const sse = await streamed;
     const end = sse.split("\n\n").filter(event => event.startsWith("event: tool:end")).map(event => JSON.parse(event.split("\ndata: ")[1]!));
     expect(end).toEqual([expect.objectContaining({ tool: "workspace__research_web", isError: true })]);
+    const listed = await (await app.request("/api/v1/sessions?bookId=null")).json();
+    expect(listed.sessions).toEqual([expect.objectContaining({ sessionId })]);
+    expect(listed.sessions.every((summary: Record<string, unknown>) => !("messages" in summary))).toBe(true);
     const restored = await (await app.request(`/api/v1/sessions/${sessionId}`)).json();
     expect(restored.session.messages.flatMap((message: any) => message.toolExecutions ?? [])).toEqual([
       expect.objectContaining({ tool: "research_web", status: "error" }),

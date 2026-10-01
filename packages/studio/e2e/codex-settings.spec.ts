@@ -339,7 +339,11 @@ for (const outcome of ['answered', 'blocked'] as const) {
           title: 'Completion fixture', updatedAt: Date.now(), createdAt: Date.now(), messageCount: 0, messages: [] };
         return route.fulfill({ json: { session } });
       }
-      if (url.pathname === '/api/v1/sessions') return route.fulfill({ json: { sessions: session ? [session] : [] } });
+      if (url.pathname === '/api/v1/sessions') {
+        // Match the real list endpoint: only the detail response contains messages.
+        const { messages: _messages, ...summary } = session ?? {};
+        return route.fulfill({ json: { sessions: session ? [summary] : [] } });
+      }
       return route.fulfill({ json: { session, chatRequest } });
     });
     await page.route('**/api/v1/agent', async route => {
@@ -413,7 +417,11 @@ for (const outcome of ['failed', 'empty', 'partial'] as const) {
           createdAt: Date.now(), updatedAt: Date.now(), messageCount: 0, messages: [] };
         return route.fulfill({ json: { session } });
       }
-      if (url.pathname === '/api/v1/sessions') return route.fulfill({ json: { sessions: session ? [session] : [] } });
+      if (url.pathname === '/api/v1/sessions') {
+        // Match the real list endpoint: only the detail response contains messages.
+        const { messages: _messages, ...summary } = session ?? {};
+        return route.fulfill({ json: { sessions: session ? [summary] : [] } });
+      }
       return route.fulfill({ json: { session } });
     });
     await page.route('**/api/v1/agent', route => {
