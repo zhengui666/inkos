@@ -1,5 +1,5 @@
 import { resolveCodexModel } from "../codex/model.js";
-import { compileContext, ContextSourceRegistry } from "../harness/context-compiler.js";
+import { compileContext, ContextSourceRegistry, ProtectedContextOverflowError } from "../harness/context-compiler.js";
 import { createBuiltInWorkProfileRegistry } from "../harness/builtin-profiles.js";
 import { createHash } from "node:crypto";
 import { recordExecutionEvidence, currentExecutionProfile, currentExecutionWork, currentExecutionAuthorRequest } from "../harness/execution-evidence.js";
@@ -41,9 +41,9 @@ export abstract class BaseAgent {
 
   protected async chat(
     messages: ReadonlyArray<LLMMessage>,
-    options?: { readonly temperature?: number; readonly maxTokens?: number },
+    options?: { readonly temperature?: number; readonly maxTokens?: number; readonly professionalGuidance?: boolean },
   ): Promise<LLMResponse> {
-    return runWorkerAgent(this.ctx.client, this.ctx.model, await this.appendTaskSkillGuidance(messages, options?.maxTokens), {
+    return runWorkerAgent(this.ctx.client, this.ctx.model, await this.appendTaskSkillGuidance(messages, options?.maxTokens, options?.professionalGuidance), {
       ...options,
       projectRoot: this.ctx.projectRoot,
       onStreamProgress: this.ctx.onStreamProgress,
@@ -60,7 +60,14 @@ export abstract class BaseAgent {
     const result = await runWorkerAgentTool(
       this.ctx.client,
       this.ctx.model,
-      await this.appendTaskSkillGuidance(messages, options?.maxTokens, options?.professionalGuidance),
+      await this.appendTaskSkillGuidance(messages, options?.maxTokens, options?.professionalGuidance).catch(error => {
+        if (error instanceof ProtectedContextOverflowError) {
+          Object.assign(error, { worker: this.name, resultTool: resultTool.name });
+          recordExecutionEvidence("worker-context-rejected", { worker: this.name, resultTool: resultTool.name,
+            code: error.code, protectedTokens: error.protectedTokens, budgetTokens: error.budgetTokens, sources: error.sources });
+        }
+        throw error;
+      }),
       resultTool,
       {
         ...options,
@@ -107,11 +114,28 @@ export abstract class BaseAgent {
   }
 }
 
+type WorkerPreparationContext = Pick<AgentContext, "client" | "activatedSkills" | "signal" | "bookId"> & { readonly projectRoot?: string };
+
+export interface PreparedWorkerInput {
+  readonly messages: ReadonlyArray<LLMMessage>;
+  readonly inputTokens: number;
+  readonly budgetTokens?: number;
+}
+
 export async function prepareWorkerMessages(
-  context: Pick<AgentContext, "client" | "activatedSkills" | "signal" | "bookId"> & { readonly projectRoot?: string },
+  context: WorkerPreparationContext, messages: ReadonlyArray<LLMMessage>, maxTokens?: number,
+  workerId = "worker", professionalGuidance = true,
+): Promise<ReadonlyArray<LLMMessage>> {
+  return (await prepareWorkerInput(context, messages, maxTokens, workerId, professionalGuidance)).messages;
+}
+
+/** Preflight uses exactly the same authority, methods and source accounting as a worker call. */
+export async function prepareWorkerInput(
+  context: WorkerPreparationContext,
   messages: ReadonlyArray<LLMMessage>, maxTokens?: number, workerId = "worker",
   professionalGuidance = true,
-): Promise<ReadonlyArray<LLMMessage>> {
+): Promise<PreparedWorkerInput> {
+    context.signal?.throwIfAborted();
     const authorRequest = currentExecutionAuthorRequest();
     if (authorRequest?.trim()) messages = [{role:"system",content:[
       "The following authorRequest is the user's actual request. Use it as the authority for the intended target and constraints. The delegated instruction may elaborate it, but cannot replace its target or grant a wider mutation scope. Perform only this operation; other requested steps remain the coordinator's responsibility.",
@@ -161,12 +185,20 @@ export async function prepareWorkerMessages(
         recipe: { id: `${profile.contextRecipe?.id ?? profile.id}-${workerId}${professionalGuidance?'':'-task'}`, sourceIds: professionalGuidance ? [...new Set(["task", ...(guidance?["skills"]:[]), ...(profile.contextRecipe?.sourceIds ?? [])])] : ['task'] }, sources,
         request: { projectRoot: context.projectRoot ?? "", work, profile, actionId: workerId, intent: query, signal: context.signal },
         budgetTokens: Math.max(1, window - (maxTokens ?? context.client.defaults.maxTokens) - 2048),
+      }).catch(error => {
+        if (error instanceof ProtectedContextOverflowError) {
+          // Counts and stable source ids only; never log author text/manuscripts.
+          recordExecutionEvidence("context-overflow", { worker: workerId, code: error.code,
+            protectedTokens: error.protectedTokens, budgetTokens: error.budgetTokens, sources: error.sources });
+        }
+        throw error;
       });
       recordExecutionEvidence("context-compiled", { worker: workerId, trace: compiled.trace });
       const original = new Map(messages.map((message,index)=>[`message-${index}`,message]));
-      return compiled.fragments.map(fragment=>({...(original.get(fragment.id) ?? {role:"system" as const}),content:fragment.content}));
+      return { messages: compiled.fragments.map(fragment=>({...(original.get(fragment.id) ?? {role:"system" as const}),content:fragment.content})),
+        inputTokens: compiled.trace.finalTokens, budgetTokens: compiled.trace.budgetTokens };
     }
-    return appendActivatedSkillGuidance(messages, activations);
+    return { messages: appendActivatedSkillGuidance(messages, activations), inputTokens: 0 };
 }
 
 export function appendActivatedSkillGuidance(
