@@ -256,8 +256,13 @@ export function attachSessionStreamListeners({
   streamEs,
   set,
   get,
-}: AttachSessionStreamListenersInput): void {
+}: AttachSessionStreamListenersInput): { settleChat: () => void } {
+  let chatSettled = false;
+  const ownsStream = () => get().sessions[sessionId]?.stream === streamEs;
+  const acceptsChatText = () => !chatSettled && ownsStream()
+    && get().sessions[sessionId]?.isChatStreaming === true;
   const textDeltaBatcher = createStreamTextDeltaBatcher((deltas) => {
+    if (!acceptsChatText()) return;
     set((state) => ({
       sessions: updateSession(state.sessions, sessionId, (runtime) => {
         const [messages, stream] = getOrCreateStream(runtime.messages, streamTs);
@@ -297,6 +302,7 @@ export function attachSessionStreamListeners({
     const existing = progressThrottles.get(key);
     if (existing) return existing;
     const throttle = createLatestEventThrottle<StreamProgressEventData>((data) => {
+      if (!ownsStream()) return;
       set((state) => ({
         sessions: updateSession(state.sessions, sessionId, (runtime) => {
           const messages = executionId
@@ -416,6 +422,7 @@ export function attachSessionStreamListeners({
   streamEs.addEventListener("agent:aborted", finishSessionStream);
 
   streamEs.addEventListener("thinking:start", (event: MessageEvent) => {
+    if (!acceptsChatText()) return;
     try {
       const data = event.data ? JSON.parse(event.data) : null;
       if (!sessionMatchesEvent(sessionId, data)) return;
@@ -434,6 +441,7 @@ export function attachSessionStreamListeners({
   });
 
   streamEs.addEventListener("thinking:delta", (event: MessageEvent) => {
+    if (!acceptsChatText()) return;
     try {
       const data = event.data ? JSON.parse(event.data) : null;
       if (!sessionMatchesEvent(sessionId, data) || !data?.text) return;
@@ -444,6 +452,7 @@ export function attachSessionStreamListeners({
   });
 
   streamEs.addEventListener("thinking:end", (event: MessageEvent) => {
+    if (!acceptsChatText()) return;
     try {
       const data = event.data ? JSON.parse(event.data) : null;
       if (!sessionMatchesEvent(sessionId, data)) return;
@@ -466,6 +475,7 @@ export function attachSessionStreamListeners({
   });
 
   streamEs.addEventListener("draft:delta", (event: MessageEvent) => {
+    if (!acceptsChatText()) return;
     try {
       const data = event.data ? JSON.parse(event.data) : null;
       if (!sessionMatchesEvent(sessionId, data) || !data?.text) return;
@@ -623,6 +633,7 @@ export function attachSessionStreamListeners({
       const category = data.category;
       const phase = data.phase;
       const executionId = eventExecutionId(data);
+      if (!executionId && !acceptsChatText()) return;
       set((state) => ({
         sessions: updateSession(state.sessions, sessionId, (runtime) => {
           // 带 executionId 的压缩事件（后台生产任务的 pipeline）：作为阶段挂到
@@ -645,6 +656,17 @@ export function attachSessionStreamListeners({
       // ignore
     }
   });
+
+  return {
+    settleChat() {
+      // HTTP can finish before the text batching timer or terminal SSE event.
+      // Drain first so the caller replaces the existing response, then prevent
+      // late text from recreating it. Background tool events remain subscribed.
+      flushTextDeltas();
+      chatSettled = true;
+      flushProgressThrottles();
+    },
+  };
 }
 
 function compressionLabel(category: ContextCompressionCategory): string {

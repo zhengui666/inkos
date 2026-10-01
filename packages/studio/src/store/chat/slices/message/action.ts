@@ -412,6 +412,7 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
         isStreaming: keepProductionStream,
         isChatStreaming: false,
         detachedChatRequestId: undefined,
+        pendingSendId: undefined,
         lastFailedSend: undefined,
         stream: keepProductionStream ? runtime.stream : null,
         lastError: null,
@@ -450,9 +451,26 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
       const failureMessage = failedRequest ? failedRequest.error?.message
         ?? tr("上次请求未完成，请重试或从已保存结果继续。", "The previous request failed. Retry or continue from the saved results.") : undefined;
       const failureTimestamp = failedRequest?.completedAt ?? failedRequest?.startedAt;
-      if (failureMessage && failureTimestamp !== undefined) restoredMessages = [...restoredMessages, {
-        role: "assistant", kind: "error", content: failureMessage, timestamp: failureTimestamp,
-      }];
+      if (failureMessage && failureTimestamp !== undefined) {
+        // A blocked completion is already saved as an assistant display receipt.
+        // Reuse only this request's matching receipt; unrelated prior wording or
+        // an ordinary transport failure must still get its own error message.
+        let completionIndex = -1;
+        if (failedRequest?.completionStatus === "blocked" && failedRequest.error?.code === "AGENT_TASK_INCOMPLETE") {
+          for (let index = restoredMessages.length - 1; index >= 0; index--) {
+            const message = restoredMessages[index]!;
+            if (message.role === "user" || message.timestamp < failedRequest.startedAt) break;
+            if (message.role === "assistant" && message.content === failureMessage
+              && message.timestamp <= failureTimestamp) {
+              completionIndex = index;
+              break;
+            }
+          }
+        }
+        restoredMessages = completionIndex >= 0
+          ? restoredMessages.map((message, index) => index === completionIndex ? { ...message, kind: "error" as const } : message)
+          : [...restoredMessages, { role: "assistant", kind: "error", content: failureMessage, timestamp: failureTimestamp }];
+      }
       const messages = restoredMessages;
       const restoredResolutions = deriveResolvedProposals(messages);
 
@@ -489,6 +507,7 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
               isStreaming: isRunning,
               isChatStreaming: chatRunning,
               detachedChatRequestId: chatRunning ? data.chatRequest!.requestId : undefined,
+              pendingSendId: chatRunning ? runtime?.pendingSendId : undefined,
               ...(failedRequest ? {
                 lastFailedSend: failedRequest.retry ?? runtime?.lastFailedSend,
                 lastError: failureMessage,
@@ -622,6 +641,7 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
         // 本轮成功则说明对话已继续，旧的重试入口不再保留。
         lastFailedSend: undefined,
         detachedChatRequestId: undefined,
+        pendingSendId: sourceRequestId,
       })),
     }));
 
@@ -634,7 +654,7 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
     set((state) => ({
       sessions: updateSession(state.sessions, sessionId, () => ({ stream: streamEs })),
     }));
-    attachSessionStreamListeners({ sessionId, streamTs, sourceRequestId, streamEs, set, get });
+    const { settleChat } = attachSessionStreamListeners({ sessionId, streamTs, sourceRequestId, streamEs, set, get });
 
     let failureExecutions: ReadonlyArray<ToolExecution> = [];
     try {
@@ -660,6 +680,10 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
         }),
       });
 
+      // Stop/newer requests own their UI even if the old HTTP call succeeds.
+      if (get().sessions[sessionId]?.stream !== streamEs
+        || get().sessions[sessionId]?.pendingSendId !== sourceRequestId) return;
+      settleChat();
       const finalContent = data.details?.draftRaw || data.response || "";
       const toolCall = data.details?.toolCall ?? undefined;
       const responseToolExecutions = data.details?.toolExecutions ?? [];
@@ -737,7 +761,8 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
     } catch (error) {
       const payload = (error as { payload?: AgentResponse })?.payload;
       // Explicit stop or a newer request already owns this session's UI.
-      if (get().sessions[sessionId]?.stream !== streamEs) return;
+      if (get().sessions[sessionId]?.stream !== streamEs
+        || get().sessions[sessionId]?.pendingSendId !== sourceRequestId) return;
       if ((error instanceof TypeError || error instanceof SyntaxError
         || (error instanceof Error && error.name === "AbortError"))
         && get().sessions[sessionId]?.isChatStreaming) {
@@ -748,6 +773,7 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
         await get().loadSessionDetail(sessionId, true);
         return;
       }
+      settleChat();
       failureExecutions = payload?.details?.toolExecutions ?? [];
       applyResponseSession(sessionId, payload?.session, workId ?? session.bookId);
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -781,6 +807,7 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
         set((state) => ({
           sessions: updateSession(state.sessions, sessionId, () => ({
             isChatStreaming: false,
+            pendingSendId: undefined,
             isStreaming: taskInFlight,
             stream: taskInFlight ? streamEs : null,
           })),
