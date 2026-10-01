@@ -58,7 +58,7 @@ jobs:
           mkdir -p test-project
           printf '%s\n' '{"name":"Codex browser tests","version":"0.1.0","language":"en"}' > test-project/inkos.json
       - name: Verify Codex settings, Doctor and radar UI with mocked account APIs
-        run: pnpm --filter @actalk/inkos-studio exec playwright test codex-settings.spec.ts
+        run: pnpm --filter @actalk/inkos-studio exec playwright test --config=playwright.codex.config.ts codex-settings.spec.ts
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
