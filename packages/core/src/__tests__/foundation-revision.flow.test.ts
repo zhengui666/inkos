@@ -76,3 +76,32 @@ it('recovers a partial draft with its canon and candidate revision preserved',as
     expect(await readFile(join(state.bookDir('draft'),'story/parent_canon.md'),'utf8')).toBe('Sealed letters remain sealed.');
   } finally {generate.mockRestore();await rm(root,{recursive:true,force:true});}
 });
+
+it('preserves a timed-out foundation draft and recovers it without losing candidate history',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'inkos-timeout-recovery-'));
+  const runner=new PipelineRunner({projectRoot:root,model:'fixture',client:{} as never});
+  const state=new StateManager(root);
+  const now=new Date().toISOString();
+  const book={id:'timed-out',title:'Draft',genre:'other',platform:'other',language:'en' as const,status:'outlining' as const,targetChapters:1,chapterWordCount:300,createdAt:now,updatedAt:now};
+  const timeout=Object.assign(new Error('Worker exceeded its execution deadline'),{code:'WORKER_TIMEOUT'});
+  const generate=vi.spyOn(ArchitectAgent.prototype,'generateFoundation').mockRejectedValue(timeout);
+  try {
+    await expect(runner.initBook(book,{externalContext:'Keep the sealed-letter premise.'})).rejects.toMatchObject({cause:timeout,message:expect.stringContaining('candidate artifacts were preserved')});
+    const before=await loadWorkManifest(root,book.id);
+    expect(before.status).toBe('draft');
+    expect(before.artifacts.length).toBeGreaterThan(0);
+    expect(await readFile(join(state.bookDir(book.id),'story/brief.md'),'utf8')).toBe('Keep the sealed-letter premise.');
+    expect(await state.isCompleteBookDirectory(state.bookDir(book.id))).toBe(false);
+    generate.mockResolvedValue({storyFrame:'Recovered frame',volumeMap:'One chapter',bookRules:'Preserve canon',bookRulesData:BookRulesSchema.parse({version:'2',prohibitions:[],enableFullCastTracking:false,allowedDeviations:[]}),roles:[{tier:'major',name:'Lead',content:'Adult clerk'}],initialHooks:[],pendingHooks:''});
+    await runner.reviseFoundation(book.id,'Complete the preserved draft.');
+    const after=await loadWorkManifest(root,book.id);
+    expect(after.status).toBe('active');
+    for(const artifact of before.artifacts) {
+      expect(after.artifacts.find(item=>item.id===artifact.id)?.revisions).toEqual(expect.arrayContaining(
+        artifact.revisions.map(({id,checksum,snapshotPath})=>expect.objectContaining({id,checksum,snapshotPath})),
+      ));
+    }
+    expect(await readFile(join(state.bookDir(book.id),'story/brief.md'),'utf8')).toBe('Keep the sealed-letter premise.');
+    expect(await state.isCompleteBookDirectory(state.bookDir(book.id))).toBe(true);
+  } finally {generate.mockRestore();await rm(root,{recursive:true,force:true});}
+});

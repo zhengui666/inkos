@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Type } from "@sinclair/typebox";
 import { runWorkerAgent, runWorkerAgentTool } from "../../agent/worker-agent.js";
 import type { LLMClient } from "../../llm/provider.js";
@@ -137,5 +137,82 @@ describe("native structured worker results", () => {
     await expect(runWorkerAgentTool(llmClient, "ignored", [{ role: "user", content: "Submit" }], resultTool, { timeoutMs: 20 })).rejects.toMatchObject({ code: "WORKER_TIMEOUT" });
     expect(client.close).toHaveBeenCalledOnce();
     expect(client.request.mock.calls.filter(([method]) => method === "turn/start")).toHaveLength(1);
+  });
+});
+
+describe("long-running worker deadlines", () => {
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); });
+
+  it.each(["text", "structured"])("allows a %s worker past ten minutes and releases its timer", async kind => {
+    vi.useFakeTimers();
+    vi.stubEnv("INKOS_WORKER_TIMEOUT_MS", "");
+    const progress = vi.fn();
+    const pending = kind === "text"
+      ? runWorkerAgent(llmClient, "ignored", [{ role: "user", content: "Write" }], { onTextDelta: progress })
+      : runWorkerAgentTool(llmClient, "ignored", [{ role: "user", content: "Write" }], resultTool);
+    await vi.advanceTimersByTimeAsync(11 * 60_000);
+    expect(client.close).not.toHaveBeenCalled();
+    if (kind === "text") {
+      client.notify("item/agentMessage/delta", { itemId: "answer", delta: "Manuscript" });
+      client.finish();
+      await expect(pending).resolves.toMatchObject({ content: "Manuscript" });
+      expect(progress).toHaveBeenCalledWith("Manuscript");
+    } else {
+      completeOutput({ value: 7 });
+      await expect(pending).resolves.toEqual({ value: 7 });
+    }
+    expect(client.close).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("propagates the default hour deadline through the Codex turn and closes the peer", async () => {
+    vi.useFakeTimers(); vi.stubEnv("INKOS_WORKER_TIMEOUT_MS", "");
+    const pending = runWorkerAgent(llmClient, "ignored", [{ role: "user", content: "Write" }]);
+    const rejected = expect(pending).rejects.toMatchObject({ code: "WORKER_TIMEOUT" });
+    await vi.advanceTimersByTimeAsync(60 * 60_000 - 1);
+    expect(client.close).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1); await rejected;
+    expect(client.request.mock.calls.some(([method]) => method === "turn/interrupt")).toBe(true);
+    expect(client.close).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps one configured budget across correction turns", async () => {
+    vi.useFakeTimers(); vi.stubEnv("INKOS_WORKER_TIMEOUT_MS", "2000");
+    let turn = 0;
+    client.run = async () => { if (++turn === 1) setTimeout(() => completeOutput({ value: "invalid" }), 1500); };
+    const pending = runWorkerAgentTool(llmClient, "ignored", [{ role: "user", content: "Write" }], resultTool);
+    const rejected = expect(pending).rejects.toMatchObject({ code: "WORKER_TIMEOUT" });
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(turn).toBe(2);
+    await vi.advanceTimersByTimeAsync(1); await rejected;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("lets an explicit deadline override the environment", async () => {
+    vi.useFakeTimers(); vi.stubEnv("INKOS_WORKER_TIMEOUT_MS", "1");
+    const pending = runWorkerAgent(llmClient, "ignored", [{ role: "user", content: "Write" }], { timeoutMs: 2000 });
+    const rejected = expect(pending).rejects.toMatchObject({ code: "WORKER_TIMEOUT" });
+    await vi.advanceTimersByTimeAsync(1999); expect(client.close).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1); await rejected;
+  });
+
+  it("preserves user cancellation rather than reporting timeout during the extended budget", async () => {
+    vi.useFakeTimers(); vi.stubEnv("INKOS_WORKER_TIMEOUT_MS", "7200000");
+    const controller = new AbortController();
+    const reason = Object.assign(new Error("User cancelled"), { code: "USER_CANCELLED" });
+    const pending = runWorkerAgentTool(llmClient, "ignored", [{ role: "user", content: "Write" }], resultTool, { signal: controller.signal });
+    const rejected = expect(pending).rejects.toBe(reason);
+    await vi.advanceTimersByTimeAsync(11 * 60_000); controller.abort(reason);
+    await rejected;
+    expect(client.close).toHaveBeenCalledOnce();
+    expect(client.notices.size).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["0", "-1", "NaN", "Infinity", "2147483648", "1.5", "nonsense"])("rejects invalid environment timeout %s before starting a peer", async value => {
+    vi.stubEnv("INKOS_WORKER_TIMEOUT_MS", value);
+    await expect(runWorkerAgent(llmClient, "ignored", [{ role: "user", content: "Write" }])).rejects.toThrow("must be an integer");
+    expect(mocks.create).not.toHaveBeenCalled();
   });
 });
