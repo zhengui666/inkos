@@ -4,6 +4,11 @@ import type { RadarSource, PlatformRankings } from "./radar-source.js";
 import { FanqieRadarSource, QidianRadarSource } from "./radar-source.js";
 import { RadarResultToolSchema } from "./radar-tool.js";
 
+export interface RadarScanOptions {
+  readonly onProgress?: (phase: "fetching" | "analyzing") => void;
+  readonly sourceTimeoutMs?: number;
+}
+
 export interface RadarResult {
   readonly recommendations: ReadonlyArray<RadarRecommendation>;
   readonly marketSummary: string;
@@ -51,8 +56,11 @@ export class RadarAgent extends BaseAgent {
     return "radar";
   }
 
-  async scan(): Promise<RadarResult> {
-    const rankings = await Promise.all(this.sources.map((s) => s.fetch()));
+  async scan(options: RadarScanOptions = {}): Promise<RadarResult> {
+    this.ctx.signal?.throwIfAborted();
+    options.onProgress?.("fetching");
+    const rankings = await Promise.all(this.sources.map(source => fetchSource(source, this.ctx.signal, options.sourceTimeoutMs)));
+    this.ctx.signal?.throwIfAborted();
     const rankingsText = formatRankingsForPrompt(rankings);
     if (!rankingsText) {
       throw new Error("Market radar has no source evidence to analyze.");
@@ -66,6 +74,7 @@ ${rankingsText}
 
 通过结果工具提交建议和整体市场概述。`;
 
+    options.onProgress?.("analyzing");
     const { result } = await this.submitStructured(
       [
         { role: "system", content: systemPrompt },
@@ -88,5 +97,29 @@ ${rankingsText}
       marketSummary: result.marketSummary,
       timestamp: new Date().toISOString(),
     };
+  }
+}
+
+/** Bound even custom read-only sources that do not implement AbortSignal yet. */
+async function fetchSource(source: RadarSource, parent?: AbortSignal, timeoutMs = 15_000): Promise<PlatformRankings> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error("Radar source timed out")), timeoutMs);
+  const signal = parent ? AbortSignal.any([parent, controller.signal]) : controller.signal;
+  let onAbort: () => void = () => {};
+  try {
+    signal.throwIfAborted();
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    return await Promise.race([source.fetch(signal), aborted]);
+  } catch {
+    parent?.throwIfAborted();
+    // An unavailable source contributes no evidence. Other available sources
+    // remain usable; if all are empty scan() fails before invoking the model.
+    return { platform: source.name, entries: [] };
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", onAbort);
   }
 }

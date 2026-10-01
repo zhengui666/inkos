@@ -45,6 +45,40 @@ describe("Studio Codex-only production routes", () => {
     ]));
   });
 
+  it("persists a native constrained result once and reports progress across navigation", async () => {
+    const root = await project();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const codex = new CodexFixture(async () => { await gate; return { text: JSON.stringify({ resultJson: JSON.stringify(radar) }) }; });
+    createCodexClient.mockImplementation(codex.createClient);
+    const app = createStudioServer({} as never, root);
+    const pending = app.request("/api/v1/radar/scan", post());
+    await vi.waitFor(() => expect(codex.turns).toHaveLength(1));
+    expect(await (await app.request("/api/v1/radar/status")).json()).toMatchObject({ running: true, phase: "analyzing" });
+    expect((await app.request("/api/v1/radar/scan", post())).status).toBe(409);
+    release();
+    expect((await pending).status).toBe(200);
+    expect(await (await app.request("/api/v1/radar/status")).json()).toMatchObject({ running: false, phase: "complete", result: radar });
+    const restarted = createStudioServer({} as never, root);
+    expect((await (await restarted.request("/api/v1/radar/history")).json()).items).toHaveLength(1);
+    expect(codex.toolResponses).toHaveLength(0);
+    expect(codex.turns).toHaveLength(1);
+  });
+
+  it("retains bounded result diagnostics and persists nothing after rejected tools", async () => {
+    const root = await project();
+    const codex = new CodexFixture(() => ({ calls: [{ name: "unknown_fixture_tool", args: { manuscript: "private fixture text" } }], complete: true }));
+    createCodexClient.mockImplementation(codex.createClient);
+    const app = createStudioServer({} as never, root);
+    const response = await app.request("/api/v1/radar/scan", post());
+    expect(response.status).toBe(500);
+    const body = await response.json();
+    expect(body.diagnostics).toMatchObject({ code: "WORKER_RESULT_MISSING", attempts: 3, submissions: 0, rejectedTools: 3, resultTool: "submit_market_radar" });
+    expect(JSON.stringify(body)).not.toContain("private fixture text");
+    expect((await (await app.request("/api/v1/radar/history")).json()).items).toEqual([]);
+    expect(await (await app.request("/api/v1/radar/status")).json()).toMatchObject({ running: false, phase: "error" });
+  });
+
   it("executes the direct style worker with the saved model, effort and speed, then sees changed settings next request", async () => {
     const root = await project(true);
     await mkdir(join(root, ".inkos"));

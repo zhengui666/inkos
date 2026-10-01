@@ -201,7 +201,7 @@ it('carries the required result schema through Codex dynamic tools and preserves
   expect(codex.requests.find(request=>request.method==='turn/start')?.params.effort).toBe('medium');
   expect(thread.dynamicTools).toHaveLength(1);
   expect(thread.dynamicTools[0]).toMatchObject({name:'submit_value',inputSchema:{required:['value','flags']}});
-  expect(thread.baseInstructions).toContain('Finish by calling submit_value exactly once');
+  expect(thread.baseInstructions).toContain('native outputSchema envelope');
   expect(codex.toolResponses).toHaveLength(1);
   expect(codex.toolResponses[0].response.success).toBe(true);
   expect(codex.requests.some(request=>request.method==='turn/interrupt')).toBe(true);

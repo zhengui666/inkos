@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Theme } from "../hooks/use-theme";
 import type { TFunction } from "../hooks/use-i18n";
 import { useColors } from "../hooks/use-colors";
@@ -33,32 +33,100 @@ export function RadarView({ nav, theme, t }: { nav: Nav; theme: Theme; t: TFunct
   const [history, setHistory] = useState<ReadonlyArray<RadarHistoryItem>>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [phase, setPhase] = useState("fetching");
+  const [elapsed, setElapsed] = useState(0);
+  const posting = useRef(false);
+  const following = useRef(false);
+  const mounted = useRef(true);
+  const generation = useRef(0);
+  const restored = useRef(false);
+  const reconciling = useRef(false);
+  const reconcileStatus = useRef<() => Promise<void>>(async () => {});
 
   const loadHistory = async () => {
+    const version = generation.current;
     try {
       const data = await fetchJson<{ items: ReadonlyArray<RadarHistoryItem> }>("/radar/history");
-      setHistory(data.items ?? []);
+      if (mounted.current && generation.current === version) setHistory(data.items ?? []);
     } catch {
-      setHistory([]);
+      if (mounted.current && generation.current === version) setHistory([]);
     }
   };
 
   useEffect(() => {
+    mounted.current = true;
     void loadHistory();
+    let stopped = false;
+    let inFlight = false;
+    const checkStatus = async () => {
+      if (inFlight || stopped || (restored.current && !posting.current && !following.current)) return;
+      inFlight = true;
+      const version = generation.current;
+      try {
+        const status = await fetchJson<{ running: boolean; phase: string; startedAt?: number; result?: RadarResult; error?: string }>("/radar/status", { cache: "no-store" });
+        if (stopped || !mounted.current || generation.current !== version) return;
+        reconciling.current = false;
+        if (status.running) {
+          setError("");
+          following.current = true;
+          setLoading(true);
+          setPhase(status.phase);
+          setElapsed(Math.max(0, Math.floor((Date.now() - (status.startedAt ?? Date.now())) / 1000)));
+        } else if ((following.current || !restored.current) && !posting.current) {
+          following.current = false;
+          setLoading(false);
+          if (status.result) { setResult(status.result); setError(""); void loadHistory(); }
+          else if (status.error) { setResult(null); setError(status.error); }
+        }
+        restored.current = true;
+      } catch {
+        // If both the POST and status transport failed, retain its error and
+        // allow manual retry. A previously observed running scan stays active.
+        if (!stopped && generation.current === version && !posting.current && !following.current) {
+          reconciling.current = false;
+          setLoading(false);
+        }
+      } finally {
+        inFlight = false;
+        if (!stopped && generation.current !== version && reconciling.current) void checkStatus();
+      }
+    };
+    reconcileStatus.current = checkStatus;
+    void checkStatus();
+    const timer = setInterval(() => { void checkStatus(); }, 1500);
+    return () => { stopped = true; mounted.current = false; clearInterval(timer); };
   }, []);
 
   const handleScan = async () => {
+    if (posting.current || following.current || reconciling.current) return;
+    posting.current = true;
+    restored.current = true;
+    generation.current += 1;
+    setPhase("fetching");
+    setElapsed(0);
     setLoading(true);
     setError("");
     setResult(null);
+    let failed = false;
     try {
       const data = await fetchJson<RadarResult>("/radar/scan", { method: "POST" });
-      setResult(data);
+      if (mounted.current) setResult(data);
       await loadHistory();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      failed = true;
+      if (mounted.current) setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      // Invalidate status requests started before this authoritative POST ended.
+      generation.current += 1;
+      posting.current = false;
+      following.current = false;
+      if (mounted.current) {
+        restored.current = !failed;
+        reconciling.current = failed;
+        setLoading(failed);
+        if (failed) void reconcileStatus.current();
+      }
     }
-    setLoading(false);
   };
 
   return (
@@ -84,8 +152,15 @@ export function RadarView({ nav, theme, t }: { nav: Nav; theme: Theme; t: TFunct
         </button>
       </div>
 
+      {loading && (
+        <div role="status" className="rounded-lg border border-border px-4 py-3 text-sm text-muted-foreground">
+          {t(phase === "analyzing" ? "radar.analyzing" : phase === "saving" ? "radar.saving" : "radar.fetching")} · {elapsed}s
+          <p className="mt-1 text-xs">{t("radar.deadline")}</p>
+        </div>
+      )}
+
       {error && (
-        <div className="bg-destructive/10 text-destructive px-4 py-3 rounded-lg text-sm">{error}</div>
+        <div role="alert" className="bg-destructive/10 text-destructive px-4 py-3 rounded-lg text-sm">{error}</div>
       )}
 
       {result && (

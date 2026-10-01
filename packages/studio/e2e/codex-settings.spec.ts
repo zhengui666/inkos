@@ -142,3 +142,165 @@ test("market scan renders Codex-backed results and retained history without dire
   await page.getByRole("button", { name: "Radar", exact: true }).click();
   await expect(page.getByText("Codex market fixture", { exact: true })).toBeVisible();
 });
+
+test("market scan shows phases, suppresses repeated clicks and resumes after navigation", async ({ page }) => {
+  await mockCodex(page);
+  let scans = 0;
+  let phase = "fetching";
+  let running = false;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const result = { marketSummary: "Resumed market fixture", recommendations: [] };
+  await page.route("**/api/v1/radar/status", route => route.fulfill({ json: { running, phase, startedAt: Date.now() - 5000,
+    ...(!running && scans ? { result } : {}) } }));
+  await page.route("**/api/v1/radar/scan", async route => {
+    scans++; running = true;
+    await gate;
+    running = false; phase = "complete";
+    await route.fulfill({ json: result }).catch(() => {});
+  });
+  await page.route("**/api/v1/radar/history", route => route.fulfill({ json: { items: [] } }));
+  await page.getByRole("button", { name: "Radar", exact: true }).click();
+  await page.getByRole("button", { name: "Scan Market", exact: true }).evaluate((button: HTMLButtonElement) => { button.click(); button.click(); });
+  await expect(page.getByRole("status")).toContainText("Fetching ranking evidence");
+  expect(scans).toBe(1);
+  phase = "analyzing";
+  await expect(page.getByRole("status")).toContainText("Codex is analyzing");
+  await page.goto("/#/settings");
+  await page.getByRole("button", { name: "Radar", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("Codex is analyzing");
+  await expect(page.getByRole("button", { name: "Scanning...", exact: true })).toBeDisabled();
+  release();
+  await expect(page.getByText("Resumed market fixture", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Scan Market", exact: true })).toBeEnabled();
+  expect(scans).toBe(1);
+});
+
+test("failed market scan keeps actionable diagnostics visible and permits retry", async ({ page }) => {
+  await mockCodex(page);
+  let scans = 0;
+  await page.route("**/api/v1/radar/status", route => route.fulfill({ json: { running: false, phase: "idle" } }));
+  await page.route("**/api/v1/radar/history", route => route.fulfill({ json: { items: [] } }));
+  await page.route("**/api/v1/radar/scan", route => ++scans === 1
+    ? route.fulfill({ status: 500, json: { error: "Worker deadline exceeded (code=WORKER_TIMEOUT)" } })
+    : route.fulfill({ json: { marketSummary: "Retried market fixture", recommendations: [] } }));
+  await page.getByRole("button", { name: "Radar", exact: true }).click();
+  await page.getByRole("button", { name: "Scan Market", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("WORKER_TIMEOUT");
+  await page.getByRole("button", { name: "Scan Market", exact: true }).click();
+  await expect(page.getByText("Retried market fixture", { exact: true })).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  expect(scans).toBe(2);
+});
+
+for (const outcome of ["complete", "error"] as const) {
+  test(`market scan restores ${outcome} when it finishes while the user is away`, async ({ page }) => {
+    await mockCodex(page);
+    let running = false;
+    let started = false;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const result = { marketSummary: "Completed while away", recommendations: [] };
+    const error = "Scan failed while away (code=WORKER_RESULT_INVALID)";
+    await page.route("**/api/v1/radar/status", route => route.fulfill({ json: { running,
+      phase: running ? "analyzing" : started ? outcome : "idle", startedAt: Date.now(),
+      ...(!running && started ? outcome === "complete" ? { result } : { error } : {}) } }));
+    await page.route("**/api/v1/radar/history", route => route.fulfill({ json: { items: [] } }));
+    await page.route("**/api/v1/radar/scan", async route => {
+      started = true; running = true; await gate; running = false;
+      await route.fulfill(outcome === "complete" ? { json: result } : { status: 500, json: { error } }).catch(() => {});
+    });
+    await page.getByRole("button", { name: "Radar", exact: true }).click();
+    await page.getByRole("button", { name: "Scan Market", exact: true }).click();
+    await expect.poll(() => started).toBe(true);
+    await page.goto("/#/settings");
+    release();
+    await expect.poll(() => running).toBe(false);
+    await page.getByRole("button", { name: "Radar", exact: true }).click();
+    if (outcome === "complete") await expect(page.getByText(result.marketSummary, { exact: true })).toBeVisible();
+    else await expect(page.getByRole("alert")).toContainText(error);
+    await expect(page.getByRole("button", { name: "Scan Market", exact: true })).toBeEnabled();
+  });
+}
+
+test("a delayed running status cannot resurrect a completed scan", async ({ page }) => {
+  await mockCodex(page);
+  let running = false;
+  let statusHeld = false;
+  let releaseScan!: () => void;
+  let releaseStatus!: () => void;
+  const scanGate = new Promise<void>(resolve => { releaseScan = resolve; });
+  const statusGate = new Promise<void>(resolve => { releaseStatus = resolve; });
+  const result = { marketSummary: "Authoritative completed scan", recommendations: [] };
+  await page.route("**/api/v1/radar/history", route => route.fulfill({ json: { items: [] } }));
+  await page.route("**/api/v1/radar/status", async route => {
+    if (running && !statusHeld) {
+      statusHeld = true;
+      await statusGate;
+      return route.fulfill({ json: { running: true, phase: "analyzing", startedAt: Date.now() } });
+    }
+    return route.fulfill({ json: { running: false, phase: "idle" } });
+  });
+  await page.route("**/api/v1/radar/scan", async route => {
+    running = true; await scanGate; running = false;
+    await route.fulfill({ json: result });
+  });
+  await page.getByRole("button", { name: "Radar", exact: true }).click();
+  await page.getByRole("button", { name: "Scan Market", exact: true }).click();
+  await expect.poll(() => statusHeld).toBe(true);
+  releaseScan();
+  await expect(page.getByText(result.marketSummary, { exact: true })).toBeVisible();
+  const lateStatus = page.waitForResponse(response => response.url().endsWith("/radar/status"));
+  releaseStatus();
+  await lateStatus;
+  await expect(page.getByRole("status")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Scan Market", exact: true })).toBeEnabled();
+});
+
+test("an old terminal status cannot overwrite a newer requested scan", async ({ page }) => {
+  await mockCodex(page);
+  let held = false;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const result = { marketSummary: "Newer requested scan", recommendations: [] };
+  await page.route("**/api/v1/radar/history", route => route.fulfill({ json: { items: [] } }));
+  await page.route("**/api/v1/radar/status", async route => {
+    held = true; await gate;
+    await route.fulfill({ json: { running: false, phase: "error", error: "Old scan failed" } });
+  });
+  await page.route("**/api/v1/radar/scan", route => route.fulfill({ json: result }));
+  await page.getByRole("button", { name: "Radar", exact: true }).click();
+  await expect.poll(() => held).toBe(true);
+  await page.getByRole("button", { name: "Scan Market", exact: true }).click();
+  await expect(page.getByText(result.marketSummary, { exact: true })).toBeVisible();
+  const lateStatus = page.waitForResponse(response => response.url().endsWith("/radar/status"));
+  release(); await lateStatus;
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(page.getByText(result.marketSummary, { exact: true })).toBeVisible();
+});
+
+for (const failure of ["transport", "conflict"] as const) {
+  test(`market scan reconciles ${failure} failure with a still-running server scan`, async ({ page }) => {
+    await mockCodex(page);
+    let running = false;
+    let scans = 0;
+    const result = { marketSummary: "Recovered server scan", recommendations: [] };
+    await page.route("**/api/v1/radar/history", route => route.fulfill({ json: { items: [] } }));
+    await page.route("**/api/v1/radar/status", route => route.fulfill({ json: { running,
+      phase: running ? "analyzing" : scans ? "complete" : "idle", startedAt: Date.now(),
+      ...(!running && scans ? { result } : {}) } }));
+    await page.route("**/api/v1/radar/scan", route => {
+      scans++; running = true;
+      return failure === "transport" ? route.abort("failed") : route.fulfill({ status: 409, json: { error: "A market scan is already running" } });
+    });
+    await page.getByRole("button", { name: "Radar", exact: true }).click();
+    await page.getByRole("button", { name: "Scan Market", exact: true }).click();
+    await expect(page.getByRole("status")).toContainText("Codex is analyzing");
+    await expect(page.getByRole("button", { name: "Scanning...", exact: true })).toBeDisabled();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    running = false;
+    await expect(page.getByText(result.marketSummary, { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Scan Market", exact: true })).toBeEnabled();
+    expect(scans).toBe(1);
+  });
+}

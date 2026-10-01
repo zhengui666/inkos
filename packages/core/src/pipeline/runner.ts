@@ -438,19 +438,25 @@ export class PipelineRunner {
   // Atomic operations (composable by OpenClaw or agent mode)
   // ---------------------------------------------------------------------------
 
-  async runRadar(): Promise<RadarResult> {
+  async runRadar(options: import("../agents/radar.js").RadarScanOptions & { timeoutMs?: number } = {}): Promise<RadarResult> {
     const available = await loadAvailableAgentSkills({ projectRoot: this.config.projectRoot });
     const marketSkill = [...available.skills].reverse().find((skill) => skill.id === "inkos-long-market-research");
     if (!marketSkill) throw new Error("Radar requires unavailable skill: inkos-long-market-research");
     const baseContext = this.agentCtxFor("radar");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(Object.assign(new Error("Market scan exceeded its five-minute execution deadline"), {
+      code: "RADAR_TIMEOUT",
+    })), options.timeoutMs ?? 5 * 60_000);
+    const signal = baseContext.signal ? AbortSignal.any([baseContext.signal, controller.signal]) : controller.signal;
     const radar = new RadarAgent({
       ...baseContext,
+      signal,
       activatedSkills: mergeActivatedSkillGuidance(
         baseContext.activatedSkills ?? [],
         [{ skill: marketSkill, resources: [] }],
       ),
     }, this.config.radarSources);
-    return radar.scan();
+    try { return await radar.scan(options); } finally { clearTimeout(timer); }
   }
 
   async initBook(book: BookConfig, options: InitBookOptions = {}): Promise<void> {
