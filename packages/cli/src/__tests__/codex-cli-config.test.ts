@@ -124,7 +124,7 @@ describe.each(configModes)("CLI config: $name", ({ llm }) => {
 
   it("preserves key validation for direct provider API consumers", async () => {
     const actual = await vi.importActual<typeof import("../utils.js")>("../utils.js");
-    await expect(actual.loadConfig({ projectRoot: fixture.root })).rejects.toMatchObject({ code: "MISSING_API_KEY" });
+    await expect(actual.loadConfig({ projectRoot: fixture.root, purpose: "provider" })).rejects.toMatchObject({ code: "MISSING_API_KEY" });
     await expect(actual.loadConfig({ projectRoot: fixture.root, requireApiKey: true })).rejects.toMatchObject({ code: "MISSING_API_KEY" });
   });
 });

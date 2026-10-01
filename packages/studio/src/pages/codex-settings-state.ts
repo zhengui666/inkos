@@ -2,7 +2,7 @@ import type { StudioCodexModel, StudioCodexSettings } from "../shared/codex";
 
 export function selectedCodexModel(models: readonly StudioCodexModel[], settings: StudioCodexSettings) {
   return settings.model
-    ? models.find((model) => model.model === settings.model)
+    ? models.find((model) => model.model === settings.model || model.id === settings.model)
     : models.find((model) => model.isDefault) ?? models[0];
 }
 

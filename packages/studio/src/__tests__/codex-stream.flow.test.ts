@@ -35,7 +35,7 @@ it("delivers a complete Codex reasoning lifecycle over Studio SSE", async () => 
       }
     })();
     const response = await app.request("/api/v1/agent", post({ sessionId, instruction: "Explain the scene." }));
-    expect(response.status).toBe(200);
+    expect(response.status, await response.clone().text()).toBe(200);
     const text = await events;
     expect(text).toContain("event: thinking:start");
     expect(text).toContain("event: thinking:delta");

@@ -11,6 +11,8 @@ import type { ChatAttachmentPayload, StudioCompletionStatus } from "../shared/se
 import {
   StateManager,
   createCodexAccountService,
+  inspectCodexReadiness,
+  CodexConfigurationError,
   type CodexAccountService,
   recoverAtomicFileSets,
   commitAtomicFileSet,
@@ -2628,6 +2630,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     if (error instanceof ApiError) {
       return c.json({ error: { code: error.code, message: error.message } }, error.status as 400);
     }
+    if (error instanceof CodexConfigurationError) {
+      return c.json({ error: { code: error.code, message: error.message } }, 400);
+    }
     if (error instanceof LLMConfigurationError) {
       return c.json({ error: { code: "LLM_CONFIG_ERROR", message: error.message } }, 400);
     }
@@ -2638,7 +2643,8 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     );
   });
 
-  app.route("/api/v1/codex", createCodexRoutes(overrides.codexAccountService ?? createCodexAccountService({ projectDir: root })));
+  const codexAccountService = overrides.codexAccountService ?? createCodexAccountService({ projectDir: root });
+  app.route("/api/v1/codex", createCodexRoutes(codexAccountService));
 
   // BookId validation middleware — blocks path traversal on all book routes
   app.use("/api/v1/books/:id/*", async (c, next) => {
@@ -2676,7 +2682,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
   async function loadCurrentProjectConfig(
     options?: { readonly requireApiKey?: boolean },
   ): Promise<ProjectConfig> {
-    const freshConfig = await loadProjectConfig(root, { ...options, consumer: "studio" });
+    const freshConfig = await loadProjectConfig(root, { ...options, consumer: "studio", purpose: "codex" });
     cachedConfig = freshConfig;
     return freshConfig;
   }
@@ -2720,7 +2726,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       : sseSink;
     const logger = createLogger({ tag: "studio", sinks: [scopedSseSink, consoleSink] });
     return {
-      client: overrides?.client ?? createLLMClient(currentConfig.llm),
+      client: overrides?.client ?? createLLMClient(currentConfig.llm, root),
       model: overrides?.model ?? currentConfig.llm.model,
       projectRoot: root,
       defaultLLMConfig: currentConfig.llm,
@@ -4692,7 +4698,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     try {
       // Load config + create LLM client (pipeline created after model resolution)
       const config = await loadCurrentProjectConfig({ requireApiKey: false });
-      const client = createLLMClient(config.llm);
+      const client = createLLMClient(config.llm, root);
 
       const loadedBookSession = await loadBookSession(root, sessionId);
       if (!loadedBookSession) {
@@ -5816,7 +5822,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       const { compileStyleGuide } = await import("@actalk/inkos-core");
       const config = await loadCurrentProjectConfig();
       const guide = await compileStyleGuide({
-        client: createLLMClient(config.llm),
+        client: createLLMClient(config.llm, root),
         model: config.llm.model,
         projectRoot: root,
         referenceText: text,
@@ -6216,28 +6222,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     } catch { /* ignore */ }
 
     try {
-      const currentConfig = await loadCurrentProjectConfig({ requireApiKey: false });
-      const service = currentConfig.llm.service ?? currentConfig.llm.provider;
-      // Hard overall budget so the diagnostics page never hangs on a slow /
-      // rate-limited upstream — if we can't confirm connectivity quickly, report
-      // it as not-connected rather than spinning.
-      const probe = await withTimeout(
-        probeServiceCapabilities({
-          root,
-          service,
-          apiKey: currentConfig.llm.apiKey,
-          baseUrl: currentConfig.llm.baseUrl,
-          preferredApiFormat: currentConfig.llm.apiFormat,
-          preferredStream: currentConfig.llm.stream,
-          preferredModel: currentConfig.llm.model,
-          proxyUrl: currentConfig.llm.proxyUrl,
-          language: normalizeStudioLanguage(currentConfig.language),
-        }),
-        DOCTOR_LLM_PROBE_BUDGET_MS,
-        "doctor llm probe",
-      );
-      checks.llmConnected = probe.ok;
-    } catch { /* slow/unreachable upstream — leave llmConnected false */ }
+      await withTimeout(inspectCodexReadiness(codexAccountService), DOCTOR_LLM_PROBE_BUDGET_MS, "doctor Codex account check");
+      checks.llmConnected = true;
+    } catch { /* Unauthenticated/unavailable/unsupported Codex settings remain unhealthy. */ }
 
     return c.json(checks);
   });
@@ -6561,7 +6548,7 @@ export async function startStudioServer(
   options?: { readonly staticDir?: string; readonly hostname?: string; readonly allowedOrigins?: readonly string[] },
 ): Promise<void> {
   await recoverAtomicFileSets(root, true);
-  const config = await loadProjectConfig(root, { consumer: "studio", requireApiKey: false });
+  const config = await loadProjectConfig(root, { consumer: "studio", purpose: "codex" });
 
   const codexAccountService = createCodexAccountService({ projectDir: root });
   const app = createStudioServer(config, root, { hostname: options?.hostname, allowedOrigins: options?.allowedOrigins, codexAccountService });

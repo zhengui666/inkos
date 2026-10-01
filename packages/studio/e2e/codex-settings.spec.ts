@@ -113,3 +113,32 @@ test("model changes keep effort and speed valid and persist across reload", asyn
   await card.getByLabel("Codex model", { exact: true }).selectOption("");
   await expect(card.getByLabel("Reasoning effort")).toHaveValue("medium");
 });
+
+test("Codex-ready projects do not need legacy env files in Doctor", async ({ page }) => {
+  await mockCodex(page);
+  await page.route("**/api/v1/doctor", route => route.fulfill({ json: {
+    inkosJson: true, projectEnv: false, globalEnv: false, booksDir: true, bookCount: 0, llmConnected: true,
+  } }));
+  await page.getByRole("button", { name: "Doctor", exact: true }).click();
+  await expect(page.getByText("Codex account and model settings", { exact: true })).toBeVisible();
+  await expect(page.getByText("All checks passed — environment is healthy", { exact: true })).toBeVisible();
+  await expect(page.getByText("Optional external-service configuration", { exact: true })).toHaveCount(2);
+});
+
+test("market scan renders Codex-backed results and retained history without directing the user to API keys", async ({ page }) => {
+  const state = await mockCodex(page);
+  state.account = { connected: true, account: { type: "chatgpt", email: "writer@example.test", planType: "plus" }, requiresOpenaiAuth: true, login: null };
+  let scans = 0;
+  const result = { marketSummary: "Codex market fixture", recommendations: [{ platform: "qidian", genre: "fantasy", concept: "The Clockmaker", reasoning: "Grounded in the supplied ranking", benchmarkTitles: ["Fixture ranking"] }] };
+  await page.route("**/api/v1/radar/scan", async route => { scans++; await route.fulfill({ json: result }); });
+  await page.route("**/api/v1/radar/history", route => route.fulfill({ json: { items: scans ? [{ file: "scan-fixture.json", timestamp: "2026-01-01T00:00:00Z", summaryPreview: result.marketSummary, result }] : [] } }));
+  await page.getByRole("button", { name: "Radar", exact: true }).click();
+  await page.getByRole("button", { name: "Scan Market", exact: true }).click();
+  await expect(page.getByText("The Clockmaker", { exact: true })).toBeVisible();
+  await expect(page.getByText("Scan History", { exact: true })).toBeVisible();
+  await expect(page.getByText(/API Key.*not set|API Key 未设置/)).toHaveCount(0);
+  expect(scans).toBe(1);
+  await page.reload();
+  await page.getByRole("button", { name: "Radar", exact: true }).click();
+  await expect(page.getByText("Codex market fixture", { exact: true })).toBeVisible();
+});

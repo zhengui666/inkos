@@ -39,3 +39,10 @@ it("only opens secure official device-login URLs", () => {
     expect(isCodexVerificationUrl(url)).toBe(false);
   }
 });
+
+it("accepts catalog aliases consistently with the server and runtime", () => {
+  const aliased = [{ ...models[0]!, id: "alias", model: "canonical" }];
+  const settings = { model: "alias", reasoningEffort: "medium", serviceTier: "default" };
+  expect(selectedCodexModel(aliased, settings)?.model).toBe("canonical");
+  expect(validCodexSettings(aliased, settings)).toBe(true);
+});

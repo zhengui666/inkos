@@ -13,7 +13,7 @@ class WorkerClient {
   run: () => Promise<void> = async () => {};
   request = vi.fn(async (method: string, _params?: unknown) => {
     if (method === "account/read") return { account: { type: "chatgpt", email: "fixture@example.test", planType: "plus" }, requiresOpenaiAuth: false };
-    if (method === "model/list") return { data: [{ model: "codex-fixture", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "high" }] }] };
+    if (method === "model/list") return { data: [{ id: "codex-fixture", model: "codex-fixture", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "high" }] }] };
     if (method === "thread/start") return { thread: { id: "thread" }, model: "codex-fixture" };
     if (method === "turn/start") {
       queueMicrotask(() => { void this.run(); });

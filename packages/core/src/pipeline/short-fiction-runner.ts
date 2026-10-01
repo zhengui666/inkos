@@ -1244,8 +1244,9 @@ async function readProjectCoverConfig(root: string): Promise<{
   readonly model?: string;
   readonly baseUrl?: string;
 } | undefined> {
-  const parsed = ProjectConfigSchema.parse(JSON.parse(await readFile(join(root, "inkos.json"), "utf-8")));
-  const cover = parsed.llm.cover;
+  const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
+  // A configured image capability must not require obsolete text-provider fields.
+  const cover = ProjectConfigSchema.shape.llm.shape.cover.parse(raw?.llm?.cover);
   if (!cover) return undefined;
   const baseUrl = normalizeCoverBaseUrl(cover.baseUrl);
   return {

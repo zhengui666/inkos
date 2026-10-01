@@ -7,10 +7,12 @@ import { guessServiceFromBaseUrl, resolveServicePreset, resolveServiceProviderFa
 import { isApiKeyOptionalForEndpoint } from "./llm-endpoint-auth.js";
 import { mergedLLMEnv, studioIgnoredEnv, type LLMEnvLayers, type LLMEnvMap } from "./llm-env.js";
 import type { LLMApiFormat } from "../llm/api-format.js";
+import { readCodexSettings } from "../codex/settings.js";
 
 export type LLMConsumer = "studio" | "cli" | "daemon" | "deploy";
-export type LLMConfigMode = "studio-project" | "cli-project" | "environment";
-export type LLMValueSource = "project" | "studio-secret" | "env" | "cli" | "default";
+export type LLMConfigMode = "studio-project" | "cli-project" | "environment" | "codex";
+export type LLMConfigPurpose = "provider" | "codex";
+export type LLMValueSource = "project" | "studio-secret" | "env" | "cli" | "default" | "codex-settings";
 
 export class LLMConfigurationError extends Error {
   constructor(
@@ -37,6 +39,8 @@ export interface ResolveEffectiveLLMConfigInput {
   readonly envLayers: LLMEnvLayers;
   readonly cli?: LLMConfigCliOverrides;
   readonly requireApiKey?: boolean;
+  /** Select the capability before hydrating unrelated provider credentials. */
+  readonly purpose?: LLMConfigPurpose;
 }
 
 export interface EffectiveLLMDiagnostics {
@@ -75,6 +79,7 @@ export async function resolveEffectiveLLMConfig(
   input: ResolveEffectiveLLMConfigInput,
 ): Promise<EffectiveLLMConfigResult> {
   const config = await readProjectConfig(input.projectRoot);
+  if (input.purpose === "codex") return resolveCodexProjectConfig(config, input);
   const llm = { ...((config.llm ?? {}) as Record<string, unknown>) };
   const services = normalizeServiceEntries(llm.services);
   const configMode = resolveConfigMode(input.consumer, llm.configSource, services);
@@ -126,6 +131,42 @@ export async function resolveEffectiveLLMConfig(
     config: parsed,
     llm: parsed.llm,
     diagnostics,
+  };
+}
+
+/**
+ * Production text belongs to Codex, whose account and model settings are separate
+ * from image/direct-provider configuration. This is an in-memory compatibility
+ * projection, never written back to inkos.json and never a provider fallback.
+ */
+async function resolveCodexProjectConfig(
+  raw: Record<string, unknown>,
+  input: ResolveEffectiveLLMConfigInput,
+): Promise<EffectiveLLMConfigResult> {
+  const settings = await readCodexSettings(input.projectRoot);
+  const legacy = objectValue(raw.llm);
+  const config = ProjectConfigSchema.parse({
+    ...raw,
+    ...(input.consumer !== "studio" && mergedLLMEnv(input.envLayers).INKOS_DEFAULT_LANGUAGE
+      ? { language: mergedLLMEnv(input.envLayers).INKOS_DEFAULT_LANGUAGE } : {}),
+    // Legacy per-worker provider overrides cannot choose a Codex model or budget.
+    modelOverrides: undefined,
+    llm: {
+      service: "codex", provider: "openai", configSource: input.consumer === "studio" ? "studio" : "env",
+      model: settings.model ?? "codex-default", apiKey: "",
+      // Required by the legacy LLMConfig shape, but no HTTP client is constructed
+      // for this service and this reserved invalid endpoint is never contacted.
+      baseUrl: "https://example.invalid/v1", apiFormat: "responses", stream: true,
+      temperature: 0.7, thinkingBudget: 0,
+      // Images remain a separate, explicitly configured capability. Keep schema
+      // validation and preserve their configuration without loading their key.
+      ...(legacy.cover !== undefined ? { cover: legacy.cover } : {}),
+    },
+  });
+  return {
+    config, llm: config.llm,
+    diagnostics: { configMode: "codex", serviceSource: "default", modelSource: "codex-settings",
+      apiKeySource: "default", warnings: [] },
   };
 }
 

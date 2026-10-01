@@ -32,11 +32,70 @@ function projectModel(value: unknown): CodexModel | null {
     supportedReasoningEfforts: (Array.isArray(model.supportedReasoningEfforts) ? model.supportedReasoningEfforts : []).map(value => {
       const effort = object(value); return { reasoningEffort: text(effort.reasoningEffort), description: text(effort.description) };
     }).filter(effort => effort.reasoningEffort),
-    serviceTiers: (Array.isArray(model.serviceTiers) ? model.serviceTiers : []).map(value => {
-      const tier = object(value); return { id: text(tier.id), name: text(tier.name), description: text(tier.description) };
-    }).filter(tier => tier.id),
+    serviceTiers: projectServiceTiers(model),
     defaultServiceTier: typeof model.defaultServiceTier === 'string' ? model.defaultServiceTier : null,
   };
+}
+
+function projectServiceTiers(model: Record<string, unknown>): CodexModel["serviceTiers"] {
+  const tiers = new Map<string, CodexModel["serviceTiers"][number]>();
+  for (const value of Array.isArray(model.serviceTiers) ? model.serviceTiers : []) {
+    const tier = object(value), id = text(tier.id);
+    if (id) tiers.set(id, { id, name: text(tier.name) || id, description: text(tier.description) });
+  }
+  for (const id of Array.isArray(model.additionalSpeedTiers) ? model.additionalSpeedTiers : []) {
+    if (typeof id === 'string' && id && !tiers.has(id)) tiers.set(id, { id, name: id, description: '' });
+  }
+  return [...tiers.values()];
+}
+
+export class CodexConfigurationError extends Error {
+  constructor(readonly code: "CODEX_AUTH_REQUIRED" | "CODEX_MODEL_UNAVAILABLE" | "CODEX_SETTINGS_UNSUPPORTED", message: string) {
+    super(message); this.name = "CodexConfigurationError";
+  }
+}
+
+/** The runtime, settings editor and health check share the same catalog rules. */
+export function selectCodexModel(models: readonly CodexModel[], settings: CodexSettings): CodexModel {
+  const model = settings.model
+    ? models.find(model => model.model === settings.model || model.id === settings.model)
+    : models.find(model => model.isDefault) ?? models[0];
+  if (!model) throw new CodexConfigurationError("CODEX_MODEL_UNAVAILABLE",
+    "The configured Codex model is not available. Refresh Codex settings and choose an available model.");
+  if (!model.supportedReasoningEfforts.some(option => option.reasoningEffort === settings.reasoningEffort)) {
+    throw new CodexConfigurationError("CODEX_SETTINGS_UNSUPPORTED", "The configured reasoning effort is not supported by this Codex model. Update Codex settings.");
+  }
+  if (settings.serviceTier !== 'default' && !model.serviceTiers.some(option => option.id === settings.serviceTier)) {
+    throw new CodexConfigurationError("CODEX_SETTINGS_UNSUPPORTED", "The configured speed is not supported by this Codex model. Update Codex settings.");
+  }
+  return model;
+}
+
+/** Read-only account/catalog validation, never a model inference or billing probe. */
+export async function inspectCodexReadiness(service: Pick<CodexAccountService, 'readAccount' | 'readSettings' | 'listModels'>): Promise<{ model: string; reasoningEffort: string; serviceTier: string }> {
+  const account = await service.readAccount();
+  if (!account.connected || account.account?.type !== 'chatgpt') throw new CodexConfigurationError("CODEX_AUTH_REQUIRED",
+    "Sign in with ChatGPT in Studio → Project settings → Codex before starting a text task.");
+  const settings = await service.readSettings();
+  const model = selectCodexModel(await service.listModels(), settings);
+  return { model: model.model, reasoningEffort: settings.reasoningEffort, serviceTier: settings.serviceTier };
+}
+
+export async function readCodexModels(client: CodexClient, signal?: AbortSignal): Promise<CodexModel[]> {
+  const models = new Map<string, CodexModel>();
+  const seen = new Set<string>();
+  let cursor: string | null = null;
+  do {
+    signal?.throwIfAborted();
+    const result = object(await client.request('model/list', { cursor, limit: 100, includeHidden: false }, { signal }));
+    if (!Array.isArray(result.data)) throw new Error('Codex returned an invalid model catalog');
+    for (const value of result.data) { const model = projectModel(value); if (model) models.set(model.id, model); }
+    cursor = typeof result.nextCursor === 'string' && result.nextCursor ? result.nextCursor : null;
+    if (cursor && seen.has(cursor)) throw new Error('Codex model catalog repeated a page');
+    if (cursor) seen.add(cursor);
+    if (seen.size > 100) throw new Error('Codex model catalog has too many pages');
+  } while (cursor);
+  return [...models.values()];
 }
 
 function projectDeviceLogin(value: unknown): CodexDeviceLogin {
@@ -153,20 +212,7 @@ class AccountService implements CodexAccountService {
   }
 
   async listModels(): Promise<CodexModel[]> {
-    const client = await this.getClient();
-    const models = new Map<string, CodexModel>();
-    const seen = new Set<string>();
-    let cursor: string | null = null;
-    do {
-      const result = object(await client.request('model/list', { cursor, limit: 100, includeHidden: false }));
-      if (!Array.isArray(result.data)) throw new Error('Codex returned an invalid model catalog');
-      for (const value of result.data) { const model = projectModel(value); if (model) models.set(model.id, model); }
-      cursor = typeof result.nextCursor === 'string' && result.nextCursor ? result.nextCursor : null;
-      if (cursor && seen.has(cursor)) throw new Error('Codex model catalog repeated a page');
-      if (cursor) seen.add(cursor);
-      if (seen.size > 100) throw new Error('Codex model catalog has too many pages');
-    } while (cursor);
-    return [...models.values()];
+    return readCodexModels(await this.getClient());
   }
 
   readSettings(): Promise<CodexSettings> { return readCodexSettings(this.options.projectDir); }
@@ -176,15 +222,7 @@ class AccountService implements CodexAccountService {
       const patch = validateCodexSettingsPatch(value);
       const current = await this.readSettings();
       const merged = { ...current, ...patch };
-      const models = await this.listModels();
-      const model = merged.model ? models.find(model => model.model === merged.model || model.id === merged.model) : models.find(model => model.isDefault);
-      if (merged.model && !model) throw new Error('The selected model is not available in the Codex catalog');
-      if (model && !model.supportedReasoningEfforts.some(option => option.reasoningEffort === merged.reasoningEffort)) {
-        throw new Error('The selected reasoning effort is not supported by this model');
-      }
-      if (merged.serviceTier !== 'default' && !model?.serviceTiers.some(tier => tier.id === merged.serviceTier)) {
-        throw new Error('The selected service tier is not supported by this model');
-      }
+      selectCodexModel(await this.listModels(), { ...merged, model: merged.model ?? undefined });
       return updateCodexSettings(this.options.projectDir, patch);
     });
   }

@@ -21,6 +21,10 @@ export function deriveInvalidationPaths(path: string): ReadonlyArray<string> {
   const normalized = buildApiUrl(path);
   if (!normalized) return [];
 
+  if (normalized.startsWith("/api/v1/codex/")) {
+    return ["/api/v1/codex/account", "/api/v1/codex/settings", "/api/v1/codex/models", "/api/v1/doctor"];
+  }
+
   if (
     normalized === "/api/v1/books/create" ||
     normalized === "/api/v1/fanfic/init" ||

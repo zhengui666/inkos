@@ -107,8 +107,9 @@ async function fetchDoctorModels(
 
 export const doctorCommand = new Command("doctor")
   .description("Check environment and project health")
+  .option("--provider", "Also probe the explicitly configured external provider (may incur API usage)")
   .option("--repair-node-runtime", "Write .nvmrc and .node-version pinned to Node 22 for this project")
-  .action(async (opts: { repairNodeRuntime?: boolean }) => {
+  .action(async (opts: { repairNodeRuntime?: boolean; provider?: boolean }) => {
     const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
     const root = findProjectRoot();
     // doctor is not scoped to a book, so the language comes from the environment
@@ -145,60 +146,64 @@ export const doctorCommand = new Command("doctor")
       checks.push({ name: "inkos.json", ok: false, detail: "Not found. Run 'inkos init'" });
     }
 
-    // 3. Check .env exists
-    try {
-      await readFile(join(root, ".env"), "utf-8");
-      checks.push({ name: ".env", ok: true, detail: "Found" });
-    } catch {
-      checks.push({ name: ".env", ok: false, detail: "Not found" });
-    }
-
-    // 4. Check global config
-    {
-      let hasGlobal = false;
+    if (opts.provider) {
+      // External provider checks are opt-in; Codex does not require .env/API keys.
+      // 3. Check .env exists
       try {
-        const globalContent = await readFile(GLOBAL_ENV_PATH, "utf-8");
-        hasGlobal = globalContent.includes("INKOS_LLM_API_KEY=") && !globalContent.includes("your-api-key-here");
-      } catch { /* no global config */ }
-      checks.push({
-        name: "Global Config",
-        ok: hasGlobal,
-        detail: hasGlobal ? `Found (${GLOBAL_ENV_PATH})` : "Not set. Run 'inkos config set-global'",
-      });
-    }
-
-    // 5. Check effective LLM config (Studio project base + env/CLI overlay, or legacy env)
-    {
-      const { loadConfigWithDiagnostics } = await import("../utils.js");
-      const { isApiKeyOptionalForEndpoint } = await import("@actalk/inkos-core");
-      let configResult: Awaited<ReturnType<typeof loadConfigWithDiagnostics>> | undefined;
-      try {
-        configResult = await loadConfigWithDiagnostics({ requireApiKey: false });
-        checks.push({
-          name: "LLM Config Mode",
-          ok: true,
-          detail: `${configResult.diagnostics.configMode} (service=${configResult.diagnostics.serviceSource}, model=${configResult.diagnostics.modelSource}, key=${configResult.diagnostics.apiKeySource})`,
-        });
-        for (const warning of configResult.diagnostics.warnings) {
-          checks.push({ name: "  Config Hint", ok: true, detail: warning });
-        }
+        await readFile(join(root, ".env"), "utf-8");
+        checks.push({ name: ".env", ok: true, detail: "Found" });
       } catch {
-        // The API connectivity check below will report the concrete config failure.
+        checks.push({ name: ".env", ok: false, detail: "Not found" });
       }
-      const provider = configResult?.llm.provider;
-      const baseUrl = configResult?.llm.baseUrl;
-      const apiKey = configResult?.llm.apiKey;
-      const apiKeyOptional = isApiKeyOptionalForEndpoint({ provider, baseUrl });
-      const hasKey = apiKeyOptional || (!!apiKey && apiKey.length > 10 && apiKey !== "your-api-key-here");
-      checks.push({
-        name: "LLM API Key",
-        ok: hasKey,
-        detail: apiKeyOptional
-          ? "Optional for local/self-hosted endpoint"
-          : hasKey
-            ? "Configured"
-            : "Missing — save a Studio service key or set env for CLI/daemon/deploy",
-      });
+
+      // 4. Check global config
+      {
+        let hasGlobal = false;
+        try {
+          const globalContent = await readFile(GLOBAL_ENV_PATH, "utf-8");
+          hasGlobal = globalContent.includes("INKOS_LLM_API_KEY=") && !globalContent.includes("your-api-key-here");
+        } catch { /* no global config */ }
+        checks.push({
+          name: "Global Config",
+          ok: hasGlobal,
+          detail: hasGlobal ? `Found (${GLOBAL_ENV_PATH})` : "Not set. Run 'inkos config set-global'",
+        });
+      }
+
+      // 5. Check effective LLM config (Studio project base + env/CLI overlay, or legacy env)
+      {
+        const { loadConfigWithDiagnostics } = await import("../utils.js");
+        const { isApiKeyOptionalForEndpoint } = await import("@actalk/inkos-core");
+        let configResult: Awaited<ReturnType<typeof loadConfigWithDiagnostics>> | undefined;
+        try {
+          configResult = await loadConfigWithDiagnostics({ requireApiKey: false, purpose: "provider" });
+          checks.push({
+            name: "LLM Config Mode",
+            ok: true,
+            detail: `${configResult.diagnostics.configMode} (service=${configResult.diagnostics.serviceSource}, model=${configResult.diagnostics.modelSource}, key=${configResult.diagnostics.apiKeySource})`,
+          });
+          for (const warning of configResult.diagnostics.warnings) {
+            checks.push({ name: "  Config Hint", ok: true, detail: warning });
+          }
+        } catch {
+          // The API connectivity check below will report the concrete config failure.
+        }
+        const provider = configResult?.llm.provider;
+        const baseUrl = configResult?.llm.baseUrl;
+        const apiKey = configResult?.llm.apiKey;
+        const apiKeyOptional = isApiKeyOptionalForEndpoint({ provider, baseUrl });
+        const hasKey = apiKeyOptional || (!!apiKey && apiKey.length > 10 && apiKey !== "your-api-key-here");
+        checks.push({
+          name: "LLM API Key",
+          ok: hasKey,
+          detail: apiKeyOptional
+            ? "Optional for local/self-hosted endpoint"
+            : hasKey
+              ? "Configured"
+              : "Missing — save a Studio service key or set env for CLI/daemon/deploy",
+        });
+      }
+
     }
 
     // 5. Check books directory
@@ -215,145 +220,160 @@ export const doctorCommand = new Command("doctor")
       checks.push({ name: "Books", ok: false, detail: String(error) });
     }
 
-    // 6. API connectivity test
+    // Validate the configured Codex account/catalog without making a paid model request.
+    const { createCodexAccountService, inspectCodexReadiness } = await import("@actalk/inkos-core");
+    const codex = createCodexAccountService({ projectDir: root });
     try {
-      const { createLLMClient, chatCompletion, LLMConfigSchema, isApiKeyOptionalForEndpoint, resolveServiceModelsBaseUrl } = await import("@actalk/inkos-core");
-      const { loadConfig } = await import("../utils.js");
+      const ready = await inspectCodexReadiness(codex);
+      checks.push({ name: "Codex", ok: true,
+        detail: `ChatGPT account ready; model=${ready.model}, effort=${ready.reasoningEffort}, speed=${ready.serviceTier} (no inference probe)` });
+    } catch (error) {
+      checks.push({ name: "Codex", ok: false, detail: error instanceof Error ? error.message : "Codex account check failed" });
+    } finally { await codex.dispose(); }
 
-      let llmConfig;
+    if (opts.provider) {
+      // 6. Explicit external API connectivity test
       try {
-        const config = await loadConfig();
-        llmConfig = config.llm;
-      } catch {
-        // No project config — try building from global env
-        const { config: loadDotenv } = await import("dotenv");
-        loadDotenv({ path: GLOBAL_ENV_PATH });
-        const env = process.env;
-        const apiKeyOptional = isApiKeyOptionalForEndpoint({
-          provider: env.INKOS_LLM_PROVIDER,
-          baseUrl: env.INKOS_LLM_BASE_URL,
-        });
-        if ((env.INKOS_LLM_API_KEY || apiKeyOptional) && env.INKOS_LLM_BASE_URL && env.INKOS_LLM_MODEL) {
-          llmConfig = LLMConfigSchema.parse({
-            provider: env.INKOS_LLM_PROVIDER ?? "custom",
+        const { createLLMClient, chatCompletion, LLMConfigSchema, isApiKeyOptionalForEndpoint, resolveServiceModelsBaseUrl } = await import("@actalk/inkos-core");
+        const { loadConfig } = await import("../utils.js");
+
+        let llmConfig;
+        try {
+          const config = await loadConfig({ purpose: "provider" });
+          llmConfig = config.llm;
+        } catch (error) {
+          if ((error as { code?: string }).code !== "PROJECT_NOT_FOUND") throw error;
+          // No project config — try building from global env
+          const { config: loadDotenv } = await import("dotenv");
+          loadDotenv({ path: GLOBAL_ENV_PATH });
+          const env = process.env;
+          const apiKeyOptional = isApiKeyOptionalForEndpoint({
+            provider: env.INKOS_LLM_PROVIDER,
             baseUrl: env.INKOS_LLM_BASE_URL,
-            apiKey: env.INKOS_LLM_API_KEY ?? "",
-            model: env.INKOS_LLM_MODEL,
           });
+          if ((env.INKOS_LLM_API_KEY || apiKeyOptional) && env.INKOS_LLM_BASE_URL && env.INKOS_LLM_MODEL) {
+            llmConfig = LLMConfigSchema.parse({
+              provider: env.INKOS_LLM_PROVIDER ?? "custom",
+              baseUrl: env.INKOS_LLM_BASE_URL,
+              apiKey: env.INKOS_LLM_API_KEY ?? "",
+              model: env.INKOS_LLM_MODEL,
+            });
+          }
         }
-      }
 
-      if (!llmConfig) {
-        checks.push({
-          name: "API Connectivity",
-          ok: false,
-          detail: "No LLM config available (no project config or global .env)",
-        });
-        checks.push({
-          name: "  Hint",
-          ok: false,
-          detail: "Run `inkos setup`, `inkos config set-global`, or add LLM settings to the project .env file.",
-        });
-      } else {
-        checks.push({
-          name: "LLM Config",
-          ok: true,
-          detail: `provider=${llmConfig.provider} model=${llmConfig.model} stream=${llmConfig.stream ?? true} baseUrl=${llmConfig.baseUrl}`,
-        });
+        if (!llmConfig) {
+          checks.push({
+            name: "API Connectivity",
+            ok: false,
+            detail: "No LLM config available (no project config or global .env)",
+          });
+          checks.push({
+            name: "  Hint",
+            ok: false,
+            detail: "Run `inkos setup`, `inkos config set-global`, or add LLM settings to the project .env file.",
+          });
+        } else {
+          checks.push({
+            name: "LLM Config",
+            ok: true,
+            detail: `provider=${llmConfig.provider} model=${llmConfig.model} stream=${llmConfig.stream ?? true} baseUrl=${llmConfig.baseUrl}`,
+          });
 
-        log("\n  [..] Testing API connectivity...");
+          log("\n  [..] Testing API connectivity...");
 
-        let connected = false;
-        let detectedDetail = "";
-        let lastError = "Unknown error";
-        const modelsBaseUrl = resolveDoctorModelsBaseUrl(
-          typeof llmConfig.service === "string" ? llmConfig.service : undefined,
-          llmConfig.baseUrl,
-          resolveServiceModelsBaseUrl,
-        );
-        const discoveredModels = (llmConfig.apiKey && modelsBaseUrl)
-          ? await fetchDoctorModels(modelsBaseUrl, llmConfig.apiKey, llmConfig.proxyUrl)
-          : [];
-        const modelCandidates = (llmConfig.provider === "openai" || discoveredModels.length > 0)
-          ? buildDoctorModelCandidates(llmConfig.model, discoveredModels)
-          : [llmConfig.model];
-        const plans = llmConfig.provider === "openai"
-          ? buildDoctorProbePlans(llmConfig.apiFormat, llmConfig.stream)
-          : [{ apiFormat: (llmConfig.apiFormat ?? "chat") as LLMApiFormat, stream: llmConfig.stream ?? true }];
+          let connected = false;
+          let detectedDetail = "";
+          let lastError = "Unknown error";
+          const modelsBaseUrl = resolveDoctorModelsBaseUrl(
+            typeof llmConfig.service === "string" ? llmConfig.service : undefined,
+            llmConfig.baseUrl,
+            resolveServiceModelsBaseUrl,
+          );
+          const discoveredModels = (llmConfig.apiKey && modelsBaseUrl)
+            ? await fetchDoctorModels(modelsBaseUrl, llmConfig.apiKey, llmConfig.proxyUrl)
+            : [];
+          const modelCandidates = (llmConfig.provider === "openai" || discoveredModels.length > 0)
+            ? buildDoctorModelCandidates(llmConfig.model, discoveredModels)
+            : [llmConfig.model];
+          const plans = llmConfig.provider === "openai"
+            ? buildDoctorProbePlans(llmConfig.apiFormat, llmConfig.stream)
+            : [{ apiFormat: (llmConfig.apiFormat ?? "chat") as LLMApiFormat, stream: llmConfig.stream ?? true }];
 
-        for (const model of modelCandidates) {
-          for (const plan of plans) {
-            try {
-              const client = createLLMClient({
-                ...llmConfig,
-                model,
-                apiFormat: plan.apiFormat,
-                stream: plan.stream,
-              });
-              const response = await chatCompletion(client, model, [
-                { role: "user", content: "Say OK" },
-              ], { maxTokens: 16 });
+          for (const model of modelCandidates) {
+            for (const plan of plans) {
+              try {
+                const client = createLLMClient({
+                  ...llmConfig,
+                  model,
+                  apiFormat: plan.apiFormat,
+                  stream: plan.stream,
+                });
+                const response = await chatCompletion(client, model, [
+                  { role: "user", content: "Say OK" },
+                ], { maxTokens: 16 });
 
-              connected = true;
-              detectedDetail = `OK (model: ${model}, apiFormat=${plan.apiFormat}, stream=${plan.stream}, tokens: ${response.usage.totalTokens})`;
+                connected = true;
+                detectedDetail = `OK (model: ${model}, apiFormat=${plan.apiFormat}, stream=${plan.stream}, tokens: ${response.usage.totalTokens})`;
+                break;
+              } catch (error) {
+                lastError = error instanceof Error ? error.message : String(error);
+              }
+            }
+            if (connected) {
               break;
-            } catch (error) {
-              lastError = error instanceof Error ? error.message : String(error);
             }
           }
-          if (connected) {
-            break;
+
+          checks.push({
+            name: "API Connectivity",
+            ok: connected,
+            detail: connected ? detectedDetail : lastError.split("\n")[0]!,
+          });
+
+          if (!connected && /\b(?:401|403|429)\b|unauthorized|forbidden|quota|balance|insufficient|exceeded|额度|余额|配额/i.test(lastError)) {
+            checks.push({
+              name: "  Hint",
+              ok: false,
+              detail: formatDoctorHintQuota(language),
+            });
           }
+
+          if (!connected && llmConfig.provider === "openai") {
+            checks.push({
+              name: "  Hint",
+              ok: false,
+              detail: formatDoctorHintOpenAiProbeExhausted(language),
+            });
+          }
+        }
+      } catch (e) {
+        const errMsg = String(e);
+        const hints: string[] = [];
+
+        if (errMsg.includes("Connection error") || errMsg.includes("ECONNREFUSED") || errMsg.includes("fetch failed")) {
+          hints.push(formatDoctorHintBaseUrl(language));
+        }
+        if (errMsg.includes("400")) {
+          hints.push(formatDoctorHintStreamRequirement(language));
+          hints.push(formatDoctorHintModelName(language));
+        }
+        if (errMsg.includes("401")) {
+          hints.push(formatDoctorHintInvalidApiKey(language));
         }
 
         checks.push({
           name: "API Connectivity",
-          ok: connected,
-          detail: connected ? detectedDetail : lastError.split("\n")[0]!,
+          ok: false,
+          detail: errMsg.split("\n")[0]!,
         });
 
-        if (!connected && /\b(?:401|403|429)\b|unauthorized|forbidden|quota|balance|insufficient|exceeded|额度|余额|配额/i.test(lastError)) {
-          checks.push({
-            name: "  Hint",
-            ok: false,
-            detail: formatDoctorHintQuota(language),
-          });
-        }
-
-        if (!connected && llmConfig.provider === "openai") {
-          checks.push({
-            name: "  Hint",
-            ok: false,
-            detail: formatDoctorHintOpenAiProbeExhausted(language),
-          });
+        if (hints.length > 0) {
+          for (const hint of hints) {
+            checks.push({ name: "  Hint", ok: false, detail: hint });
+          }
         }
       }
-    } catch (e) {
-      const errMsg = String(e);
-      const hints: string[] = [];
 
-      if (errMsg.includes("Connection error") || errMsg.includes("ECONNREFUSED") || errMsg.includes("fetch failed")) {
-        hints.push(formatDoctorHintBaseUrl(language));
-      }
-      if (errMsg.includes("400")) {
-        hints.push(formatDoctorHintStreamRequirement(language));
-        hints.push(formatDoctorHintModelName(language));
-      }
-      if (errMsg.includes("401")) {
-        hints.push(formatDoctorHintInvalidApiKey(language));
-      }
-
-      checks.push({
-        name: "API Connectivity",
-        ok: false,
-        detail: errMsg.split("\n")[0]!,
-      });
-
-      if (hints.length > 0) {
-        for (const hint of hints) {
-          checks.push({ name: "  Hint", ok: false, detail: hint });
-        }
-      }
     }
 
     // Output

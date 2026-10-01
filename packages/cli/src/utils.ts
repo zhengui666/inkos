@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { createLLMClient, StateManager, createLogger, createStderrSink, createJsonLineSink, resolveEffectiveLLMConfig, loadLLMEnvLayers, GLOBAL_CONFIG_DIR, GLOBAL_ENV_PATH, createBuiltInWorkProfileRegistry, loadAvailableAgentSkills, mergeActivatedSkillGuidance, resolveProfileSkillActivations, type ActivatedSkillGuidance, type EffectiveLLMConfigResult, type LLMApiFormat, type LLMConfigCliOverrides, type ProjectConfig, type PipelineConfig, type LogSink } from "@actalk/inkos-core";
+import { createLLMClient, StateManager, createLogger, createStderrSink, createJsonLineSink, resolveEffectiveLLMConfig, loadLLMEnvLayers, GLOBAL_CONFIG_DIR, GLOBAL_ENV_PATH, createBuiltInWorkProfileRegistry, loadAvailableAgentSkills, mergeActivatedSkillGuidance, resolveProfileSkillActivations, type ActivatedSkillGuidance, type EffectiveLLMConfigResult, type LLMApiFormat, type LLMConfigCliOverrides, type LLMConfigPurpose, type ProjectConfig, type PipelineConfig, type LogSink } from "@actalk/inkos-core";
 
 export { GLOBAL_CONFIG_DIR, GLOBAL_ENV_PATH };
 
@@ -51,6 +51,7 @@ export async function resolveCliProfileSkills(
 
 export async function loadConfig(options?: {
   readonly requireApiKey?: boolean;
+  readonly purpose?: LLMConfigPurpose;
   readonly projectRoot?: string;
   readonly cli?: LLMConfigCliOverrides;
 }): Promise<ProjectConfig> {
@@ -59,6 +60,7 @@ export async function loadConfig(options?: {
 
 export async function loadConfigWithDiagnostics(options?: {
   readonly requireApiKey?: boolean;
+  readonly purpose?: LLMConfigPurpose;
   readonly projectRoot?: string;
   readonly cli?: LLMConfigCliOverrides;
 }): Promise<EffectiveLLMConfigResult> {
@@ -74,11 +76,12 @@ export async function loadConfigWithDiagnostics(options?: {
     envLayers,
     cli,
     requireApiKey: options?.requireApiKey,
+    purpose: options?.purpose ?? (options?.requireApiKey === true ? "provider" : "codex"),
   });
 }
 
-export function createClient(config: ProjectConfig) {
-  return createLLMClient(config.llm);
+export function createClient(config: ProjectConfig, projectRoot = findProjectRoot()) {
+  return createLLMClient(config.llm, projectRoot);
 }
 
 export function parseLLMOverridesFromArgv(argv: readonly string[]): LLMConfigCliOverrides {
@@ -153,7 +156,7 @@ export function buildPipelineConfig(
     : undefined;
 
   return {
-    client: createLLMClient(config.llm),
+    client: createLLMClient(config.llm, root),
     model: config.llm.model,
     projectRoot: root,
     defaultLLMConfig: config.llm,

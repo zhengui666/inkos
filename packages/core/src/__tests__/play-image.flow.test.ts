@@ -5,7 +5,6 @@ import{Type}from'@sinclair/typebox';
 import{createServer}from'node:http';import{once}from'node:events';import{mkdtemp,readFile,writeFile,rm}from'node:fs/promises';
 import{tmpdir}from'node:os';import{join}from'node:path';import{createHash}from'node:crypto';import{it,expect,vi}from'vitest';
 import{PlayCurrentStateSchema}from'../models/play.js';
-import{saveSecrets}from'../llm/secrets.js';
 import{PlayStore}from'../play/play-store.js';import{playSceneImageKey,readPlayImageManifest,generatePlayImage,playImageContext,buildPlaySceneImagePrompt}from'../play/play-image.js';
 import{createPlayImageTool}from'../harness/tools/play-image.js';import{executeExplicitCapabilityTool}from'../harness/explicit-action.js';
 import{loadWorkManifest}from'../harness/work-store.js';import{CreativeEpisodeStore}from'../harness/episode-store.js';
@@ -52,8 +51,8 @@ it('records illustration methods and versioned output, invalidates stale scene i
  try{
   vi.stubEnv('INKOS_COVER_ENDPOINT',`http://127.0.0.1:${(server.address() as {port:number}).port}/v1/images/generations`);
   vi.stubEnv('INKOS_COVER_BASE_URL','');vi.stubEnv('INKOS_COVER_API_KEY','fixture');vi.stubEnv('INKOS_COVER_MODEL','image-fixture');
-  await writeFile(join(root,'inkos.json'),JSON.stringify({version:'0.1.0',name:'Illustration flow',llm:{service:'custom',provider:'openai',configSource:'studio',model:'fixture',services:[{service:'custom',name:'Custom',models:['fixture'],baseUrl:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,apiFormat:'chat',stream:false}],apiKey:'fixture',baseUrl:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,apiFormat:'chat',stream:false}}));
-  await saveSecrets(root,{services:{'custom:Custom':{apiKey:'fixture'}}});
+  // The scene-brief worker uses Codex; only the separate image capability has a key.
+  await writeFile(join(root,'inkos.json'),JSON.stringify({version:'0.1.0',name:'Illustration flow'}));
   const store=new PlayStore(root),world=await store.createWorld({id:'world',title:'Fixture',premise:'A closed workshop',worldContract:'Wait for player actions',visualContract:'Ink illustration',mode:'guided',language:'en'});
   await store.ensureRun('world','main');await store.saveCurrentState('world','main',{turn:2});await store.writeProjection('world','main','projections/scene.md','A toolbox outside a locked door.');
   const run=(episodeId:string,instruction?:string)=>executeExplicitCapabilityTool({projectRoot:root,workId:'world',episodeId,conversationId:'fixture',binding:{capabilityId:'interactive-world',actionId:'generate_play_image',profileId:'interactive-world',risk:'recoverable-write'},tool:createPlayImageTool(root,'world'),parameters:{target:'scene',instruction}});
