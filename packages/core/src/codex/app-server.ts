@@ -48,7 +48,10 @@ export const CODEX_ISOLATED_CONFIG: Readonly<Record<string, string | number | bo
   'features.multi_agent': false, 'features.multi_agent_v2': false,
   'features.browser_use': false, 'features.browser_use_external': false,
   'features.computer_use': false, 'features.image_generation': false,
-  'features.code_mode': false, 'features.code_mode_host': false,
+  'features.code_mode': false,
+  // Code-mode-only catalog models still route Inkos tools through functions.exec.
+  // Enable its isolated JS dispatcher, never a native filesystem/shell environment.
+  'features.code_mode_host': true,
   'features.js_repl': false, 'features.tool_search': false,
   'features.tool_suggest': false, 'features.skill_search': false,
   'features.skill_mcp_dependency_install': false,

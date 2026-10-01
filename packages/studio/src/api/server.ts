@@ -5324,10 +5324,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           }
           const failure = formatAgentFailure(result.errorMessage, language, "model");
           return c.json({
-            error: { code: failure.code, message: failure.message },
+            error: { code: result.completionDiagnostics?.code ?? failure.code, message: failure.message },
             response: failure.message,
             session: workSessionResponseMetadata(bookSession),
-            details: { toolExecutions: collectedToolExecs },
+            details: { toolExecutions: collectedToolExecs, ...(result.completionDiagnostics ? { completion: result.completionDiagnostics } : {}) },
           }, failure.status);
         }
 

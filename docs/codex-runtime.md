@@ -133,3 +133,32 @@ Official references:
 - https://developers.openai.com/codex/app-server/
 - https://developers.openai.com/codex/auth/
 - https://github.com/openai/codex/tree/rust-v0.159.2
+
+## Tool execution and explicit completion
+
+Code-mode-only Codex models require the pinned package's `codex-code-mode-host`
+companion even when optional Code Mode is disabled. Inkos enables this isolated
+JavaScript dispatcher so `functions.exec` can call the supplied Inkos dynamic
+tools. Every thread and turn explicitly sets `environments: []`: native shell,
+filesystem/apply-patch, and other environment-backed tools are not exposed.
+The existing read-only sandbox, no-approval policy, credential isolation, and
+MCP/plugin/browser restrictions remain in force. The dispatcher exposes neither
+Node.js nor a network API; production changes still pass through Inkos's
+authorized capability actions and artifact receipts.
+
+Main chat accepts an explicit `answered`, `delivered`, `needs_input`, or `blocked`
+completion from either `finish_turn` or the declared native output schema. Both
+routes run the same host checks. Delivery requires real successful action
+receipts and current validated artifacts. Ordinary prose, an unexecuted plan,
+malformed JSON, and failed/interrupted model turns do not prove delivery. Native
+JSON is model-only history; a durable host completion receipt supplies the
+visible response and reload behavior. No model tool call is invented for native
+completion. The existing one-correction budget can repair an invalid contract
+while preserving completed operations.
+
+Native regression tests run the actual pinned binary against credential-free
+loopback Responses fixtures. They exercise `custom_tool_call` through
+`functions.exec`, multiple host actions, Work binding, both completion routes,
+transcript reload, and the absence of disabled native capabilities. Injecting a
+direct function call alone does not validate a code-mode-only model's execution
+path. These fixtures are not real-model quality or account-quota checks.
