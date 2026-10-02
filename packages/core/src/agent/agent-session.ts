@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { Agent } from "../codex/agent.js";
+import { finalizeAgentRequest } from "./request-lifecycle.js";
+import { withAgentRequestDeadline } from "./execution-deadline.js";
 import { readCodexSettings } from "../codex/settings.js";
 import { resolveCodexModel } from "../codex/model.js";
 import { preserveToolArgumentTypes } from "./tool-arguments.js";
@@ -730,8 +732,8 @@ export async function runAgentSession(
   config: AgentSessionConfig,
   userMessage: string,
 ): Promise<AgentSessionResult> {
-  return runInAgentSessionQueue(config.projectRoot, config.sessionId, async () => {
-    let currentConfig = config;
+  return runInAgentSessionQueue(config.projectRoot, config.sessionId, () => withAgentRequestDeadline(config.signal, async signal => {
+    let currentConfig = { ...config, signal };
     const visited = new Set<string>();
     let result = await runAgentSessionUnlocked(currentConfig, userMessage);
     while (result.workTransition && !result.errorMessage) {
@@ -756,7 +758,7 @@ export async function runAgentSession(
       result = await runAgentSessionUnlocked(currentConfig, userMessage);
     }
     return result;
-  });
+  }));
 }
 
 interface AgentWorkTransition {
@@ -1161,152 +1163,7 @@ async function runAgentSessionUnlocked(
 
   // ----- Prepare transcript persistence -----
   const requestId = randomUUID();
-  await ensureSessionCreatedEvent(projectRoot, sessionId, bookId, sessionKind, cached.profileId, cached.workId);
-  await appendAgentTranscriptEvent(projectRoot, sessionId, (seq) => ({
-    type: "request_started",
-    version: 1,
-    sessionId,
-    requestId,
-    seq,
-    timestamp: Date.now(),
-    sessionKind,
-    profileId: cached.profileId,
-    workId: cached.workId,
-    input: promptMessage,
-  }));
-  if (config.resumeAction) {
-    if (promptMessage.trim()) {
-      const uuid = randomUUID();
-      const message = { role: "user" as const, content: promptMessage, timestamp: Date.now() };
-      agent.state.messages = [...agent.state.messages, message];
-      await appendAgentTranscriptEvent(projectRoot, sessionId, seq => ({
-        type: "message", version: 1, sessionId, requestId, uuid, parentUuid: null,
-        seq, role: "user", visibility: "model", timestamp: message.timestamp, piTurnIndex: 0, message,
-      }));
-      parentUuid = uuid;
-    }
-    const [actionAssistant, actionResult] = resumedActionMessages(model, config.resumeAction);
-    const actionAssistantUuid = randomUUID();
-    const actionResultUuid = randomUUID();
-    agent.state.messages = [...agent.state.messages, actionAssistant, actionResult];
-    await appendAgentTranscriptEvent(projectRoot, sessionId, (seq) => ({
-      type: "message",
-      version: 1,
-      sessionId,
-      requestId,
-      uuid: actionAssistantUuid,
-      parentUuid,
-      seq,
-      role: "assistant",
-      ...(config.resumeAction?.replayOnly ? { visibility: "model" as const } : {}),
-      timestamp: actionAssistant.timestamp,
-      piTurnIndex: 0,
-      toolCallId: config.resumeAction!.toolCallId,
-      message: actionAssistant,
-    }));
-    await appendAgentTranscriptEvent(projectRoot, sessionId, (seq) => ({
-      type: "message",
-      version: 1,
-      sessionId,
-      requestId,
-      uuid: actionResultUuid,
-      parentUuid: actionAssistantUuid,
-      seq,
-      role: "toolResult",
-      ...(config.resumeAction?.replayOnly ? { visibility: "model" as const } : {}),
-      timestamp: actionResult.timestamp,
-      piTurnIndex: 0,
-      toolCallId: config.resumeAction!.toolCallId,
-      sourceToolAssistantUuid: actionAssistantUuid,
-      message: actionResult,
-    }));
-    parentUuid = actionResultUuid;
-    lastAssistantUuid = actionAssistantUuid;
-  }
-  const episodeHandle = cached.harnessRuntime.startEpisode({
-    profileId: cached.profileId,
-    work,
-    authorRequest: userMessage,
-    baselineWork: config.baselineWork,
-    episodeId: `episode-${requestId}`,
-  });
-  cached.currentEpisode = episodeHandle;
-  cached.completedPlayScene = undefined;
-  cached.turnCompletion = undefined;
-  cached.hasDelivery = config.resumeAction?.result.status === "success";
-  cached.deliveryFailed = false;
-  cached.artifactDeliveries = new TurnArtifactDeliveries();
-  if (config.resumeAction) cached.artifactDeliveries.observe(config.resumeAction.result, config.resumeAction.parameters);
-  let episodeFinished = false;
-  const finishEpisode = (status: "completed" | "failed" | "cancelled") => {
-    if (episodeFinished) return;
-    cached!.harnessRuntime.finishEpisode(episodeHandle, status);
-    episodeFinished = true;
-    cached!.currentEpisode = null;
-  };
-
-  const persistAgentEvent = async (event: AgentEvent): Promise<void> => {
-    if (event.type === "turn_start") {
-      piTurnIndex += 1;
-      return;
-    }
-    if (event.type !== "message_end") return;
-
-    const role = transcriptRoleForMessage(event.message);
-    if (!role) return;
-
-    if (assistantInvokesSkill(event.message)) skillTurnActive = true;
-    const persistedMessage = sanitizeSkillTurnMessage(event.message, skillTurnActive);
-    const controlMessage = role === "assistant"
-      ? (event.message as AssistantMessage).content.some(part => part.type === "toolCall" && part.name === TURN_COMPLETION_TOOL)
-      : role === "toolResult" && (event.message as ToolResultMessage).toolName === TURN_COMPLETION_TOOL;
-    // Main-agent prose is provisional until the explicit completion is
-    // accepted. Keep raw structured output in model history, never the UI.
-    const provisionalText = role === "assistant" && (event.message as AssistantMessage).content.some(part => part.type === "text");
-    const completion = role === "assistant" && cached?.turnCompletion
-      && (event.message as AssistantMessage).content.length === 0 ? cached.turnCompletion : undefined;
-    const uuid = randomUUID();
-    const isToolResult = role === "toolResult";
-    const toolCallId = toolCallIdForMessage(event.message);
-    await appendAgentTranscriptEvent(projectRoot, sessionId, (seq) => ({
-      type: "message",
-      version: 1,
-      sessionId,
-      requestId,
-      uuid,
-      parentUuid: isToolResult && lastAssistantUuid ? lastAssistantUuid : parentUuid,
-      seq,
-      role,
-      ...(controlMessage || provisionalText ? { visibility: "model" as const } : {}),
-      ...(completion ? { display: { completion } } : {}),
-      timestamp: messageTimestamp(event.message),
-      piTurnIndex,
-      ...(toolCallId ? { toolCallId } : {}),
-      ...(isToolResult && lastAssistantUuid
-        ? { sourceToolAssistantUuid: lastAssistantUuid }
-        : {}),
-      ...(role === "user" && config.attachments?.length ? { display: { userInput: {
-        text: userMessage, language: language === "en" ? "en" as const : "zh" as const,
-        attachments: config.attachments.map(attachment => ({ filename: attachment.filename })),
-      } } } : {}),
-      message: persistedMessage,
-    }));
-
-    if (completion) completionPersisted = true;
-    if (role === "assistant") lastAssistantUuid = uuid;
-    parentUuid = uuid;
-  };
-
-  // ----- Subscribe to events (transcript persistence + SSE forwarding) -----
-  const unsubscribe = agent.subscribe(async (event: AgentEvent) => {
-    await persistAgentEvent(event);
-    if (event.type === "message_update" && ["text_start", "text_delta", "text_end"].includes(event.assistantMessageEvent.type)) return;
-    if ((event.type === "tool_execution_start" || event.type === "tool_execution_end" || event.type === "tool_execution_update")
-      && event.toolName === TURN_COMPLETION_TOOL) return;
-    onEvent?.(event);
-  });
-
-  // ----- Execute the turn -----
+  let unsubscribe = () => {};
   let finalAssistant: AssistantMessage | undefined;
   let errorMessage: string | undefined;
   let completionError: (Error & { code?: string }) | undefined;
@@ -1314,9 +1171,149 @@ async function runAgentSessionUnlocked(
   let completionDiagnostics: AgentSessionResult["completionDiagnostics"];
   const turnMessageStartIndex = agent.state.messages.length;
   const abortContainingWorkflow = () => agent.abort();
-  config.signal?.addEventListener("abort", abortContainingWorkflow, { once: true });
-
+  let failed = false;
   try {
+    await ensureSessionCreatedEvent(projectRoot, sessionId, bookId, sessionKind, cached.profileId, cached.workId);
+    await appendAgentTranscriptEvent(projectRoot, sessionId, (seq) => ({
+      type: "request_started",
+      version: 1,
+      sessionId,
+      requestId,
+      seq,
+      timestamp: Date.now(),
+      sessionKind,
+      profileId: cached.profileId,
+      workId: cached.workId,
+      input: promptMessage,
+    }));
+    if (config.resumeAction) {
+      if (promptMessage.trim()) {
+        const uuid = randomUUID();
+        const message = { role: "user" as const, content: promptMessage, timestamp: Date.now() };
+        agent.state.messages = [...agent.state.messages, message];
+        await appendAgentTranscriptEvent(projectRoot, sessionId, seq => ({
+          type: "message", version: 1, sessionId, requestId, uuid, parentUuid: null,
+          seq, role: "user", visibility: "model", timestamp: message.timestamp, piTurnIndex: 0, message,
+        }));
+        parentUuid = uuid;
+      }
+      const [actionAssistant, actionResult] = resumedActionMessages(model, config.resumeAction);
+      const actionAssistantUuid = randomUUID();
+      const actionResultUuid = randomUUID();
+      agent.state.messages = [...agent.state.messages, actionAssistant, actionResult];
+      await appendAgentTranscriptEvent(projectRoot, sessionId, (seq) => ({
+        type: "message",
+        version: 1,
+        sessionId,
+        requestId,
+        uuid: actionAssistantUuid,
+        parentUuid,
+        seq,
+        role: "assistant",
+        ...(config.resumeAction?.replayOnly ? { visibility: "model" as const } : {}),
+        timestamp: actionAssistant.timestamp,
+        piTurnIndex: 0,
+        toolCallId: config.resumeAction!.toolCallId,
+        message: actionAssistant,
+      }));
+      await appendAgentTranscriptEvent(projectRoot, sessionId, (seq) => ({
+        type: "message",
+        version: 1,
+        sessionId,
+        requestId,
+        uuid: actionResultUuid,
+        parentUuid: actionAssistantUuid,
+        seq,
+        role: "toolResult",
+        ...(config.resumeAction?.replayOnly ? { visibility: "model" as const } : {}),
+        timestamp: actionResult.timestamp,
+        piTurnIndex: 0,
+        toolCallId: config.resumeAction!.toolCallId,
+        sourceToolAssistantUuid: actionAssistantUuid,
+        message: actionResult,
+      }));
+      parentUuid = actionResultUuid;
+      lastAssistantUuid = actionAssistantUuid;
+    }
+    const episodeHandle = cached.harnessRuntime.startEpisode({
+      profileId: cached.profileId,
+      work,
+      authorRequest: userMessage,
+      baselineWork: config.baselineWork,
+      episodeId: `episode-${requestId}`,
+    });
+    cached.currentEpisode = episodeHandle;
+    cached.completedPlayScene = undefined;
+    cached.turnCompletion = undefined;
+    cached.hasDelivery = config.resumeAction?.result.status === "success";
+    cached.deliveryFailed = false;
+    cached.artifactDeliveries = new TurnArtifactDeliveries();
+    if (config.resumeAction) cached.artifactDeliveries.observe(config.resumeAction.result, config.resumeAction.parameters);
+
+
+    const persistAgentEvent = async (event: AgentEvent): Promise<void> => {
+      if (event.type === "turn_start") {
+        piTurnIndex += 1;
+        return;
+      }
+      if (event.type !== "message_end") return;
+
+      const role = transcriptRoleForMessage(event.message);
+      if (!role) return;
+
+      if (assistantInvokesSkill(event.message)) skillTurnActive = true;
+      const persistedMessage = sanitizeSkillTurnMessage(event.message, skillTurnActive);
+      const controlMessage = role === "assistant"
+        ? (event.message as AssistantMessage).content.some(part => part.type === "toolCall" && part.name === TURN_COMPLETION_TOOL)
+        : role === "toolResult" && (event.message as ToolResultMessage).toolName === TURN_COMPLETION_TOOL;
+      // Main-agent prose is provisional until the explicit completion is
+      // accepted. Keep raw structured output in model history, never the UI.
+      const provisionalText = role === "assistant" && (event.message as AssistantMessage).content.some(part => part.type === "text");
+      const completion = role === "assistant" && cached?.turnCompletion
+        && (event.message as AssistantMessage).content.length === 0 ? cached.turnCompletion : undefined;
+      const uuid = randomUUID();
+      const isToolResult = role === "toolResult";
+      const toolCallId = toolCallIdForMessage(event.message);
+      await appendAgentTranscriptEvent(projectRoot, sessionId, (seq) => ({
+        type: "message",
+        version: 1,
+        sessionId,
+        requestId,
+        uuid,
+        parentUuid: isToolResult && lastAssistantUuid ? lastAssistantUuid : parentUuid,
+        seq,
+        role,
+        ...(controlMessage || provisionalText ? { visibility: "model" as const } : {}),
+        ...(completion ? { display: { completion } } : {}),
+        timestamp: messageTimestamp(event.message),
+        piTurnIndex,
+        ...(toolCallId ? { toolCallId } : {}),
+        ...(isToolResult && lastAssistantUuid
+          ? { sourceToolAssistantUuid: lastAssistantUuid }
+          : {}),
+        ...(role === "user" && config.attachments?.length ? { display: { userInput: {
+          text: userMessage, language: language === "en" ? "en" as const : "zh" as const,
+          attachments: config.attachments.map(attachment => ({ filename: attachment.filename })),
+        } } } : {}),
+        message: persistedMessage,
+      }));
+
+      if (completion) completionPersisted = true;
+      if (role === "assistant") lastAssistantUuid = uuid;
+      parentUuid = uuid;
+    };
+
+    // ----- Subscribe to events (transcript persistence + SSE forwarding) -----
+    unsubscribe = agent.subscribe(async (event: AgentEvent) => {
+      await persistAgentEvent(event);
+      if (event.type === "message_update" && ["text_start", "text_delta", "text_end"].includes(event.assistantMessageEvent.type)) return;
+      if ((event.type === "tool_execution_start" || event.type === "tool_execution_end" || event.type === "tool_execution_update")
+        && event.toolName === TURN_COMPLETION_TOOL) return;
+      onEvent?.(event);
+    });
+
+    // ----- Execute the turn -----
+    config.signal?.addEventListener("abort", abortContainingWorkflow, { once: true });
     config.signal?.throwIfAborted();
     await withExecutionEvidence((type, payload) => cached!.harnessRuntime.episodes.append({
       episodeId: episodeHandle.episode.id, workId: episodeHandle.episode.workId, type, payload,
@@ -1405,28 +1402,13 @@ async function runAgentSessionUnlocked(
           finalResponses, completionCalls: receipts.length, rejectedCompletionCalls: receipts.filter(message => message.isError).length };
         errorMessage = `${errorMessage} [${Object.entries(completionDiagnostics).map(([key, value]) => `${key}=${value}`).join(", ")}]`;
       }
-      const failedError = errorMessage;
-      await appendAgentTranscriptEvent(projectRoot, sessionId, (seq) => ({
-        type: "request_failed",
-        version: 1,
-        sessionId,
-        requestId,
-        seq,
-        timestamp: Date.now(),
-        error: failedError,
-      }));
-      finishEpisode(turnAborted ? "cancelled" : "failed");
-      removeCachedAgent(cacheKey);
+      failed = true;
+      await finalizeAgentRequest({ projectRoot, sessionId, requestId, episodes: cached.episodeStore, signal: config.signal,
+        status: turnAborted ? "cancelled" : "failed", error: errorMessage });
     } else {
-      const committed = await appendAgentTranscriptEvent(projectRoot, sessionId, (seq) => ({
-        type: "request_committed",
-        version: 1,
-        sessionId,
-        requestId,
-        seq,
-        timestamp: Date.now(),
-      }));
-      cached.lastCommittedSeq = committed.seq;
+      const committedSeq = await finalizeAgentRequest({ projectRoot, sessionId, requestId, episodes: cached.episodeStore, signal: config.signal,
+        status: completion?.status === "blocked" ? "failed" : "completed" });
+      if (committedSeq !== undefined) cached.lastCommittedSeq = committedSeq;
       // Publish only the host-validated message, once, after durable commit.
       if (completion) {
         const message = { ...finalAssistant!, content: [{ type: "text" as const, text: completion.message }] };
@@ -1434,25 +1416,18 @@ async function runAgentSessionUnlocked(
           type: "text_delta", contentIndex: 0, delta: completion.message, partial: message,
         } });
       }
-      finishEpisode(completion?.status === "blocked" ? "failed" : "completed");
     }
-  } catch (error) {
-    await appendAgentTranscriptEvent(projectRoot, sessionId, (seq) => ({
-      type: "request_failed",
-      version: 1,
-      sessionId,
-      requestId,
-      seq,
-      timestamp: Date.now(),
-      error: error instanceof Error ? error.message : String(error),
-    }));
-    finishEpisode(isAbortLike(error) ? "cancelled" : "failed");
-    removeCachedAgent(cacheKey);
+  } catch (caught) {
+    failed = true;
+    const error = config.signal?.aborted ? config.signal.reason : caught;
+    await finalizeAgentRequest({ projectRoot, sessionId, requestId, episodes: cached.episodeStore, signal: config.signal,
+      status: isAbortLike(error) ? "cancelled" : "failed", error });
     throw error;
   } finally {
     config.signal?.removeEventListener("abort", abortContainingWorkflow);
     cached.currentEpisode = null;
     unsubscribe();
+    if (failed) removeCachedAgent(cacheKey);
   }
 
   // ----- Extract result -----

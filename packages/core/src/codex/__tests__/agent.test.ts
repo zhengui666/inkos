@@ -57,6 +57,61 @@ const make = (execute: (_id: string, args: { value: string }) => Promise<AgentTo
 });
 
 describe("Codex Agent bridge", () => {
+  it("bounds model silence after a failed tool without retrying the tool", async () => {
+    const execute = vi.fn(async () => { throw new Error("fixture tool failure"); });
+    const agent = new Agent({ projectRoot: "/project", initialState: make(execute).state, idleTimeoutMs: 30 });
+    client.run = async () => { await client.tool("one"); };
+    await expect(agent.prompt("Go")).rejects.toMatchObject({ code: "AGENT_MODEL_STALLED", failedToolCalls: 1, lastEvent: "tool-response" });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(client.closed).toBe(true);
+  });
+
+  it("does not mistake an active host tool for a silent model", async () => {
+    const execute = vi.fn(async () => {
+      await new Promise(resolve => setTimeout(resolve, 80));
+      return { content: [{ type: "text" as const, text: "saved" }], details: {} };
+    });
+    const agent = new Agent({ projectRoot: "/project", initialState: make(execute).state, idleTimeoutMs: 25 });
+    client.run = async () => { await client.tool("one"); client.finish(); };
+    await agent.prompt("Go");
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes the silence deadline for actual model activity", async () => {
+    const agent = new Agent({ projectRoot: "/project", initialState: make().state, idleTimeoutMs: 60 });
+    client.run = async () => {
+      for (let i = 0; i < 5; i++) {
+        await new Promise(resolve => setTimeout(resolve, 20));
+        client.notify("item/reasoning/summaryTextDelta", { itemId: "reason", delta: "progress" });
+      }
+      client.text("Ready"); client.finish();
+    };
+    await agent.prompt("Go");
+    expect(agent.finalOutput).toBe("Ready");
+  });
+
+  it("retains ownership until an aborting host tool actually exits", async () => {
+    const controller = new AbortController();
+    let release!: () => void, started!: () => void;
+    const startedWork = new Promise<void>(resolve => { started = resolve; });
+    const heldWork = new Promise<void>(resolve => { release = resolve; });
+    const agent = new Agent({ projectRoot: "/project", signal: controller.signal,
+      initialState: make(async () => { started(); await heldWork; return { content: [], details: {} }; }).state,
+    });
+    client.run = async () => { await client.tool("one").catch(() => {}); };
+    let settled = false;
+    const run = agent.prompt("Go");
+    void run.then(() => { settled = true; }, () => { settled = true; });
+    await startedWork;
+    controller.abort(Object.assign(new Error("Request deadline"), { code: "AGENT_REQUEST_TIMEOUT" }));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+    await expect(agent.prompt("Do not overlap")).rejects.toThrow("already running");
+    release();
+    await expect(run).rejects.toMatchObject({ code: "AGENT_REQUEST_TIMEOUT" });
+    expect(client.closed).toBe(true);
+  });
+
   it("emits the complete reasoning lifecycle consumed by Studio's stream store", async () => {
     const agent = make();
     const events: string[] = [];

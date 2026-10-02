@@ -195,14 +195,7 @@ export class CreativeHarnessRuntime {
     status: "completed" | "failed" | "cancelled",
     completedAt?: string,
   ): CreativeEpisode {
-    const episode = this.episodes.requireEpisode(handle.episode.id);
-    this.episodes.append({
-      episodeId: episode.id,
-      workId: episode.workId,
-      type: `episode-${status}`,
-      payload: {},
-    }, completedAt);
-    return this.episodes.finish(episode.id, status, completedAt);
+    return this.episodes.finishWithEvent(handle.episode.id, status, completedAt);
   }
 }
 

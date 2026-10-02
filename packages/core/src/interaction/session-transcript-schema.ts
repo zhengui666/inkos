@@ -60,6 +60,7 @@ export const RequestFailedEventSchema = BaseEventSchema.extend({
   type: z.literal("request_failed"),
   requestId: z.string().min(1),
   error: z.string(),
+  code: z.string().min(1).optional(),
 });
 
 export const MessageEventSchema = BaseEventSchema.extend({

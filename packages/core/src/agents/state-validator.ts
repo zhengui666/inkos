@@ -1,6 +1,7 @@
 import { BaseAgent } from "./base.js";
 import { StateValidationToolSchema } from "./state-validation-tool.js";
 import type { Observation } from "../models/observation.js";
+import { renderProjectionComparison } from "./state-validation-context.js";
 
 export interface ValidationResult {
   readonly observations: ReadonlyArray<Observation>;
@@ -52,17 +53,9 @@ Do not rewrite the chapter or silently resolve contradictory sources. A hook mar
 
 ${authorityBlock}
 
-## Previous State Card
-${oldState}
+${renderProjectionComparison("State Card", oldState, newState)}
 
-## Proposed State Card
-${newState}
-
-## Previous Hooks
-${oldHooks}
-
-## Proposed Hooks
-${newHooks}
+${renderProjectionComparison("Hooks", oldHooks, newHooks)}
 
 ## Chapter Text (for reference)
 ${chapterContent}`;

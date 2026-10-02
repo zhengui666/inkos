@@ -66,6 +66,8 @@ export interface StudioChatRequestSnapshot {
   readonly sessionId: string;
   readonly requestId: string;
   readonly startedAt: number;
+  readonly owner?: { readonly pid: number; readonly instanceId: string };
+  readonly cancelRequestedAt?: number;
   readonly status: "running" | "completed" | "failed" | "cancelled";
   readonly completedAt?: number;
   readonly completionStatus?: StudioCompletionStatus;

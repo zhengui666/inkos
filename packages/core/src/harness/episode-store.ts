@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import {
   HARNESS_VERSION,
@@ -18,10 +19,17 @@ function isLiveProcess(pid: number): boolean {
   catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
 }
 
+// A failed request can relinquish its store while Studio's process stays alive.
+// PID liveness alone must not keep that abandoned episode running forever.
+const activeEpisodeOwners = new Set<string>();
+
 export class CreativeEpisodeStore {
   private readonly db: DatabaseSync;
+  private readonly ownerNamespace: string;
+  private readonly ownedEpisodes = new Set<string>();
 
   constructor(path: string) {
+    this.ownerNamespace = path === ":memory:" ? randomUUID() : resolve(path);
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA journal_mode = WAL");
@@ -52,7 +60,15 @@ export class CreativeEpisodeStore {
       episode.completedAt,
       process.pid,
     );
+    this.ownedEpisodes.add(episode.id);
+    activeEpisodeOwners.add(this.ownerKey(episode.id));
     return episode;
+  }
+
+  private ownerKey(id: string): string { return `${this.ownerNamespace}\0${id}`; }
+
+  private releaseOwner(id: string): void {
+    if (this.ownedEpisodes.delete(id)) activeEpisodeOwners.delete(this.ownerKey(id));
   }
 
   append(
@@ -114,6 +130,7 @@ export class CreativeEpisodeStore {
     if (Number(result.changes) !== 1) {
       throw new Error(`Creative episode is missing or already terminal: ${id}`);
     }
+    this.releaseOwner(id);
     return this.requireEpisode(id);
   }
 
@@ -126,6 +143,30 @@ export class CreativeEpisodeStore {
       WHERE episode_id = ?
     `).get(id) as unknown as Record<string, unknown> | undefined;
     return row ? CreativeEpisodeSchema.parse({ version: HARNESS_VERSION, ...row }) : undefined;
+  }
+
+  /** Idempotent terminal receipt and state transition in one transaction. */
+  finishWithEvent(episodeId: string, status: Exclude<EpisodeStatus, "running">,
+    completedAt = new Date().toISOString()): CreativeEpisode {
+    const id = HarnessIdSchema.parse(episodeId);
+    EpisodeStatusSchema.parse(status);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const episode = this.requireEpisode(id);
+      if (episode.status === "running") {
+        const row = this.db.prepare("SELECT COALESCE(MAX(seq), -1) + 1 AS seq FROM creative_episode_events WHERE episode_id = ?")
+          .get(id) as unknown as { seq: number };
+        this.db.prepare(`INSERT INTO creative_episode_events
+          (episode_id, seq, timestamp, type, work_id, capability_id, action_id, payload_json)
+          VALUES (?, ?, ?, ?, ?, NULL, NULL, '{}')`)
+          .run(id, row.seq, completedAt, `episode-${status}`, episode.workId);
+        this.db.prepare("UPDATE creative_episodes SET status = ?, completed_at = ? WHERE episode_id = ? AND status = 'running'")
+          .run(status, completedAt, id);
+      }
+      this.db.exec("COMMIT");
+      this.releaseOwner(id);
+      return this.requireEpisode(id);
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 
   requireEpisode(episodeId: string): CreativeEpisode {
@@ -262,7 +303,8 @@ export class CreativeEpisodeStore {
       `).all() as unknown as ReadonlyArray<{ readonly episodeId: string; readonly workId: string | null; readonly ownerPid: number | null }>;
       let recovered = 0;
       for (const row of rows) {
-        if (row.ownerPid && isLiveProcess(row.ownerPid)) continue;
+        if (row.ownerPid === process.pid ? activeEpisodeOwners.has(this.ownerKey(row.episodeId))
+          : row.ownerPid && isLiveProcess(row.ownerPid)) continue;
         const seqRow = this.db.prepare(
           "SELECT COALESCE(MAX(seq), -1) + 1 AS seq FROM creative_episode_events WHERE episode_id = ?",
         ).get(row.episodeId) as unknown as { readonly seq: number };
@@ -307,6 +349,7 @@ export class CreativeEpisodeStore {
 
   close(): void {
     this.db.close();
+    for (const id of this.ownedEpisodes) this.releaseOwner(id);
   }
 
   private initializeSchema(): void {
