@@ -39,17 +39,38 @@ it('settles a request and episode when episode initialization fails after creati
 
 it('keeps one request deadline across a silent model and records timeout as failure, not user cancellation', async () => {
   const root = await mkdtemp(join(tmpdir(), 'inkos-request-deadline-'));
+  // Leave filesystem work and the fixture's setImmediate RPC delivery real, but
+  // do not let slow startup consume the deadline before the held turn starts.
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   vi.stubEnv('INKOS_AGENT_TIMEOUT_MS', '80');
-  const codex = new CodexFixture(() => ({ hold: true }));
+  let modelStarted!: () => void;
+  const started = new Promise<void>(resolve => { modelStarted = resolve; });
+  const codex = new CodexFixture(() => { modelStarted(); return { hold: true }; });
   createClient.mockImplementation(codex.createClient);
+  const request = runAgentSession(configuration(root, 'deadline'), 'Go');
+  let settled = false;
+  const outcome = request.then(
+    value => { settled = true; return { value }; },
+    error => { settled = true; return { error }; },
+  );
   try {
-    await expect(runAgentSession(configuration(root, 'deadline'), 'Go')).rejects.toMatchObject({ code: 'AGENT_REQUEST_TIMEOUT' });
+    await Promise.race([started, outcome.then(() => { throw new Error('Request ended before the silent model started'); })]);
+    await vi.advanceTimersByTimeAsync(79);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await outcome).toMatchObject({ error: { code: 'AGENT_REQUEST_TIMEOUT' } });
     expect((await readTranscriptEvents(root, 'deadline')).at(-1)?.type).toBe('request_failed');
     const episodes = new CreativeEpisodeStore(join(root, '.inkos', 'harness.sqlite'));
     try { expect(episodes.listEpisodes().map(e => e.status)).toEqual(['failed']); }
     finally { episodes.close(); }
     expect(codex.requests.filter(r => r.method === 'turn/start')).toHaveLength(1);
-  } finally { vi.unstubAllEnvs(); abortAgentSession(root, 'deadline'); await rm(root, { recursive: true, force: true }); }
+  } finally {
+    abortAgentSession(root, 'deadline');
+    await outcome;
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 it('answers a question, rejects an unevidenced delivery, creates a Work and restores its explicit completion', async () => {
