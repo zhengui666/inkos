@@ -6,7 +6,7 @@ import { serve } from "@hono/node-server";
 import { gzipSync } from "node:zlib";
 import { randomUUID } from "node:crypto";
 import { recoverSessionAfterAgentFailure, workSessionResponseMetadata } from "./work-session.js";
-import { ChatRequestStore } from "./chat-request-store.js";
+import { ChatRequestAdmissionError, ChatRequestStore } from "./chat-request-store.js";
 import type { ChatAttachmentPayload, StudioCompletionStatus } from "../shared/session-request.js";
 import {
   StateManager,
@@ -1001,6 +1001,9 @@ function formatAgentFailure(
   const message = error instanceof Error ? error.message : String(error);
   if (error instanceof Error && error.name === "BookWriteLockError") {
     return { code: "BOOK_BUSY", message, status: 409 };
+  }
+  if (error instanceof Error && "code" in error && ["AGENT_MODEL_STALLED", "AGENT_REQUEST_TIMEOUT", "REQUEST_PERSISTENCE_FAILED"].includes(String(error.code))) {
+    return { code: String(error.code), message, status: 500 };
   }
   if (origin === "model") {
     return { code: "AGENT_LLM_ERROR", message, status: 502 };
@@ -2496,15 +2499,12 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
   const chatRequestStore = new ChatRequestStore(root);
   const loadChatRequest = async (sessionId: string) => {
     const live = chatRequests.get(sessionId);
-    if (live) return live.snapshot;
-    const saved = await chatRequestStore.load(sessionId);
-    // Recheck after I/O: a new request may have acquired the session meanwhile.
-    if (chatRequests.has(sessionId)) return chatRequests.get(sessionId)!.snapshot;
-    if (!saved || saved.status !== "running") return saved;
-    return { ...saved, status: "failed" as const, error: {
-      code: "CHAT_REQUEST_INTERRUPTED",
-      message: "Studio restarted before this request finished. Continue from the saved results.",
-    } };
+    if (live?.snapshot.status === "running") return live.snapshot;
+    const saved = await chatRequestStore.recover(sessionId);
+    // Only a live local admission can supersede this read. An old terminal
+    // cache must never hide a newer request owned by another server instance.
+    const current = chatRequests.get(sessionId);
+    return current?.snapshot.status === "running" ? current.snapshot : saved ?? current?.snapshot ?? null;
   };
   // 确认式生产任务的单任务名额（sessionId → taskId）。原来的检查是"await 读快照
   // → 之后才 set controller"的 check-then-act：两个并发确认请求都能通过检查，
@@ -4558,8 +4558,14 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const taskAborted = Boolean(controller);
     const chat = chatRequests.get(sessionId);
     const chatRunning = chat?.snapshot.status === "running";
-    if (chatRunning) chat.controller.abort();
-    const aborted = abortAgentSession(root, sessionId) || taskAborted || chatRunning;
+    const cancellation = await chatRequestStore.cancel(sessionId, chatRunning ? chat.snapshot.requestId : undefined);
+    if (chatRunning && chat.snapshot.status === "running") {
+      // Admission saves this snapshot before invoking the agent. A stop that
+      // arrives before that first save must still prevent all model/tool work.
+      chat.snapshot = cancellation ?? { ...chat.snapshot, cancelRequestedAt: Date.now() };
+      chat.controller.abort();
+    }
+    const aborted = abortAgentSession(root, sessionId) || taskAborted || chatRunning || Boolean(cancellation);
     broadcast("agent:aborted", { sessionId, aborted, scope: chatOnly ? "chat" : "all" });
     return c.json({ ok: true, aborted });
   });
@@ -4584,46 +4590,59 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         requestId: typeof body.clientRequestId === "string" && body.clientRequestId.trim()
           ? body.clientRequestId.trim().slice(0, 128) : randomUUID(),
         startedAt: Date.now(),
+        owner: chatRequestStore.createOwner(),
         status: "running" as "running" | "completed" | "failed" | "cancelled",
       },
       controller: new AbortController(),
     };
     chatRequests.set(sessionId, request);
-    if (body.retryOfRequestId !== undefined) {
-      try {
-        const saved = previous?.snapshot ?? await chatRequestStore.load(sessionId);
-        const interrupted = !previous && saved?.status === 'running';
-        if (!saved || typeof body.retryOfRequestId !== 'string' || saved.requestId !== body.retryOfRequestId
-          || (saved.status !== 'failed' && !interrupted) || saved.retry?.text !== body.instruction) {
-          throw new ApiError(409, 'CHAT_RETRY_CONFLICT', 'The failed submission no longer matches this retry. Reload the saved request.');
-        }
-        if (saved.baselineWork === undefined) throw new ApiError(409, 'CHAT_RETRY_BASELINE_UNAVAILABLE', 'The original revision inventory is unavailable for this older request. Send a new instruction against the current version.');
-        request.snapshot = { ...request.snapshot, baselineWork: saved.baselineWork };
-      } catch (error) {
-        if (previous) chatRequests.set(sessionId, previous); else chatRequests.delete(sessionId);
-        throw error;
-      }
-    }
     try {
-      await chatRequestStore.save(request.snapshot);
+      request.snapshot = await chatRequestStore.admit(request.snapshot, saved => {
+        if (body.retryOfRequestId !== undefined) {
+          if (!saved || typeof body.retryOfRequestId !== 'string' || saved.requestId !== body.retryOfRequestId
+            || saved.status !== 'failed' || saved.cancelRequestedAt !== undefined || saved.retry?.text !== body.instruction) {
+            throw new ApiError(409, 'CHAT_RETRY_CONFLICT', 'The failed submission no longer matches this retry. Reload the saved request.');
+          }
+          if (saved.baselineWork === undefined) throw new ApiError(409, 'CHAT_RETRY_BASELINE_UNAVAILABLE', 'The original revision inventory is unavailable for this older request. Send a new instruction against the current version.');
+          return { ...request.snapshot, baselineWork: saved.baselineWork };
+        }
+        return request.snapshot;
+      });
+    } catch (error) {
+      chatRequestStore.releaseOwner(request.snapshot.owner!);
+      if (previous) chatRequests.set(sessionId, previous); else chatRequests.delete(sessionId);
+      if (error instanceof ChatRequestAdmissionError) throw new ApiError(409, error.code, error.message);
+      throw error;
+    }
+    let thrown: unknown;
+    try {
       await next();
-    } finally {
-      const response = await c.res.clone().json().catch(() => null) as { error?: string | { code?: string; message?: string }; completionStatus?: StudioCompletionStatus } | null;
-      const failure = response?.error;
-      const error = failure ? {
-        code: typeof failure === "object" ? failure.code ?? "CHAT_REQUEST_FAILED" : "CHAT_REQUEST_FAILED",
-        message: typeof failure === "string" ? failure : failure.message ?? "The request failed.",
-      } : c.res.status >= 400 ? { code: "CHAT_REQUEST_FAILED", message: `Request failed (HTTP ${c.res.status}).` } : undefined;
-      const { toolExecutions: _completedTools, ...identity } = request.snapshot;
-      request.snapshot = { ...identity,
-        status: request.controller.signal.aborted ? "cancelled" : error ? "failed" : "completed",
-        completedAt: Date.now(),
-        error,
-        completionStatus: response?.completionStatus,
-      };
-      if (request.snapshot.status !== "failed") request.snapshot = { ...request.snapshot, retry: undefined };
-      if (!deletedSessionIds.has(sessionId)) await chatRequestStore.save(request.snapshot);
-      broadcast("request:snapshot", request.snapshot);
+    } catch (error) { thrown = error; throw error; }
+    finally {
+      try {
+        const response = await c.res.clone().json().catch(() => null) as { error?: string | { code?: string; message?: string }; completionStatus?: StudioCompletionStatus } | null;
+        const failure = response?.error;
+        const error = thrown !== undefined ? { code: "CHAT_REQUEST_FAILED", message: thrown instanceof Error ? thrown.message : String(thrown) } : failure ? {
+          code: typeof failure === "object" ? failure.code ?? "CHAT_REQUEST_FAILED" : "CHAT_REQUEST_FAILED",
+          message: typeof failure === "string" ? failure : failure.message ?? "The request failed.",
+        } : c.res.status >= 400 ? { code: "CHAT_REQUEST_FAILED", message: `Request failed (HTTP ${c.res.status}).` } : undefined;
+        const { toolExecutions: _completedTools, ...identity } = request.snapshot;
+        request.snapshot = { ...identity,
+          status: request.controller.signal.aborted || request.snapshot.cancelRequestedAt !== undefined ? "cancelled" : error ? "failed" : "completed",
+          completedAt: Date.now(),
+          error,
+          completionStatus: response?.completionStatus,
+        };
+        if (request.snapshot.status !== "failed") request.snapshot = { ...request.snapshot, retry: undefined };
+        if (!deletedSessionIds.has(sessionId)) await chatRequestStore.save(request.snapshot, "update");
+        broadcast("request:snapshot", request.snapshot);
+      } catch (error) {
+        request.snapshot = { ...request.snapshot,
+          status: request.controller.signal.aborted ? "cancelled" : "failed",
+          error: { code: "CHAT_REQUEST_PERSISTENCE_FAILED", message: error instanceof Error ? error.message : String(error) },
+        };
+        throw error;
+      } finally { chatRequestStore.releaseOwner(request.snapshot.owner!); }
     }
   });
 
@@ -4774,7 +4793,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           actionSource, requestedIntent, actionPayload, requestedSkills, disabledSkills,
           attachments: retryAttachments, playMode,
         } } };
-        await chatRequestStore.save(chatRequest.snapshot);
+        await chatRequestStore.save(chatRequest.snapshot, "update");
       }
       const modelOverride = typeof reqModel === "string" && reqModel.trim()
         ? reqModel.trim()

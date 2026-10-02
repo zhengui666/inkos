@@ -1,6 +1,7 @@
 import type { Api, AssistantMessage, ImageContent, Model, ToolCall, ToolResultMessage } from "@mariozechner/pi-ai";
 import { Value } from "@sinclair/typebox/value";
 import { estimateTextTokens } from "../llm/provider.js";
+import { executionTimeoutMs } from "../agent/execution-deadline.js";
 import { createCodexClient, type CodexClient } from "./client.js";
 import { readCodexSettings, type CodexSettings } from "./settings.js";
 import { CodexConfigurationError, readCodexModels, selectCodexModel } from "./account.js";
@@ -26,6 +27,8 @@ export interface CodexAgentOptions {
   transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
   shouldStop?: () => boolean;
   onModelTurn?: () => void;
+  /** Model silence only: active host tools keep their own execution deadline. */
+  idleTimeoutMs?: number;
 }
 
 const emptyUsage = (): AssistantMessage["usage"] => ({
@@ -123,6 +126,8 @@ export class Agent {
     let cleanupAbort = () => {};
     let unsubscribeClose = () => {};
     const activeToolWork = new Set<Promise<unknown>>();
+    let idleTimer: ReturnType<typeof setInterval> | undefined;
+    let runFailure: unknown;
     try {
       signal.throwIfAborted();
       await this.emit({ type: "agent_start" });
@@ -166,6 +171,12 @@ export class Agent {
         rejectDone(error);
         if (!controller.signal.aborted) controller.abort(error);
       };
+      const idleTimeoutMs = executionTimeoutMs(this.options.idleTimeoutMs, "INKOS_AGENT_IDLE_TIMEOUT_MS", 60 * 60_000);
+      let lastActivityAt = Date.now();
+      let lastEvent = "turn/start";
+      let failedToolCalls = 0;
+      let turnFinished = false;
+      const activity = (event: string) => { lastActivityAt = Date.now(); lastEvent = event; };
       const enqueue = <T>(task: () => Promise<T>): Promise<T> => {
         const work = queue.then(() => { signal.throwIfAborted(); return task(); });
         queue = work.then(() => {}, fail);
@@ -232,6 +243,9 @@ export class Agent {
       unsubscribeNotification = client.onNotification((method, raw) => {
         const params = object(raw);
         if (params.threadId !== this.threadId) return;
+        if (["turn/started", "turn/completed", "item/started", "item/completed", "thread/tokenUsage/updated"].includes(method)
+          || method.endsWith("Delta") && typeof params.delta === "string" && params.delta.length > 0
+          || method === "item/agentMessage/delta" && typeof params.delta === "string" && params.delta.length > 0) activity(method);
         void enqueue(async () => {
           if (method === "turn/started") {
             this.turnId = object(params.turn).id;
@@ -257,6 +271,7 @@ export class Agent {
               cacheRead: Number(tokens.cachedInputTokens) || 0, cacheWrite: Number(tokens.cacheWriteInputTokens) || 0,
               totalTokens: Number(tokens.totalTokens) || 0 };
           } else if (method === "turn/completed") {
+            turnFinished = true;
             const turn = object(params.turn);
             finalStatus = turn.status;
             finalError = typeof object(turn.error).message === "string" ? object(turn.error).message : finalError;
@@ -285,6 +300,7 @@ export class Agent {
           assistant.stopReason = "toolUse";
           await this.append(assistant);
           const result = await this.executeTool(toolCall, signal);
+          if (result.message.isError) failedToolCalls++;
           toolResults.push(result.message);
           await this.append(result.message);
           if (this.options.shouldStop?.()) {
@@ -296,7 +312,7 @@ export class Agent {
         });
         toolCalls.set(id, task);
         activeToolWork.add(task);
-        void task.then(() => { activeToolWork.delete(task); }, error => { activeToolWork.delete(task); fail(error); });
+        void task.then(() => { activeToolWork.delete(task); activity("tool-response"); }, error => { activeToolWork.delete(task); fail(error); });
         return task;
       });
       const onAbort = () => { void this.interrupt().finally(() => rejectDone(signal.reason ?? aborted())).catch(rejectDone); };
@@ -304,6 +320,11 @@ export class Agent {
       cleanupAbort = () => signal.removeEventListener("abort", onAbort);
       signal.throwIfAborted();
       this.options.onModelTurn?.();
+      idleTimer = setInterval(() => {
+        if (signal.aborted || turnFinished || activeToolWork.size > 0 || Date.now() - lastActivityAt < idleTimeoutMs) return;
+        fail(Object.assign(new Error(`Codex stopped reporting progress while awaiting the model (${idleTimeoutMs}ms; last event: ${lastEvent}; failed tools: ${failedToolCalls}). Saved results are retained.`),
+          { code: "AGENT_MODEL_STALLED", idleTimeoutMs, lastEvent, failedToolCalls }));
+      }, Math.min(idleTimeoutMs, 1000));
       const start = object(await client.request("turn/start", {
         threadId: this.threadId, input: encodeContext(context), environments: [],
         ...(this.options.outputSchema ? { outputSchema: this.options.outputSchema } : {}),
@@ -329,20 +350,29 @@ export class Agent {
       await flushText();
       await this.emit({ type: "turn_end", message: last, toolResults });
       await this.emit({ type: "agent_end", messages: this.state.messages.slice(startIndex) });
-    } finally {
+    } catch (error) { runFailure = error; throw error; }
+    finally {
       // Terminate the peer and signal host work before returning, including on
       // persistence failures. Never let queued mutations outlive their episode.
       cleanupAbort();
+      if (idleTimer) clearInterval(idleTimer);
       controller.abort();
       unsubscribeNotification();
       unsubscribeRequest();
       unsubscribeClose();
-      await this.client?.close();
-      await Promise.allSettled([...activeToolWork]);
-      this.client = undefined;
-      this.threadId = undefined;
-      this.turnId = undefined;
-      this.controller = undefined;
+      try { await this.client?.close(); }
+      catch (cleanupError) {
+        if (runFailure instanceof Error) Object.assign(runFailure, { cleanupError });
+        else throw cleanupError;
+      }
+      finally {
+        // Never release execution ownership while a host mutation is still alive.
+        await Promise.allSettled([...activeToolWork]);
+        this.client = undefined;
+        this.threadId = undefined;
+        this.turnId = undefined;
+        this.controller = undefined;
+      }
     }
   }
 

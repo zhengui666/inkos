@@ -49,6 +49,15 @@ it("retains a failed submission across server recreation and exposes an interrup
     const restarted = createStudioServer({} as never, root);
     const interrupted = await (await restarted.request(`/api/v1/sessions/${session.sessionId}`)).json();
     expect(interrupted.chatRequest).toMatchObject({ status: "failed", error: { code: "CHAT_REQUEST_INTERRUPTED" }, retry: detail.chatRequest.retry });
+    expect(await store.load(session.sessionId)).toEqual(interrupted.chatRequest);
+    expect(calls).toBe(1);
+    const stopped = await (await restarted.request(`/api/v1/sessions/${session.sessionId}/abort`, { method: "POST" })).json();
+    expect(stopped).toMatchObject({ aborted: true });
+    expect((await store.load(session.sessionId))?.status).toBe("cancelled");
+    expect((await store.load(session.sessionId))?.retry).toBeUndefined();
+    const cancelledRestart = createStudioServer({} as never, root);
+    const cancelled = await (await cancelledRestart.request(`/api/v1/sessions/${session.sessionId}`)).json();
+    expect(cancelled.chatRequest.status).toBe("cancelled");
     expect(calls).toBe(1);
     await restarted.request(`/api/v1/sessions/${session.sessionId}`, { method: "DELETE" });
     expect(await store.load(session.sessionId)).toBeNull();
@@ -56,3 +65,28 @@ it("retains a failed submission across server recreation and exposes an interrup
     await rm(root, { recursive: true, force: true });
   }
 }, 20000);
+
+it("settles the entire request when a failed tool is followed by a silent model", async () => {
+  const root = await mkdtemp(join(tmpdir(), "inkos-chat-stalled-"));
+  vi.stubEnv("INKOS_AGENT_IDLE_TIMEOUT_MS", "80");
+  let calls = 0;
+  const codex = new CodexFixture(() => ++calls === 1
+    ? { calls: [{ name: "missing_fixture_tool", args: {} }] }
+    : { hold: true });
+  createCodexClient.mockImplementation(codex.createClient);
+  try {
+    await mkdir(join(root, ".inkos"));
+    await writeFile(join(root, "inkos.json"), JSON.stringify({ name: "fixture", version: "0.1.0", language: "en" }));
+    const app = createStudioServer({} as never, root);
+    const post = (body: unknown) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const { session } = await (await app.request("/api/v1/sessions", post({ sessionKind: "chat" }))).json();
+    const response = await app.request("/api/v1/agent", post({ sessionId: session.sessionId, instruction: "Inspect the fixture", clientRequestId: "stalled" }));
+    expect(response.status).toBe(500);
+    expect((await response.json()).error.code).toBe("AGENT_MODEL_STALLED");
+    const store = new ChatRequestStore(root);
+    expect(await store.load(session.sessionId)).toMatchObject({ status: "failed", error: { code: "AGENT_MODEL_STALLED" } });
+    expect((await readTranscriptEvents(root, session.sessionId)).at(-1)).toMatchObject({ type: "request_failed", code: "AGENT_MODEL_STALLED" });
+    expect(codex.requests.filter(r => r.method === "turn/start")).toHaveLength(1);
+    expect(calls).toBe(2);
+  } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); }
+});

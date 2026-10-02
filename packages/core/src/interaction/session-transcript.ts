@@ -74,6 +74,10 @@ export async function appendTranscriptEvents(
     readonly events: ReadonlyArray<TranscriptEvent>;
     readonly nextSeq: number;
   }) => ReadonlyArray<TranscriptEvent> | Promise<ReadonlyArray<TranscriptEvent>>,
+  options: {
+    /** Synchronous terminal decision after filesystem setup, under the append queue. */
+    readonly beforeAppend?: (events: ReadonlyArray<TranscriptEvent>) => ReadonlyArray<TranscriptEvent>;
+  } = {},
 ): Promise<TranscriptEvent[]> {
   const key = `${projectRoot}:${sessionId}`;
   const previous = appendQueues.get(key) ?? Promise.resolve();
@@ -87,6 +91,10 @@ export async function appendTranscriptEvents(
     if (result.length === 0) return;
 
     await mkdir(sessionsDir(projectRoot), { recursive: true });
+    // No asynchronous boundary between this decision and submitting the append.
+    // Callers may reject a success that became cancelled while persistence waited.
+    if (options.beforeAppend) result = options.beforeAppend(result).map(event => TranscriptEventSchema.parse(event));
+    if (result.length === 0) return;
     await appendFile(
       transcriptPath(projectRoot, sessionId),
       `${result.map((event) => JSON.stringify(event)).join("\n")}\n`,

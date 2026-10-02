@@ -8,6 +8,8 @@ import { readTranscriptEvents } from '../interaction/session-transcript.js';
 import { listWorkManifests } from '../harness/work-store.js';
 import type { Model } from '@mariozechner/pi-ai';
 import { CodexFixture } from './codex-fixture.js';
+import { CreativeHarnessRuntime } from '../harness/runtime.js';
+import { CreativeEpisodeStore } from '../harness/episode-store.js';
 
 const createClient = vi.hoisted(() => vi.fn());
 vi.mock('../codex/client.js', () => ({ createCodexClient: createClient }));
@@ -16,6 +18,60 @@ const model: Model<'openai-responses'> = { id: 'fixture', name: 'Fixture', provi
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
 const configuration = (root: string, sessionId: string) => ({ projectRoot: root, sessionId, bookId: null, workId: null,
   profileId: 'workspace-default', sessionKind: 'chat' as const, language: 'en' as const, model, pipeline: {} as never });
+
+it('settles a request and episode when episode initialization fails after creation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'inkos-episode-start-failure-'));
+  const original = CreativeHarnessRuntime.prototype.startEpisode;
+  const start = vi.spyOn(CreativeHarnessRuntime.prototype, 'startEpisode').mockImplementationOnce(function (this: CreativeHarnessRuntime, input) {
+    original.call(this, input);
+    throw new Error('fixture initialization failure');
+  });
+  createClient.mockClear();
+  try {
+    await expect(runAgentSession(configuration(root, 'initialization'), 'Go')).rejects.toThrow('fixture initialization failure');
+    expect((await readTranscriptEvents(root, 'initialization')).at(-1)?.type).toBe('request_failed');
+    const episodes = new CreativeEpisodeStore(join(root, '.inkos', 'harness.sqlite'));
+    try { expect(episodes.listEpisodes().map(e => e.status)).toEqual(['failed']); }
+    finally { episodes.close(); }
+    expect(createClient).not.toHaveBeenCalled();
+  } finally { start.mockRestore(); abortAgentSession(root, 'initialization'); await rm(root, { recursive: true, force: true }); }
+});
+
+it('keeps one request deadline across a silent model and records timeout as failure, not user cancellation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'inkos-request-deadline-'));
+  // Leave filesystem work and the fixture's setImmediate RPC delivery real, but
+  // do not let slow startup consume the deadline before the held turn starts.
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  vi.stubEnv('INKOS_AGENT_TIMEOUT_MS', '80');
+  let modelStarted!: () => void;
+  const started = new Promise<void>(resolve => { modelStarted = resolve; });
+  const codex = new CodexFixture(() => { modelStarted(); return { hold: true }; });
+  createClient.mockImplementation(codex.createClient);
+  const request = runAgentSession(configuration(root, 'deadline'), 'Go');
+  let settled = false;
+  const outcome = request.then(
+    value => { settled = true; return { value }; },
+    error => { settled = true; return { error }; },
+  );
+  try {
+    await Promise.race([started, outcome.then(() => { throw new Error('Request ended before the silent model started'); })]);
+    await vi.advanceTimersByTimeAsync(79);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await outcome).toMatchObject({ error: { code: 'AGENT_REQUEST_TIMEOUT' } });
+    expect((await readTranscriptEvents(root, 'deadline')).at(-1)?.type).toBe('request_failed');
+    const episodes = new CreativeEpisodeStore(join(root, '.inkos', 'harness.sqlite'));
+    try { expect(episodes.listEpisodes().map(e => e.status)).toEqual(['failed']); }
+    finally { episodes.close(); }
+    expect(codex.requests.filter(r => r.method === 'turn/start')).toHaveLength(1);
+  } finally {
+    abortAgentSession(root, 'deadline');
+    await outcome;
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 it('answers a question, rejects an unevidenced delivery, creates a Work and restores its explicit completion', async () => {
   const root = await mkdtemp(join(tmpdir(), 'inkos-turn-completion-'));
