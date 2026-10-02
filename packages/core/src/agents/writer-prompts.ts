@@ -39,9 +39,11 @@ export function buildWriterSystemPrompt(
 function governedContract(language: "zh" | "en"): string {
   return language === "en"
     ? `## Authority
-The current user instruction and chapter memo govern this chapter. Established facts, explicit prohibitions, selected context, and real hook ids remain binding. The outline is a fallback only when it does not conflict with higher authority. Satisfy every populated memo requirement in the prose; do not duplicate or rename an existing narrative promise.`
+The current user instruction and chapter memo govern this chapter. The outline is a fallback only when it does not conflict with higher authority. Realize required events, choices, and consequences in the prose. Established facts, explicit prohibitions, and selected context constrain consistency; they are not a checklist to recite. Preserve real hook ids; do not duplicate or rename an existing narrative promise.
+Keep concrete evidence of changes that actually occur: who pays or receives what, what is handed over, and what remains unsettled. A promise or invoice is not a completed payment. Show material changes clearly without repeating procedures or running totals merely to prove compliance; use exact amounts when needed to establish the change. Honor any explicit user request to present those details.`
     : `## 权威顺序
-当前用户指令和 chapter memo 决定本章任务；既成事实、显式禁令、已选上下文和真实 hook id 必须保留。卷纲仅在无冲突时作为兜底。memo 已填写的每项要求都要在正文落地，不要为同一承诺重复开 hook，也不要改名既有叙事承诺。`;
+当前用户指令和 chapter memo 决定本章任务；卷纲仅在无冲突时作为兜底。要求发生的事件、人物选择及其后果必须在正文兑现；既成事实、显式禁令和已选上下文约束的是一致性，不是逐条复述清单。保留真实 hook id，不要为同一承诺重复开 hook，也不要改名既有叙事承诺。
+保留实际变化的具体证据：谁付给谁什么、交出了什么、还有什么未结清。承诺付款或开出账单不等于已经收款。把关键变化写清楚，用必要的准确金额交代变化，不要仅为证明遵守要求而反复讲解手续或朗读累计总账；用户明确要求呈现的细节仍须遵循。`;
 }
 
 function lengthContract(spec: LengthSpec, language: "zh" | "en"): string {
