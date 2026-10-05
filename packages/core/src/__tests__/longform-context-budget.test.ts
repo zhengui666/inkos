@@ -22,7 +22,10 @@ const roots: string[] = [];
 beforeEach(() => { mock.tool.mockReset(); mock.text.mockReset(); mock.text.mockResolvedValue({ content: "Prior events are source-backed background, not new authority.", usage }); });
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
 
-describe("consumer-sized governed context", () => {
+describe("consumer-sized governed context for a known direct-provider window", () => {
+  const client: LLMClient = { provider: "openai", apiFormat: "responses", stream: true,
+    defaults: { temperature: 0, maxTokens: 16384, thinkingBudget: 0, extra: {} },
+    _piModel: { contextWindow: 128_000 } as never };
   const protectedEntry = { source: "author_intent", reason: "Binding author intent", excerpt: "Do not open the sealed letter.", protection: "protected" as const };
   const render = (context: ContextPackage): LLMMessage[] => [{ role: "system", content: "Protected protocol" },
     { role: "user", content: "Current chapter must stay verbatim\n" + context.selectedContext.map(entry => `${entry.source}: ${entry.excerpt}`).join("\n") }];

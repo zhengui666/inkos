@@ -26,7 +26,8 @@ export function createHarnessContextTransform(input: {
   readonly projectRoot: string;
   readonly work: WorkManifest | null;
   readonly profile: WorkProfile;
-  readonly budgetTokens: number;
+  /** Omit for native context management, preserving the full host transcript. */
+  readonly budgetTokens?: number;
   readonly semanticCompiler?: SemanticContextCompiler;
   readonly conversationCompactor?: ConversationCompactor;
   readonly onContextCompression?: ContextCompressionCallback;
@@ -66,25 +67,27 @@ export function createHarnessContextTransform(input: {
 
   let cached: {frames:string[];summary:string} | undefined;
   return async (messages, signal) => {
+    signal?.throwIfAborted();
+    const budgetTokens = input.budgetTokens;
     const lastUserIndex = findLastUserIndex(messages);
     let historicalMessages = lastUserIndex > 0 ? messages.slice(0, lastUserIndex) : [];
     let protectedTail = lastUserIndex >= 0 ? messages.slice(lastUserIndex) : messages;
     // Completed reads in the current tool loop can exceed a model window even
     // with a short user request. Preserve the request; compact the complete
     // closed tool exchanges, keeping their full evidence in the transcript.
-    if (lastUserIndex >= 0 && estimateAgentMessages(protectedTail) > input.budgetTokens * 0.6
+    if (budgetTokens !== undefined && lastUserIndex >= 0 && estimateAgentMessages(protectedTail) > budgetTokens * 0.6
       && input.conversationCompactor && closedToolExchanges(protectedTail.slice(1))) {
       let boundary=protectedTail.length;
       for(let i=protectedTail.length-1;i>=1;i--){
         if(protectedTail[i]?.role==='assistant'&&closedToolExchanges(protectedTail.slice(i))
-          &&estimateAgentMessages(protectedTail.slice(i))<input.budgetTokens*0.2)boundary=i;
+          &&estimateAgentMessages(protectedTail.slice(i))<budgetTokens*0.2)boundary=i;
       }
       historicalMessages = [...historicalMessages, ...protectedTail.slice(1,boundary)];
       protectedTail = [messages[lastUserIndex]!,...protectedTail.slice(boundary)];
     }
     const tailTokens = estimateAgentMessages(protectedTail);
-    const workBudget = input.budgetTokens - tailTokens;
-    if (workBudget <= 0) throw new ProtectedContextOverflowError(tailTokens, input.budgetTokens);
+    const workBudget = budgetTokens === undefined ? undefined : budgetTokens - tailTokens;
+    if (workBudget !== undefined && workBudget <= 0) throw new ProtectedContextOverflowError(tailTokens, budgetTokens!);
 
     const currentWork = input.work ? await loadWorkManifest(input.projectRoot, input.work.id) : null;
     const compiled = await compileContext({
@@ -108,24 +111,24 @@ export function createHarnessContextTransform(input: {
           timestamp: Date.now(),
         }
       : null;
-    const progress=executionProgress(messages.slice(lastUserIndex>=0?lastUserIndex+1:0),Math.max(100,Math.min(8000,Math.floor(input.budgetTokens*0.6))));
+    const progress=executionProgress(messages.slice(lastUserIndex>=0?lastUserIndex+1:0),budgetTokens === undefined ? 8000 : Math.max(100,Math.min(8000,Math.floor(budgetTokens*0.6))));
     const progressMessage:UserMessage|undefined=progress?{role:'user',content:`<host_execution_progress>\n${progress}\n</host_execution_progress>`,timestamp:Date.now()}:undefined;
     const withContext = [...(contextMessage ? [contextMessage as AgentMessage] : []),
       ...(progressMessage ? [progressMessage] : []), ...messages];
-    if (estimateAgentMessages(withContext) <= input.budgetTokens) return withContext;
+    if (budgetTokens === undefined || estimateAgentMessages(withContext) <= budgetTokens) return withContext;
 
     if (!input.conversationCompactor || historicalMessages.length === 0) {
       throw new ProtectedContextOverflowError(
         estimateAgentMessages(contextMessage ? [contextMessage as AgentMessage, ...protectedTail] : protectedTail),
-        input.budgetTokens,
+        budgetTokens,
       );
     }
 
     const workTokens = contextMessage ? estimateAgentMessages([contextMessage as AgentMessage]) : 0;
     const progressTokens=progressMessage?estimateAgentMessages([progressMessage]):0;
-    const summaryBudget = input.budgetTokens - workTokens - tailTokens-progressTokens;
+    const summaryBudget = budgetTokens - workTokens - tailTokens-progressTokens;
     if (summaryBudget <= 0) {
-      throw new ProtectedContextOverflowError(workTokens + tailTokens, input.budgetTokens);
+      throw new ProtectedContextOverflowError(workTokens + tailTokens, budgetTokens);
     }
     const frames=historicalMessages.map(m=>renderAgentMessages([m]));
     const extendsCache=cached&&cached.frames.length<=frames.length&&cached.frames.every((frame,i)=>frame===frames[i]);
@@ -159,8 +162,8 @@ export function createHarnessContextTransform(input: {
       ...protectedTail,
     ];
     const finalTokens = estimateAgentMessages(finalMessages);
-    if (finalTokens > input.budgetTokens) {
-      throw new Error(`Compacted conversation still exceeds budget: ${finalTokens}/${input.budgetTokens} tokens`);
+    if (finalTokens > budgetTokens) {
+      throw new Error(`Compacted conversation still exceeds budget: ${finalTokens}/${budgetTokens} tokens`);
     }
     return finalMessages;
   };

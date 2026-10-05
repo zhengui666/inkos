@@ -21,9 +21,14 @@ import {
 import { ShortDraftBatchToolSchema, ShortDraftChapterToolSchema, ShortRevisionChapterToolSchema, shortDraftBatchToolSchema, shortOutlineToolSchema, ShortPackageToolSchema, ShortRevisionPlanSchema, shortRevisionPlanSubmissionSchema } from "./short-fiction-tool.js";
 import { numberReviewSource, type Observation } from "../models/observation.js";
 
-export const SHORT_FICTION_DEFAULT_CHAPTERS = 12;
-export const SHORT_FICTION_DEFAULT_CHARS_PER_CHAPTER = 1000;
+// Chinese chapters use a fuller scene budget without inflating the default whole story.
+export const SHORT_FICTION_DEFAULT_CHAPTERS = 5;
+export const SHORT_FICTION_DEFAULT_CHARS_PER_CHAPTER = 2400;
 export const SHORT_FICTION_EN_DEFAULT_WORDS_PER_CHAPTER = 650;
+
+export function defaultShortFictionChapterCount(language: ShortFictionLanguage = "zh"): number {
+  return language === "en" ? 12 : SHORT_FICTION_DEFAULT_CHAPTERS;
+}
 
 export type { ShortFictionLanguage } from "../prompts/short-fiction.js";
 

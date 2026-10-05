@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 
 export type AgentTrajectoryRole = "main" | "subagent" | "workflow";
 
@@ -30,8 +30,9 @@ interface AgentTrajectoryScope extends AgentTrajectoryScopeInput {
 
 const trajectoryStorage = new AsyncLocalStorage<AgentTrajectoryScope>();
 
-export function opaqueConversationId(sessionId: string): string {
-  return `inkos-${createHash("sha256").update(sessionId).digest("hex").slice(0, 32)}`;
+/** Existing recorded IDs are opaque values; do not recompute or rename them. */
+export function opaqueConversationId(sessionId: string, recordedId?: string): string {
+  return recordedId ?? `inkos-session-${Buffer.from(sessionId).toString("base64url")}`;
 }
 
 export function runWithAgentTrajectory<T>(

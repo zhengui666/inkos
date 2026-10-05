@@ -14,7 +14,7 @@ async function fixture() {
   const request = vi.fn(async (method: string): Promise<unknown> => {
     if (method === 'account/read') return { account: null, requiresOpenaiAuth: true, accessToken: 'DO NOT EXPOSE' };
     if (method === 'account/login/start') return { type: 'chatgptDeviceCode', loginId: 'l1', verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'ABCD', accessToken: 'DO NOT EXPOSE' };
-    if (method === 'model/list') return { data: [{ id: 'model1', model: 'model1', displayName: 'Model', isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: 'medium' }], serviceTiers: [{ id: 'fast' }], token: 'DO NOT EXPOSE' }], nextCursor: null };
+    if (method === 'model/list') return { data: [{ id: 'model1', model: 'gpt-6.1-sol', displayName: 'Model', isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: 'medium' }, { reasoningEffort: 'ultra' }], serviceTiers: [{ id: 'fast' }, { id: 'priority' }], token: 'DO NOT EXPOSE' }], nextCursor: null };
     return {};
   });
   const client = { request, onNotification: (listener: CodexNotificationListener) => { notification = listener; return () => undefined; },
@@ -66,9 +66,10 @@ describe('Codex account service', () => {
 it('shares catalog aliases/default fallback/speed projection with runtime settings validation', async () => {
   const { service, request } = await fixture();
   request.mockImplementation(async (method: string) => method === 'model/list' ? { data: [{ id: 'alias', model: 'canonical', displayName: 'Model', isDefault: false,
-    supportedReasoningEfforts: [{ reasoningEffort: 'medium' }], serviceTiers: [{ id: 'fast', name: 'Fast' }], additionalSpeedTiers: ['fast', 'priority'] }], nextCursor: null } : {});
+    supportedReasoningEfforts: [{ reasoningEffort: 'medium' }, { reasoningEffort: 'ultra' }], serviceTiers: [{ id: 'fast', name: 'Fast' }], additionalSpeedTiers: ['fast', 'priority'] }], nextCursor: null } : {});
   expect((await service.listModels())[0]?.serviceTiers.map(tier => tier.id)).toEqual(['fast', 'priority']);
   await expect(service.updateSettings({ model: 'alias', serviceTier: 'priority' })).resolves.toMatchObject({ model: 'alias', serviceTier: 'priority' });
-  await expect(service.updateSettings({ model: null, serviceTier: 'default' })).resolves.toMatchObject({ reasoningEffort: 'medium' });
+  await expect(service.updateSettings({ model: null, serviceTier: 'default' })).resolves.toEqual({ reasoningEffort: 'ultra', serviceTier: 'default' });
+  await expect(service.readSettings()).resolves.toEqual({ reasoningEffort: 'ultra', serviceTier: 'default' });
   await service.dispose();
 });

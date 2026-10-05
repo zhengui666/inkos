@@ -98,17 +98,28 @@ describe("guardedPiNonStreaming", () => {
       await expect(loadWorkManifest(root,'escaped')).rejects.toMatchObject({code:'ENOENT'});
       await expect(createBookFoundationTool(pipeline,{activeWork:{work,projectRoot:root}}).execute('again',{instruction:'Initialize again',targetChapters:999})).rejects.toMatchObject({code:'BOOK_ALREADY_INITIALIZED'});
       expect(await readFile(path,'utf8')).toBe(original);
-      const canon="Mara retains the sealed receipt and returns it to its owner. ".repeat(1100);
+      // This integration checks profile continuity, not a near-limit prompt boundary.
+      // Keep a large protected source while leaving room for the required craft guidance.
+      const canonLine="Mara retains the sealed receipt and returns it to its owner. ";
+      const canon=canonLine.repeat(1000);
       const boundedClient={...client,defaults:{...client.defaults,maxTokens:4096},_piModel:{...client._piModel!,contextWindow:30000,maxTokens:4096}};
       const calls:string[]=[];
+      const prompts:string[]=[];
       fetchWithProxyMock.mockImplementation(async(_url:string,init:RequestInit)=>{
         const body=JSON.parse(String(init.body)),name=body.tools[0].function.name;calls.push(name);
+        prompts.push(body.messages.map((message:{content:string})=>message.content).join("\n\n"));
         const args=name==="submit_chapter_draft"?{title:"Return",content:"Mara returns the sealed receipt. The owner checks the seal and accepts it."}:{postSettlement:"Receipt returned.",factOps:{upsert:[],expire:[]},hookOps:{upsert:[],mention:[],resolve:[],defer:[]},newHookCandidates:[],chapterSummary:{title:"Return",characters:"Mara",events:"Receipt returned",stateChanges:"",hookActivity:"",mood:"calm",chapterType:"resolution"}};
         return new Response(JSON.stringify({choices:[{finish_reason:"tool_calls",message:{tool_calls:[{id:name,type:"function",function:{name,arguments:JSON.stringify(args)}}]}}]}));
       });
-      const chapter=await new WriterAgent({client:boundedClient,model:model.id,projectRoot:root,bookId:"generic"}).writeChapter({book:JSON.parse(original),bookDir:join(root,"works/generic/source"),chapterNumber:1,chapterIntent:"Return the receipt",chapterMemo:{chapter:1,goal:"Return the receipt",body:"The owner accepts the sealed receipt.",threadRefs:[]},contextPackage:{chapter:1,selectedContext:[{source:"story/parent_canon.md",reason:"Original ownership",excerpt:canon,protection:"protected"}]}});
+      const writeWithCanon=(source:string)=>new WriterAgent({client:boundedClient,model:model.id,projectRoot:root,bookId:"generic"}).writeChapter({book:JSON.parse(original),bookDir:join(root,"works/generic/source"),chapterNumber:1,chapterIntent:"Return the receipt",chapterMemo:{chapter:1,goal:"Return the receipt",body:"The owner accepts the sealed receipt.",threadRefs:[]},contextPackage:{chapter:1,selectedContext:[{source:"story/parent_canon.md",reason:"Original ownership",excerpt:source,protection:"protected"}]}});
+      // The oversized source alone exceeds the unchanged 23856-token input budget.
+      await expect(writeWithCanon(canonLine.repeat(1600))).rejects.toMatchObject({code:"PROTECTED_CONTEXT_OVERFLOW",budgetTokens:23856});
+      expect(calls).toEqual([]);expect(prompts).toEqual([]);
+      expect(await readFile(path,'utf8')).toBe(original);
+      const chapter=await writeWithCanon(canon);
       expect(chapter.chapterNumber).toBe(1);
       expect(calls).toEqual(["submit_chapter_draft","submit_runtime_state_delta"]);
+      for(const prompt of prompts){expect(prompt).toContain(canon);expect(prompt.split(canon)).toHaveLength(2);}
     }finally{evictAgentCache('initialization');await rm(root,{recursive:true,force:true});}
   });
   it('repairs an invalid world proposal before one commit and delivers without another main-model call',async()=>{
@@ -669,7 +680,7 @@ describe("guardedPiNonStreaming", () => {
     expect(fetchWithProxyMock).toHaveBeenCalledTimes(2);
     expect(result.storyTitle).toBe("Story");
     expect(result.rawContent).toBe(`Story premise and ending\n\n## Chapter 1\n\n${chapterOne}\n\n## Chapter 2\n\n${chapterTwo}`);
-    expect(codex.requests.find(request=>request.method==='turn/start')?.params.effort).toBe('medium');
+    expect(codex.requests.find(request=>request.method==='turn/start')?.params).toMatchObject({ effort: 'ultra', serviceTier: 'priority' });
   });
 
   it("adapts a non-streaming tool call back into Pi events", async () => {

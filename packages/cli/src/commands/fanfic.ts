@@ -1,3 +1,4 @@
+import { defaultChapterLength as defaultNovelChapterLength } from "@actalk/inkos-core";
 import { Command } from "commander";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { join, resolve, basename } from "node:path";
@@ -30,7 +31,7 @@ fanficCommand
   .option("--genre <genre>", "Genre", "other")
   .option("--platform <platform>", "Target platform", "other")
   .option("--target-chapters <n>", "Target chapter count", "100")
-  .option("--chapter-words <n>", "Words per chapter", "3000")
+  .option("--chapter-words <n>", "Per-chapter target in zh characters or en words; defaults from language")
   .option("--lang <language>", "Writing language: zh or en. Defaults from the project.")
   .option("--json", "Output JSON")
   .action(async (opts) => {
@@ -57,7 +58,9 @@ fanficCommand
         genre: opts.genre,
         status: "outlining",
         targetChapters: parseInt(opts.targetChapters, 10),
-        chapterWordCount: parseInt(opts.chapterWords, 10),
+        chapterWordCount: opts.chapterWords === undefined
+          ? defaultNovelChapterLength(resolveCliLanguage(opts.lang ?? config.language))
+          : parseInt(opts.chapterWords, 10),
         language: resolveCliLanguage(opts.lang ?? config.language),
         createdAt: now,
         updatedAt: now,

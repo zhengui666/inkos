@@ -1,18 +1,15 @@
 import { createServer } from 'node:http';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
-import { createCodexClient } from '../app-server.js';
+import { createLoopbackCodexClient } from './loopback-client.js';
 
 /** Actual pinned runtime + loopback fixture, with no credentials or external inference.
  * Run with INKOS_CODEX_INTEGRATION=1 after installing @openai/codex. */
 describe.skipIf(process.env.INKOS_CODEX_INTEGRATION !== '1')('Codex native tool isolation', () => {
   it.each([true, false])('offers only the declared Inkos dynamic tools (tools enabled: %s)', async (withTools) => {
     const root = await mkdtemp(join(tmpdir(), 'inkos-codex-integration-'));
-    const require = createRequire(import.meta.url);
-    const packageRoot = dirname(require.resolve('@openai/codex/package.json'));
     let resolveRequest!: (request: Record<string, unknown>) => void;
     let rejectRequest!: (error: Error) => void;
     const captured = new Promise<Record<string, unknown>>((resolve, reject) => { resolveRequest = resolve; rejectRequest = reject; });
@@ -33,15 +30,12 @@ describe.skipIf(process.env.INKOS_CODEX_INTEGRATION !== '1')('Codex native tool 
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('No loopback fixture address');
-    let client: Awaited<ReturnType<typeof createCodexClient>> | undefined;
+    let client: Awaited<ReturnType<typeof createLoopbackCodexClient>> | undefined;
     try {
-      client = await createCodexClient(root, {
-        stateRoot: join(root, 'state'), command: process.execPath,
-        args: [join(packageRoot, 'bin', 'codex.js'),
+      client = await createLoopbackCodexClient(root, [
           '-c', 'features.enable_request_compression=false',
           '-c', 'model_provider="fixture"', '-c', 'model="gpt-5.3-codex"',
-          '-c', `model_providers.fixture={name="Fixture",base_url="http://127.0.0.1:${address.port}/v1",wire_api="responses",requires_openai_auth=false,supports_websockets=false,request_max_retries=0,stream_max_retries=0}`],
-      });
+          '-c', `model_providers.fixture={name="Fixture",base_url="http://127.0.0.1:${address.port}/v1",wire_api="responses",requires_openai_auth=false,supports_websockets=false,request_max_retries=0,stream_max_retries=0}`]);
       const result = await client.request<{ thread: { id: string } }>('thread/start', {
         cwd: client.cwd, ephemeral: true, approvalPolicy: 'never', sandbox: 'read-only',
         baseInstructions: 'Use only the Inkos tools.',
@@ -61,8 +55,6 @@ describe.skipIf(process.env.INKOS_CODEX_INTEGRATION !== '1')('Codex native tool 
 
   it('executes an actual dynamic call and returns its receipt to the model', async () => {
     const root = await mkdtemp(join(tmpdir(), 'inkos-codex-loop-'));
-    const require = createRequire(import.meta.url);
-    const packageRoot = dirname(require.resolve('@openai/codex/package.json'));
     const bodies: Array<Record<string, unknown>> = [];
     let resolveDone!: (value: Record<string, any>) => void;
     let rejectDone!: (error: Error) => void;
@@ -92,12 +84,11 @@ describe.skipIf(process.env.INKOS_CODEX_INTEGRATION !== '1')('Codex native tool 
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('No fixture address');
-    let client: Awaited<ReturnType<typeof createCodexClient>> | undefined;
+    let client: Awaited<ReturnType<typeof createLoopbackCodexClient>> | undefined;
     try {
-      client = await createCodexClient(root, { stateRoot: join(root, 'state'), command: process.execPath,
-        args: [join(packageRoot, 'bin', 'codex.js'), '-c', 'features.enable_request_compression=false',
+      client = await createLoopbackCodexClient(root, [ '-c', 'features.enable_request_compression=false',
           '-c', 'model_provider="fixture"', '-c', 'model="gpt-5.3-codex"',
-          '-c', `model_providers.fixture={name="Fixture",base_url="http://127.0.0.1:${address.port}/v1",wire_api="responses",requires_openai_auth=false,supports_websockets=false,request_max_retries=0,stream_max_retries=0}`] });
+          '-c', `model_providers.fixture={name="Fixture",base_url="http://127.0.0.1:${address.port}/v1",wire_api="responses",requires_openai_auth=false,supports_websockets=false,request_max_retries=0,stream_max_retries=0}`]);
       const calls: unknown[] = [];
       client.onRequest((method, params) => {
         if (method !== 'item/tool/call') return undefined;

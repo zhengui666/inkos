@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
@@ -46,9 +45,11 @@ export const ShortProductionStateSchema = z.object({
 }).strict();
 export type ShortProductionState = z.infer<typeof ShortProductionStateSchema>;
 export type ShortStage = z.infer<typeof ShortStageSchema>;
-export function shortInputHash(value: unknown): string {
-  return `sha256:${createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex")}`;
+export function shortInputSnapshot(value: unknown): string {
+  return JSON.stringify(canonical(value));
 }
+/** @deprecated Legacy call name; returns actual serialized input, never a digest. */
+export const shortInputHash = shortInputSnapshot;
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical);
   if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, canonical(item)]));

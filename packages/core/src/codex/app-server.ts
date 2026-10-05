@@ -1,8 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { homedir, tmpdir } from 'node:os';
+import { lstat, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
 /** Dynamic tools are experimental, so the runtime and protocol are deliberately pinned. */
@@ -26,11 +25,16 @@ export interface CodexClientOptions {
   command?: string;
   args?: string[];
   stateRoot?: string;
+  /** Reuse the exact existing home when migrating from digest-named directories. */
+  codexHome?: string;
   requestTimeoutMs?: number;
 }
 
 /** Verified against openai/codex rust-v0.159.2/config.schema.json. No API-key/provider override. */
 export const CODEX_ISOLATED_CONFIG: Readonly<Record<string, string | number | boolean | string[]>> = Object.freeze({
+  model: 'gpt-6.1-sol',
+  model_reasoning_effort: 'ultra',
+  service_tier: 'fast',
   approval_policy: 'never', sandbox_mode: 'read-only', forced_login_method: 'chatgpt',
   cli_auth_credentials_store: 'file', project_doc_max_bytes: 0,
   project_doc_fallback_filenames: [], web_search: 'disabled', notify: [],
@@ -85,11 +89,66 @@ export function createCodexEnvironment(home: string, codexHome: string): NodeJS.
   return env;
 }
 
+/** Create missing state only; never repair permissions on a directory owned by a live peer. */
 async function privateDirectory(path: string): Promise<void> {
-  await mkdir(path, { recursive: true, mode: 0o700 });
-  const stat = await lstat(path);
+  let stat;
+  try { stat = await lstat(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    await mkdir(path, { recursive: true, mode: 0o700 });
+    stat = await lstat(path);
+  }
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Codex state directory must not be a symbolic link');
-  await chmod(path, 0o700);
+  if (process.platform !== 'win32' && ((stat.mode & 0o077) !== 0
+    || (process.getuid && stat.uid !== process.getuid()))) {
+    throw new Error('Codex state directory must already be private and owned by the current OS user; Inkos will not change existing permissions');
+  }
+}
+
+/**
+ * Only the flat, JSON-valued TOML subset emitted by previous Inkos versions is
+ * accepted here, not arbitrary user TOML. Codex merges CLI tables recursively:
+ * `-c mcp_servers={}` cannot remove an existing server. Reject anything we cannot
+ * fully override before starting a peer, without modifying the shared file.
+ */
+async function validateExistingConfig(codexHome: string): Promise<void> {
+  const path = join(codexHome, 'config.toml');
+  let stat;
+  try { stat = await lstat(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  const incompatible = () => new Error('Codex project config is outside the supported Inkos isolation format; inspect it separately before starting (no config was changed)');
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024) throw incompatible();
+  const seen = new Set<string>();
+  for (const line of (await readFile(path, 'utf8')).split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const match = /^([a-z_][a-z0-9_.]*)\s*=\s*(.+)$/.exec(trimmed);
+    if (!match || seen.has(match[1]!)) throw incompatible();
+    const key = match[1]!;
+    const raw = match[2]!;
+    seen.add(key);
+    if (key === 'mcp_servers' || key === 'plugins') {
+      if (raw.trim() !== '{}') throw incompatible();
+      continue;
+    }
+    if (!Object.hasOwn(CODEX_ISOLATED_CONFIG, key)) throw incompatible();
+    let value: unknown;
+    try { value = JSON.parse(raw); } catch { throw incompatible(); }
+    const expected = CODEX_ISOLATED_CONFIG[key];
+    // Scalars/arrays replace their old values. Tables would recursively merge.
+    if (Array.isArray(expected)
+      ? !Array.isArray(value) || !value.every(item => typeof item === 'string')
+      : typeof value !== typeof expected || (typeof value === 'number' && !Number.isFinite(value))) throw incompatible();
+  }
+}
+
+/** Official process-local -c overrides, deliberately never persisted to CODEX_HOME. */
+export function codexIsolationArgs(): string[] {
+  return [...Object.entries(CODEX_ISOLATED_CONFIG), ['mcp_servers', {}], ['plugins', {}]]
+    .flatMap(([key, value]) => ['-c', `${key}=${JSON.stringify(value)}`]);
 }
 
 async function launchCommand(options: CodexClientOptions): Promise<{ command: string; args: string[] }> {
@@ -105,26 +164,29 @@ async function launchCommand(options: CodexClientOptions): Promise<{ command: st
   }
 }
 
+/** Plain project-local storage for new projects; recorded legacy paths take precedence. */
+export function resolveCodexHome(projectRoot: string, options: CodexClientOptions = {}): string {
+  const existingHome = options.codexHome ?? process.env.INKOS_CODEX_HOME;
+  if (existingHome) return resolve(existingHome);
+  const stateRoot = options.stateRoot ?? process.env.INKOS_CODEX_STATE_ROOT
+    ?? join(resolve(projectRoot), '.inkos', 'codex');
+  return join(resolve(stateRoot), 'home');
+}
+
 export async function createCodexClient(projectRoot: string, options: CodexClientOptions = {}): Promise<CodexClient> {
   const command = await launchCommand(options);
-  const projectId = createHash('sha256').update(resolve(projectRoot)).digest('hex').slice(0, 24);
-  const stateRoot = options.stateRoot ?? process.env.INKOS_CODEX_STATE_ROOT ?? join(homedir(), '.inkos', 'codex');
-  await privateDirectory(stateRoot);
-  const codexHome = join(stateRoot, projectId);
+  const codexHome = resolveCodexHome(projectRoot, options);
+  await privateDirectory(dirname(codexHome));
   await privateDirectory(codexHome);
+  await validateExistingConfig(codexHome);
   const workspace = await mkdtemp(join(tmpdir(), 'inkos-codex-'));
   const cwd = join(workspace, 'work');
   const home = join(workspace, 'home');
   await Promise.all([privateDirectory(cwd), privateDirectory(join(home, 'tmp'))]);
-  const config = Object.entries(CODEX_ISOLATED_CONFIG).map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join('\n');
   try {
-    // Config is owned by Inkos. Codex alone owns its sibling auth.json, which Inkos never reads.
-    const configTemp = join(codexHome, `config.${randomUUID()}.tmp`);
-    try {
-      await writeFile(configTemp, `${config}\nmcp_servers = {}\nplugins = {}\n`, { mode: 0o600, flag: 'wx' });
-      await rename(configTemp, join(codexHome, 'config.toml'));
-    } finally { await rm(configTemp, { force: true }); }
-    const child = spawn(command.command, [...command.args, 'app-server', '--listen', 'stdio://', '--strict-config'], {
+    // Isolation applies to this peer only. Codex itself owns account/runtime state;
+    // this does not promise that the App Server performs no writes in CODEX_HOME.
+    const child = spawn(command.command, [...command.args, 'app-server', '--listen', 'stdio://', '--strict-config', ...codexIsolationArgs()], {
       cwd, env: createCodexEnvironment(home, codexHome), stdio: 'pipe', windowsHide: true,
       detached: process.platform !== 'win32',
     });

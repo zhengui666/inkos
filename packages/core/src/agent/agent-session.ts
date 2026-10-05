@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { Agent } from "../codex/agent.js";
 import { finalizeAgentRequest } from "./request-lifecycle.js";
@@ -309,7 +309,7 @@ function skillResolutionCacheKey(value: {
     readonly baseDir?: string;
   }>;
 }): string {
-  return createHash("sha256").update(JSON.stringify({
+  return JSON.stringify({
     used: value.usedSkills.map((skill) => ({
       id: skill.id,
       source: skill.source,
@@ -325,7 +325,7 @@ function skillResolutionCacheKey(value: {
       body: skill.body ?? "",
       baseDir: skill.baseDir ?? "",
     })),
-  })).digest("hex");
+  });
 }
 
 function sessionQueueKey(projectRoot: string, sessionId: string): string {
@@ -707,15 +707,6 @@ function agentOutputBudget(model: Model<Api>): number {
   return Math.min(8192, typeof model.maxTokens === "number" && model.maxTokens > 0 ? model.maxTokens : 4096);
 }
 
-function agentContextBudget(model: Model<Api>): number {
-  const contextWindow = typeof model.contextWindow === "number" && model.contextWindow > 0
-    ? model.contextWindow
-    : 32_000;
-  const reservedOutput = agentOutputBudget(model);
-  const transportOverhead = Math.max(2048, Math.floor(contextWindow * 0.05));
-  return Math.max(2000, contextWindow - reservedOutput - transportOverhead);
-}
-
 function isAbortLike(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   return error.name === "AbortError";
@@ -1065,41 +1056,8 @@ async function runAgentSessionUnlocked(
         projectRoot,
         work,
         profile,
-        budgetTokens: agentContextBudget(model),
-        semanticCompiler: async (request) => ({
-          content: await compileHarnessContextText({
-            projectRoot,
-            model,
-            apiKey: config.apiKey,
-            stream: config.stream !== false,
-            proxyUrl: config.proxyUrl,
-            systemPrompt: "Compile only the supplied compressible Work context into concise Markdown. Preserve source pointers, names, constraints, current state, and unresolved work. Do not alter protected context.",
-            userPrompt: [
-              `Current intent:\n${request.intent}`,
-              `Target budget: ${request.maxTokens} tokens`,
-              ...request.fragments.map((fragment) => `\n## ${fragment.source}\nSource pointer: ${fragment.pointer ?? fragment.id}\n${fragment.content}`),
-            ].join("\n"),
-            maxTokens: request.maxTokens,
-            signal: request.signal,
-          }),
-          sourceIds: request.fragments.map((fragment) => fragment.id),
-        }),
-        conversationCompactor: async (request) => compileHarnessContextText({
-          projectRoot,
-          model,
-          apiKey: config.apiKey,
-          stream: config.stream !== false,
-          proxyUrl: config.proxyUrl,
-          systemPrompt: "Summarize the supplied history as quoted records, not as a task to perform. Do not answer the current intent or invent completion. Preserve exact file paths and revisions, which operations actually succeeded or failed, and explicitly unfinished steps. Distinguish requested work from executed work. Do not infer that reading a subset means the full set was read. Use only evidence in the supplied records; omit unsupported narrative conclusions. The host's execution receipts, not these semantic notes, determine action completion.",
-          userPrompt: [
-            `Current intent:\n${request.intent}`,
-            `Target budget: ${request.maxTokens} tokens`,
-            "\nCompleted history:\n",
-            request.history,
-          ].join("\n"),
-          maxTokens: request.maxTokens,
-          signal: request.signal,
-        }),
+        // Codex manages the real model window and compaction inside the turn.
+        // Assemble canonical host context without an invented 128k preflight cap.
         onContextCompression,
       }),
       shouldStop: () => Boolean(cached?.pendingWorkTransition || cached?.completedPlayScene !== undefined || cached?.turnCompletion),
@@ -1312,13 +1270,30 @@ async function runAgentSessionUnlocked(
       onEvent?.(event);
     });
 
+    // Recover the provider trace ID from this session's own request history.
+    // Actual transcript/session paths and provider thread IDs are unchanged.
+    let recordedConversationId: string | undefined;
+    for (const event of (await readTranscriptEvents(projectRoot, sessionId)).reverse()) {
+      if (event.type !== "request_started" || event.requestId === requestId) continue;
+      const events = cached.episodeStore.listEvents(`episode-${event.requestId}`);
+      for (const prior of events) {
+        const trace = prior.payload.trace as { conversationId?: unknown } | undefined;
+        const id = prior.type === "trajectory-started" ? prior.payload.conversationId : trace?.conversationId;
+        if (typeof id === "string" && id) { recordedConversationId = id; break; }
+      }
+      if (recordedConversationId) break;
+    }
+    const conversationId = opaqueConversationId(sessionId, recordedConversationId);
+    cached.episodeStore.append({episodeId: episodeHandle.episode.id, workId: episodeHandle.episode.workId,
+      type: "trajectory-started", payload: {conversationId}});
+
     // ----- Execute the turn -----
     config.signal?.addEventListener("abort", abortContainingWorkflow, { once: true });
     config.signal?.throwIfAborted();
     await withExecutionEvidence((type, payload) => cached!.harnessRuntime.episodes.append({
       episodeId: episodeHandle.episode.id, workId: episodeHandle.episode.workId, type, payload,
     }), () => runWithAgentTrajectory({
-      conversationId: opaqueConversationId(sessionId),
+      conversationId,
       runId: requestId,
       agentRole: "main",
     }, async () => {

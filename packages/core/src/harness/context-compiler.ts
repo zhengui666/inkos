@@ -51,7 +51,7 @@ export type SemanticContextCompiler = (
 
 export interface CompiledContextTrace {
   readonly recipeId: string;
-  readonly budgetTokens: number;
+  readonly budgetTokens?: number;
   readonly protectedTokens: number;
   readonly compressibleTokens: number;
   readonly finalTokens: number;
@@ -102,10 +102,11 @@ export async function compileContext(input: {
   readonly recipe: ContextRecipe;
   readonly sources: ContextSourceRegistry;
   readonly request: ContextLoadRequest;
-  readonly budgetTokens: number;
+  /** Omit when the native runtime owns the context window and compaction. */
+  readonly budgetTokens?: number;
   readonly compiler?: SemanticContextCompiler;
 }): Promise<CompiledContext> {
-  if (!Number.isInteger(input.budgetTokens) || input.budgetTokens <= 0) {
+  if (input.budgetTokens !== undefined && (!Number.isInteger(input.budgetTokens) || input.budgetTokens <= 0)) {
     throw new Error(`Context budget must be a positive integer: ${input.budgetTokens}`);
   }
   if (input.request.signal?.aborted) throw input.request.signal.reason;
@@ -116,10 +117,10 @@ export async function compileContext(input: {
   const protectedTokens = estimateFragments(protectedFragments);
   const compressibleTokens = estimateFragments(compressibleFragments);
   const totalTokens = protectedTokens + compressibleTokens;
-  if (protectedTokens > input.budgetTokens) {
+  if (input.budgetTokens !== undefined && protectedTokens > input.budgetTokens) {
     throw new ProtectedContextOverflowError(protectedTokens, input.budgetTokens, protectedFragments.map(fragment => ({ id: fragment.id, tokens: estimateFragments([fragment]) })));
   }
-  if (totalTokens <= input.budgetTokens) {
+  if (input.budgetTokens === undefined || totalTokens <= input.budgetTokens) {
     return buildResult({
       recipeId: input.recipe.id,
       budgetTokens: input.budgetTokens,
@@ -176,7 +177,7 @@ export async function compileContext(input: {
 
 function buildResult(input: {
   readonly recipeId: string;
-  readonly budgetTokens: number;
+  readonly budgetTokens?: number;
   readonly protectedFragments: ReadonlyArray<ContextFragment>;
   readonly compressibleFragments: ReadonlyArray<ContextFragment>;
   readonly protectedTokens: number;

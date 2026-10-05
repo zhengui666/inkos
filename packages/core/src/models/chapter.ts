@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { LengthTelemetrySchema } from "./length-governance.js";
-import { ObservationSchema } from "./observation.js";
+import { ObservationSchema, type Observation } from "./observation.js";
 
 export const ChapterMetaSchema = z.object({
   number: z.number().int().min(1),
@@ -19,3 +19,13 @@ export const ChapterMetaSchema = z.object({
 }).strict();
 
 export type ChapterMeta = z.infer<typeof ChapterMetaSchema>;
+
+/** A quality review cannot certify or discard execution/state-reconciliation evidence. */
+export function mergeChapterReviewObservations(
+  previous: ReadonlyArray<Observation>, reviewed: ReadonlyArray<Observation>,
+): Observation[] {
+  return [
+    ...previous.filter(observation => observation.category === "execution" || observation.code === "state-sync-required"),
+    ...reviewed,
+  ];
+}

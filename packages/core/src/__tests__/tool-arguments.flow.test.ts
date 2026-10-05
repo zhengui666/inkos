@@ -67,6 +67,7 @@ it("persists original scalar types through Codex and rejects coercible invalid i
     fixtureCalls = calls;
     const agent = new Agent({
       projectRoot: root,
+      settings: { model: "fixture", reasoningEffort: "medium", serviceTier: "default" },
       initialState: { model: client._piModel!, systemPrompt: "Apply fixture tools", messages: [], tools: [
         createAddVariableTool(root, "film"), createConnectChoiceTool(root, "film"),
         createSetWorldAnchorTool(root, "film"),

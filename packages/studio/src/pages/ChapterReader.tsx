@@ -23,6 +23,8 @@ interface ChapterData {
   readonly chapterNumber: number;
   readonly filename: string;
   readonly content: string;
+  readonly revisionId?: string | null;
+  readonly stateNeedsSync?: boolean;
 }
 
 interface Nav {
@@ -30,13 +32,19 @@ interface Nav {
   toDashboard: () => void;
 }
 
-export function ChapterReader({ bookId, chapterNumber, nav, theme, t }: {
+interface ChapterReaderProps {
   bookId: string;
   chapterNumber: number;
   nav: Nav;
   theme: Theme;
   t: TFunction;
-}) {
+}
+
+export function ChapterReader(props: ChapterReaderProps) {
+  return <ChapterReaderView key={JSON.stringify([props.bookId, props.chapterNumber])} {...props} />;
+}
+
+function ChapterReaderView({ bookId, chapterNumber, nav, theme, t }: ChapterReaderProps) {
   const c = useColors(theme);
   const { data, loading, error, refetch } = useApi<ChapterData>(
     `/books/${bookId}/chapters/${chapterNumber}`,
@@ -44,11 +52,15 @@ export function ChapterReader({ bookId, chapterNumber, nav, theme, t }: {
   const [editing, setEditing] = useState(false);
   const [editContent, setEditContent] = useState("");
   const [saving, setSaving] = useState(false);
+  const [editRevisionId, setEditRevisionId] = useState<string | undefined>();
+  const [openedContent, setOpenedContent] = useState("");
   const [workspaceRevision, setWorkspaceRevision] = useState(0);
 
   const handleStartEdit = () => {
     if (!data) return;
     setEditContent(data.content);
+    setOpenedContent(data.content);
+    setEditRevisionId(data.revisionId ?? undefined);
     setEditing(true);
   };
 
@@ -63,7 +75,7 @@ export function ChapterReader({ bookId, chapterNumber, nav, theme, t }: {
       await fetchJson(`/books/${bookId}/chapters/${chapterNumber}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: editContent }),
+        body: JSON.stringify({ content: editContent, expectedRevisionId: editRevisionId, expectedContent: openedContent }),
       });
       setEditing(false);
       refetch();

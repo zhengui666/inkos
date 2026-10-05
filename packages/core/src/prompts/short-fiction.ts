@@ -33,8 +33,8 @@ export interface ShortFictionPackagePromptInput {
 
 export function buildShortFictionOutlineSystemPrompt(language: ShortFictionLanguage = "zh"): string {
   return language === "en"
-    ? "Create the complete short-story plan using the activated short-writing Skill and only the supplied material. Submit it through the outline tool."
-    : "按已激活的短篇写作 Skill 和用户材料生成完整短篇方案，通过方案工具提交。";
+    ? "Create the complete short-story plan using the activated short-writing Skill and the author's direction. Develop open creative choices while preserving confirmed facts and constraints. Submit it through the outline tool."
+    : "按已激活的短篇写作 Skill 和用户方向生成完整短篇方案。在已确定事实和限制内发展尚未确定的创作选择，通过方案工具提交。";
 }
 
 export function buildShortFictionOutlineUserPrompt(input: ShortFictionOutlinePromptInput, language: ShortFictionLanguage = "zh"): string {
@@ -46,8 +46,8 @@ export function buildShortFictionOutlineUserPrompt(input: ShortFictionOutlinePro
     "",
     language === "en" ? "## Target" : "## 目标",
     language === "en"
-      ? `${input.chapterCount} chapters; about ${input.charsPerChapter} words per chapter.`
-      : `${input.chapterCount} 章；每章约 ${input.charsPerChapter} 字。`,
+      ? `${input.chapterCount} chapters; about ${input.charsPerChapter} words per chapter, approximately ${input.chapterCount * input.charsPerChapter} words for the complete story.`
+      : `${input.chapterCount} 章；每章约 ${input.charsPerChapter} 字，全篇约 ${input.chapterCount * input.charsPerChapter} 字。`,
     ...(reference ? ["", language === "en" ? "## Reference" : "## 参考材料", reference] : []),
   ].join("\n");
 }
@@ -80,8 +80,8 @@ export function buildShortFictionWriterUserPrompt(input: ShortFictionDraftPrompt
 }
 export function buildShortFictionDraftReviewSystemPrompt(language: ShortFictionLanguage = "zh"): string {
   return language === "en"
-    ? "Review the persisted draft with the activated short-writing Skill. Attribute every finding to its sourceId and select a short inclusive startLine/endLine range from the numbered source; the host copies the exact excerpt. Distinguish outline differences from manuscript contradictions. Submit evidence-backed observations and a concise summary through the review tool. An empty observations array is valid."
-    : "按已激活的短篇写作 Skill 审查已落盘成稿。每项观察指定 sourceId 和该编号来源内一小段连续的 startLine/endLine（含首尾行），系统按行号截取原文。区分大纲差异与正文内部矛盾。通过审稿工具提交有证据的观察和简短总结；observations 为空是合法结果。";
+    ? "Review the persisted draft with the activated short-writing Skill against the requested reading experience and causal plan. Attribute every finding to its sourceId and select a short inclusive startLine/endLine range from the numbered source; the host copies the exact excerpt. Distinguish outline differences from manuscript contradictions. Submit evidence-backed observations and a concise summary through the review tool. An empty observations array is valid."
+    : "按已激活的短篇写作 Skill，对照所要求的阅读体验与因果方案审查已落盘成稿。每项观察指定 sourceId 和该编号来源内一小段连续的 startLine/endLine（含首尾行），系统按行号截取原文。区分大纲差异与正文内部矛盾。通过审稿工具提交有证据的观察和简短总结；observations 为空是合法结果。";
 }
 
 export function buildShortFictionDraftReviewUserPrompt(input: ShortFictionDraftReviewPromptInput, language: ShortFictionLanguage = "zh"): string {

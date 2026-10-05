@@ -57,6 +57,41 @@ const make = (execute: (_id: string, args: { value: string }) => Promise<AgentTo
 });
 
 describe("Codex Agent bridge", () => {
+  it("sends a large initial payload intact and lets native compaction notifications complete", async () => {
+    const payload = "原".repeat(119500);
+    const rules = "Author-approved rules " + "规".repeat(2000);
+    const agent = new Agent({ projectRoot: "/project", initialState: { ...make().state, systemPrompt: rules } });
+    client.run = async () => {
+      client.notify("item/started", { item: { id: "compact-1", type: "contextCompaction" } });
+      client.notify("thread/tokenUsage/updated", { tokenUsage: { modelContextWindow: 258400,
+        total: { inputTokens: 130000, outputTokens: 0, totalTokens: 130000 } } });
+      client.notify("item/completed", { item: { id: "compact-1", type: "contextCompaction" } });
+      client.text("Validated"); client.finish();
+    };
+    await agent.prompt(payload);
+    const start = client.request.mock.calls.find(([method]) => method === "thread/start")?.[1] as Record<string, any>;
+    const turn = client.request.mock.calls.find(([method]) => method === "turn/start")?.[1] as Record<string, any>;
+    expect(start.baseInstructions).toBe(rules);
+    expect(start.dynamicTools[0].inputSchema).toEqual(JSON.parse(JSON.stringify(make().state.tools[0]!.parameters)));
+    expect(turn.input).toEqual([{ type: "text", text: payload, text_elements: [] }]);
+    expect(start.config).toBeUndefined();
+    expect(turn.model_context_window).toBeUndefined();
+    expect(turn.model_auto_compact_token_limit).toBeUndefined();
+    expect(agent.finalOutput).toBe("Validated");
+    expect(client.request.mock.calls.filter(([method]) => method === "turn/start")).toHaveLength(1);
+  });
+
+  it("propagates a genuine native context failure without truncating or retrying", async () => {
+    const agent = make();
+    const message = "Your input exceeds the context window of this model.";
+    client.run = async () => client.notify("error", { willRetry: false,
+      error: { message, codexErrorInfo: "contextWindowExceeded" } });
+    await expect(agent.prompt("原".repeat(280000))).rejects.toMatchObject({ code: "WORKER_MODEL_ERROR", message });
+    expect(agent.finalOutput).toBeUndefined();
+    expect(client.request.mock.calls.filter(([method]) => method === "turn/start")).toHaveLength(1);
+    expect(client.closed).toBe(true);
+  });
+
   it("bounds model silence after a failed tool without retrying the tool", async () => {
     const execute = vi.fn(async () => { throw new Error("fixture tool failure"); });
     const agent = new Agent({ projectRoot: "/project", initialState: make(execute).state, idleTimeoutMs: 30 });

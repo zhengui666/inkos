@@ -66,7 +66,27 @@ describe("lossless state validation context", () => {
     }
   });
 
-  it("fits the full validator envelope by sharing unchanged facts and hooks, without changing the 117760 budget", async () => {
+  it("reviews a candidate summary even when state and hooks are unchanged", async () => {
+    const agent = new StateValidatorAgent({ client, model: "fixture", projectRoot: "/fixture" });
+    await expect(agent.validate("Lin enters the archive.", 1, "same state", "same state", "same hooks", "same hooks", "en"))
+      .resolves.toMatchObject({ consistent: true });
+    expect(mock.tool).not.toHaveBeenCalled();
+    mock.tool.mockResolvedValue({ reconciliationRequired: true, reportMarkdown: "The summary invents a fire absent from the chapter." });
+    const summary = { chapter: 1, title: "Archive", characters: "Lin", events: "UNSUPPORTED_SUMMARY_Lin_burns_archive",
+      stateChanges: "", hookActivity: "", mood: "quiet", chapterType: "scene" };
+    const result = await agent.validate("Lin enters the archive.", 1, "same state", "same state", "same hooks", "same hooks", "en",
+      { chapterSummaries: "Previously accepted chapters only" }, { chapterSummary: summary });
+    expect(mock.tool).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ consistent: false, reconciliationRequired: true });
+    const messages = mock.tool.mock.calls[0][2] as LLMMessage[];
+    const prompt = messages.find(message => message.role === "user")!.content;
+    const [authority, proposed] = prompt.split("## Candidate Projection (unverified; not authority)");
+    expect(authority).toContain("Previously accepted chapters only");
+    expect(authority).not.toContain(summary.events);
+    expect(proposed).toContain(JSON.stringify(summary, null, 2));
+  });
+
+  it("preserves lossless projection sharing without imposing a made-up Codex input budget", async () => {
     const rows = Array.from({ length: 570 }, (_, i) => `| person-${i} | location | ${"史".repeat(100)} | 1 | 1 |`);
     const previous = ["# Current State", "> Current chapter: 27", ...rows, "| witness | location | outside | 27 | 27 |"].join("\n");
     const proposed = ["# Current State", "> Current chapter: 28", ...rows, "| witness | location | workshop | 28 | 28 |"].join("\n");
@@ -74,9 +94,10 @@ describe("lossless state validation context", () => {
     const authority = { storyFrame: "Author-approved frame: " + "设".repeat(1000), bookRules: "Keep the sealed letter closed.", chapterSummaries: "Every earlier chapter: " + "摘".repeat(1000) };
     const chapter = "The witness enters the workshop. The letter remains sealed.";
     const context = { client, model: "fixture", projectRoot: "/fixture" };
-    // The previous raw projection layout fails even before adding skills or authority.
-    await expect(prepareWorkerInput(context, [{ role: "user", content: previous + proposed + hooks + hooks }], 8192, "state-validator"))
-      .rejects.toMatchObject({ code: "PROTECTED_CONTEXT_OVERFLOW", budgetTokens: 117760 });
+    // Even the larger raw layout reaches Codex without a host capacity guess.
+    const raw = await prepareWorkerInput(context, [{ role: "user", content: previous + proposed + hooks + hooks }], 8192, "state-validator");
+    expect(raw.inputTokens).toBeGreaterThan(117760);
+    expect(raw.budgetTokens).toBeUndefined();
     const evidence: Array<{ type: string; payload: Record<string, unknown> }> = [];
     const result = await withExecutionEvidence((type, payload) => evidence.push({ type, payload }),
       () => new StateValidatorAgent(context).validate(chapter, 28, previous, proposed, hooks, hooks, "en", authority),
@@ -90,18 +111,18 @@ describe("lossless state validation context", () => {
     expect(reconstruct(prompt.slice(prompt.indexOf("## Hooks:"), prompt.indexOf("\n\n## Chapter Text")))).toEqual([hooks, hooks]);
     for (const source of [...Object.values(authority), chapter]) expect(prompt).toContain(source);
     expect(messages.map(message => message.content).join("\n")).toContain("Validate chapter 28 and preserve all earlier chapters.");
-    const trace = evidence.find(entry => entry.type === "context-compiled" && entry.payload.worker === "state-validator")!.payload.trace as { budgetTokens: number; finalTokens: number };
-    expect(trace.budgetTokens).toBe(117760);
+    const trace = evidence.find(entry => entry.type === "context-compiled" && entry.payload.worker === "state-validator")!.payload.trace as { budgetTokens?: number; finalTokens: number };
+    expect(trace.budgetTokens).toBeUndefined();
     expect(trace.finalTokens).toBeLessThan(80000);
   });
 
-  it.each(["authority", "unique projections", "chapter"])("still fails before any model call when protected %s cannot fit", async (source) => {
+  it.each(["authority", "unique projections", "chapter"])("passes protected %s above the former host cap intact to Codex", async (source) => {
     const huge = "权".repeat(120000);
-    await expect(new StateValidatorAgent({ client, model: "fixture", projectRoot: "/fixture" }).validate(source === "chapter" ? huge : "Full chapter", 28,
+    await new StateValidatorAgent({ client, model: "fixture", projectRoot: "/fixture" }).validate(source === "chapter" ? huge : "Full chapter", 28,
       source === "unique projections" ? huge : "old", "new", "old hooks", "new hooks", "en",
-      { storyFrame: source === "authority" ? huge : "Binding authority" }))
-      .rejects.toMatchObject({ code: "PROTECTED_CONTEXT_OVERFLOW", budgetTokens: 117760 });
-    expect(mock.tool).not.toHaveBeenCalled();
+      { storyFrame: source === "authority" ? huge : "Binding authority" });
+    expect(mock.tool).toHaveBeenCalledOnce();
+    expect((mock.tool.mock.calls[0][2] as LLMMessage[]).some(message => message.content.includes(huge))).toBe(true);
     expect(mock.text).not.toHaveBeenCalled();
   });
 
@@ -119,6 +140,7 @@ describe("lossless state validation context", () => {
 });
 
 it("preserves canonical chapter 27 through consecutive unavailable validations for chapters 28–30", async () => {
+  mock.tool.mockRejectedValue(Object.assign(new Error("Codex model context window exceeded"), { code: "WORKER_MODEL_ERROR" }));
   const root = await mkdtemp(join(tmpdir(), "inkos-validator-overflow-")); roots.push(root);
   await createInitialRuntimeState({ bookDir: root, language: "en" });
   const initial = await loadRuntimeStateSnapshot(root);
@@ -155,5 +177,5 @@ it("preserves canonical chapter 27 through consecutive unavailable validations f
     [28, 29, 30].map(chapter => [chapter, "state-validation-unavailable"]));
   expect(JSON.parse(await readFile(join(root, "chapters", "index.json"), "utf8"))).toHaveLength(3);
   expect(settleChapterState).not.toHaveBeenCalled();
-  expect(mock.tool).not.toHaveBeenCalled();
+  expect(mock.tool).toHaveBeenCalledTimes(3);
 });

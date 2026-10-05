@@ -27,20 +27,20 @@ shortCommand.command("revise")
   .description("Revise a complete short-fiction Work using its review and update its sales package")
   .argument("<story-id>")
   .requiredOption("--instruction <text>","Revision direction")
-  .option("--chars <n>","Target native length per chapter","1000")
-  .option("--model <model>","Whole-story revision model","deepseek-v4-pro")
+  .option("--chars <n>","Target native length per chapter; omitted preserves the saved Work target")
+  .option("--model <model>","Override the configured whole-story revision model")
   .option("--chapters <numbers>","Limit revision to comma-separated chapter numbers")
   .option("--json","Output JSON")
   .action(async(storyId:string,opts)=>{
     try {
       const root=findProjectRoot();const config=await loadConfig({requireApiKey:false,projectRoot:root});
-      config.modelOverrides={...config.modelOverrides,"short-reviser":opts.model};
+      if(opts.model!==undefined)config.modelOverrides={...config.modelOverrides,"short-reviser":opts.model};
       const pipeline=new PipelineRunner(buildPipelineConfig(config,root,{quiet:opts.json}));
       const skills=await resolveCliProfileSkills(root,"short-fiction");
       const result=await executeExplicitCapabilityTool({projectRoot:root,
         binding:{capabilityId:"short-fiction",actionId:"revise_short_fiction",profileId:"short-fiction",risk:"recoverable-write"},
         tool:createShortFictionReviseTool(pipeline,root,storyId,{activeSkills:()=>skills}),workId:storyId,
-        parameters:{instruction:opts.instruction,charsPerChapter:parsePositiveInteger(opts.chars,1000,"chars"),...(opts.chapters?{chapterNumbers:opts.chapters.split(",").map((number:string)=>parsePositiveInteger(number.trim(),1,"chapter"))}:{})},
+        parameters:{instruction:opts.instruction,charsPerChapter:opts.chars===undefined?undefined:parsePositiveInteger(opts.chars,SHORT_FICTION_DEFAULT_CHARS_PER_CHAPTER,"chars"),...(opts.chapters?{chapterNumbers:opts.chapters.split(",").map((number:string)=>parsePositiveInteger(number.trim(),1,"chapter"))}:{})},
       });
       log(opts.json?JSON.stringify(result,null,2):result.content??result.summary);
     } catch(error) {logCommandError("Short revision failed",error,opts.json);process.exitCode=1;}
@@ -52,8 +52,8 @@ shortCommand
   .requiredOption("--direction <text>", "Story direction, e.g. \"女频短篇 婚姻背叛 证据反杀\" or \"female-lead short: marriage betrayal, evidence payback\"")
   .option("--reference <path>", "Optional reference notes/text")
   .option("--story-id <id>", "Work id for the generated short fiction")
-  .option("--lang <language>", "Writing language: zh or en", "zh")
-  .option("--chapters <n>", "Complete short chapter count", String(SHORT_FICTION_DEFAULT_CHAPTERS))
+  .option("--lang <language>", "Writing language: zh or en; omitted uses the saved Work target, or zh for a new Work")
+  .option("--chapters <n>", "Complete short chapter count; omitted uses the saved Work target, or 5 in zh / 12 in en for a new Work")
   .option("--chars <n>", "Per-chapter length: zh characters or en words")
   .option("--min-chapter-length-ratio <ratio>", "Minimum complete chapter length relative to target (0 < ratio <= 1)", "0.5")
   .option("--llm-base-url <url>", "Override LLM base URL")
@@ -72,8 +72,8 @@ shortCommand
   .action(async (opts: ShortRunOptions) => {
     try {
       const root = findProjectRoot();
-      const language = parseShortFictionLanguage(opts.lang);
-      const chapterCount = parsePositiveInteger(
+      const language = opts.lang === undefined ? undefined : parseShortFictionLanguage(opts.lang);
+      const chapterCount = opts.chapters === undefined ? undefined : parsePositiveInteger(
         opts.chapters,
         SHORT_FICTION_DEFAULT_CHAPTERS,
         "chapters",
@@ -167,7 +167,7 @@ interface ShortRunOptions {
   readonly direction: string;
   readonly reference?: string;
   readonly storyId?: string;
-  readonly lang: string;
+  readonly lang?: string;
   readonly chapters?: string;
   readonly chars?: string;
   readonly minChapterLengthRatio?: string;

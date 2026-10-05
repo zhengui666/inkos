@@ -71,7 +71,7 @@ export function selectCodexModel(models: readonly CodexModel[], settings: CodexS
   return model;
 }
 
-/** Read-only account/catalog validation, never a model inference or billing probe. */
+/** Account/catalog RPC validation, never inference. A cold service may start App Server and its runtime state. */
 export async function inspectCodexReadiness(service: Pick<CodexAccountService, 'readAccount' | 'readSettings' | 'listModels'>): Promise<{ model: string; reasoningEffort: string; serviceTier: string }> {
   const account = await service.readAccount();
   if (!account.connected || account.account?.type !== 'chatgpt') throw new CodexConfigurationError("CODEX_AUTH_REQUIRED",

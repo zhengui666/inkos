@@ -15,9 +15,9 @@ describe("length metrics", () => {
   });
 
   it("defaults chapter length to the language-native unit", () => {
-    expect(defaultChapterLength("zh")).toBe(3000);
+    expect(defaultChapterLength("zh")).toBe(2400);
     expect(defaultChapterLength("en")).toBe(2000);
-    expect(defaultChapterLength()).toBe(3000);
+    expect(defaultChapterLength()).toBe(2400);
   });
 
   it("counts prose only for markdown-shaped Chinese chapters", () => {

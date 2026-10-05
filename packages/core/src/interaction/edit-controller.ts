@@ -1,6 +1,9 @@
 import { access, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative } from "node:path";
 import type { ChapterMeta } from "../models/chapter.js";
+import { countChapterLength, resolveLengthCountingMode, type LengthLanguage } from "../utils/length-metrics.js";
+import { loadWorkManifest } from "../harness/work-store.js";
+import { syncWorkSourceArtifacts } from "../harness/source-sync.js";
 import {
   archiveChapterVersion,
   type ChapterVersionSource,
@@ -26,6 +29,8 @@ export type EditRequest =
       readonly bookId: string;
       readonly chapterNumber: number;
       readonly fullText: string;
+      readonly expectedRevisionId?: string;
+      readonly expectedContent?: string;
       readonly versionSource?: ChapterVersionSource;
     }
   | {
@@ -59,6 +64,8 @@ export interface PlannedEditTransaction {
 }
 
 export interface EditExecutionDeps {
+  readonly projectRoot?: string;
+  readonly loadBookLanguage?: (bookId: string) => Promise<LengthLanguage>;
   readonly bookDir: (bookId: string) => string;
   readonly loadChapterIndex: (bookId: string) => Promise<ReadonlyArray<ChapterMeta>>;
   readonly saveChapterIndex: (bookId: string, index: ReadonlyArray<ChapterMeta>) => Promise<void>;
@@ -70,6 +77,10 @@ export interface ExecutedEditTransaction {
   readonly chapterNumber?: number;
   readonly touchedFiles: ReadonlyArray<string>;
   readonly summary: string;
+  readonly revisionId?: string;
+  readonly previousRevisionId?: string;
+  readonly wordCount?: number;
+  readonly stateNeedsSync?: boolean;
 }
 
 function isMissingDirectoryError(error: unknown): boolean {
@@ -332,48 +343,99 @@ function roughChapterLength(content: string): number {
     .length;
 }
 
+/** Read the existing Work revision; this never accepts or rewrites source files. */
+export async function readChapterEditRevision(projectRoot: string, bookId: string, chapterFile: string) {
+  const work = await loadWorkManifest(projectRoot, bookId);
+  const path = `source/chapters/${basename(chapterFile)}`;
+  const artifact = work.artifacts.find(item => item.revisions.some(revision =>
+    revision.id === item.currentRevisionId && revision.path === path));
+  const revision = artifact?.revisions.find(item => item.id === artifact.currentRevisionId);
+  if (!revision) return undefined;
+  const content = revision.snapshotPath ? await readFile(join(projectRoot, "works", bookId, revision.snapshotPath), "utf8")
+    .catch(error => { if (isMissingDirectoryError(error)) return undefined; throw error; }) : revision.contentBase64 === undefined ? undefined : Buffer.from(revision.contentBase64, "base64").toString("utf8");
+  return { artifactId: artifact!.id, revisionId: revision.id, content };
+}
+
+async function chapterEditLanguage(deps: EditExecutionDeps, bookId: string, root: string): Promise<LengthLanguage> {
+  if (deps.loadBookLanguage) return deps.loadBookLanguage(bookId);
+  try {
+    const book = JSON.parse(await readFile(join(root, "book.json"), "utf8"));
+    return book.language === "en" ? "en" : "zh";
+  } catch (error) {
+    // Older direct edit callers and their minimal fixtures did not need a book config.
+    if (isMissingDirectoryError(error)) return "zh";
+    throw error;
+  }
+}
+
 async function executeChapterReplace(
   deps: EditExecutionDeps,
   request: Extract<EditRequest, { kind: "chapter-replace" }>,
 ): Promise<ExecutedEditTransaction> {
   const root = deps.bookDir(request.bookId);
   const fullText = request.fullText.trim();
-  if (!fullText) {
-    throw new Error("Chapter replacement requires fullText.");
-  }
-  const { chapterPath } = await findChapterPath(root, request.chapterNumber);
+  if (!fullText) throw new Error("Chapter replacement requires fullText.");
+  const { chapterPath, chapterFile } = await findChapterPath(root, request.chapterNumber);
   const previousContent = await readFile(chapterPath, "utf-8");
-  const replacementContent = fullText.endsWith("\n") ? fullText : `${fullText}\n`;
+  const previousRevision = deps.projectRoot
+    ? await readChapterEditRevision(deps.projectRoot, request.bookId, chapterFile) : undefined;
+  // The caller's existing book lock covers the check and all subsequent writes.
+  // Omitted preconditions retain the older content-only API contract.
+  if (request.expectedRevisionId !== undefined && (
+    !previousRevision || previousRevision.revisionId !== request.expectedRevisionId
+    || (request.expectedContent === undefined && previousRevision.content !== undefined && previousRevision.content !== previousContent)
+  )) {
+    throw Object.assign(new Error("Chapter changed since it was opened. Reload before saving; your edit has not been applied."), {
+      code: "ARTIFACT_REVISION_CONFLICT",
+    });
+  }
+  if (request.expectedContent !== undefined && request.expectedContent !== previousContent) {
+    throw Object.assign(new Error("Chapter changed since it was opened. Your draft has been kept."), { code: "ARTIFACT_REVISION_CONFLICT" });
+  }
+  const replacementContent = `${fullText}\n`;
   if (replacementContent === previousContent) {
     throw new Error(`Chapter ${request.chapterNumber} already has the supplied content.`);
   }
-  await archiveChapterVersion(
-    root,
-    request.chapterNumber,
-    previousContent,
-    request.versionSource ?? "agent",
-  );
-  await writeFile(chapterPath, replacementContent, "utf-8");
+  const index = await deps.loadChapterIndex(request.bookId);
+  if (!index.some(chapter => chapter.number === request.chapterNumber)) throw new Error("Chapter index entry not found.");
+  const language = await chapterEditLanguage(deps, request.bookId, root);
+  const wordCount = countChapterLength(fullText, resolveLengthCountingMode(language));
+  const updatedIndex = recordManualEditObservation(index, request.chapterNumber,
+    "Chapter content was replaced by an explicit edit action.", wordCount).map(chapter =>
+    chapter.number !== request.chapterNumber ? chapter : { ...chapter, observations: [
+      ...chapter.observations.filter(observation => observation.code !== "state-sync-required"),
+      { code: "state-sync-required", category: "execution" as const, assessment: "unavailable" as const,
+        summary: "Chapter text changed. Reconcile its derived state before continuing the story.",
+        scope: `chapter:${request.chapterNumber}`, evidence: [] },
+    ] });
+
+  await archiveChapterVersion(root, request.chapterNumber, previousContent, request.versionSource ?? "agent");
   const removedRuntimeFiles = await clearChapterRuntimeFiles(root, request.chapterNumber);
-
-  const updatedIndex = recordManualEditObservation(
-    await deps.loadChapterIndex(request.bookId),
-    request.chapterNumber,
-    "Chapter content was replaced by an explicit edit action.",
-    roughChapterLength(fullText),
-  );
-  await deps.saveChapterIndex(request.bookId, updatedIndex);
-
+  let revisionId: string | undefined;
+  if (deps.projectRoot) {
+    // Reuse the native atomic source + immutable revision commit. Canonical truth is untouched.
+    const path = `source/chapters/${chapterFile}`;
+    const work = await syncWorkSourceArtifacts({ projectRoot: deps.projectRoot, workId: request.bookId, accept: true,
+      acceptPaths: [path, "source/chapters/index.json", ...removedRuntimeFiles.map(file => `source/${file.split("\\").join("/")}`)],
+      writes: [
+        { relativePath: join("works", request.bookId, path), content: replacementContent },
+        { relativePath: join("works", request.bookId, "source/chapters/index.json"), content: `${JSON.stringify(updatedIndex, null, 2)}\n` },
+      ],
+    });
+    const artifact = work.artifacts.find(item => item.revisions.some(revision =>
+      revision.id === item.currentRevisionId && revision.path === path));
+    revisionId = artifact?.currentRevisionId ?? undefined;
+  } else {
+    await writeFile(chapterPath, replacementContent, "utf-8");
+    await deps.saveChapterIndex(request.bookId, updatedIndex);
+  }
   return {
-    transactionType: request.kind,
-    bookId: request.bookId,
-    chapterNumber: request.chapterNumber,
-    touchedFiles: [
-      relative(root, chapterPath),
-      ...removedRuntimeFiles,
-      "chapters/index.json",
-    ],
-    summary: `Replaced chapter ${request.chapterNumber}.`,
+    transactionType: request.kind, bookId: request.bookId, chapterNumber: request.chapterNumber,
+    touchedFiles: [relative(root, chapterPath), ...removedRuntimeFiles, "chapters/index.json"],
+    summary: `Replaced chapter ${request.chapterNumber}; derived state needs synchronization.`,
+    ...(revisionId ? { revisionId } : {}),
+    ...(previousRevision ? { previousRevisionId: previousRevision.revisionId } : {}),
+    wordCount, stateNeedsSync: true,
   };
 }
 

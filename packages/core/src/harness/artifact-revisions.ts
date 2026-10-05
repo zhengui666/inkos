@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { extname, join } from "node:path";
 import { commitAtomicFileSet } from "../utils/atomic-file-set.js";
 import {
@@ -42,7 +41,6 @@ export async function stageArtifactRevision(input: {
     path,
     contentType: input.contentType,
     status: input.promote ? "current" : "candidate",
-    checksum: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
     byteLength: bytes.byteLength,
     episodeId: input.episodeId,
     createdAt: input.createdAt ?? new Date().toISOString(),
@@ -96,9 +94,9 @@ export function createCurrentArtifact(input: {
     id: revisionId,
     parentRevisionId: null,
     path: input.path,
+    contentBase64: bytes.toString("base64"),
     contentType: input.contentType,
     status: "current",
-    checksum: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
     byteLength: bytes.byteLength,
     episodeId: input.episodeId,
     createdAt: input.createdAt,

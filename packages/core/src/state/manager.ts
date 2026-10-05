@@ -1,5 +1,6 @@
 import { ownsWorkMutation } from "../utils/work-mutation-scope.js";
-import { readFile, writeFile, mkdir, readdir, rm, stat, unlink, open } from "node:fs/promises";
+import { readFile, writeFile, mkdir, readdir, rm, stat, realpath } from "node:fs/promises";
+import { openSync, closeSync, readFileSync, writeFileSync, writeSync, ftruncateSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { BookConfigSchema, type BookConfig } from "../models/book.js";
@@ -14,9 +15,9 @@ import {
 } from "../harness/work-store.js";
 import { syncWorkSourceArtifacts } from "../harness/source-sync.js";
 import { commitAtomicFileSet } from "../utils/atomic-file-set.js";
+import { withBookLockGuard } from "./book-lock-guard.js";
 
 const BOOK_LOCK_HEARTBEAT_MS = 30_000;
-const BOOK_LOCK_LEASE_MS = 3 * 60_000;
 const BOOK_LOCK_RELEASE_RETRIES = 4;
 
 interface BookLockMetadata {
@@ -30,7 +31,6 @@ interface BookLockMetadata {
 interface ProcessBookLock {
   readonly metadata: BookLockMetadata;
   heartbeatTimer?: ReturnType<typeof setInterval>;
-  heartbeatTask?: Promise<void>;
 }
 
 // Studio creates a PipelineRunner per request. Lock ownership therefore has to
@@ -129,7 +129,9 @@ export class StateManager {
   async acquireBookLock(bookId: string): Promise<() => Promise<void>> {
     if (ownsWorkMutation(this.projectRoot, bookId)) return async () => {};
     await mkdir(this.bookDir(bookId), { recursive: true });
-    const lockPath = join(this.bookDir(bookId), ".write.lock");
+    // Aliases of one physical Work must share the same in-process owner. Without
+    // this, a symlink path could mistake an active same-pid lock for an orphan.
+    const lockPath = join(await realpath(this.bookDir(bookId)), ".write.lock");
     const lockKey = this.normalizeLockKey(lockPath);
     const existingOwner = processBookLocks.get(lockKey);
     if (existingOwner) {
@@ -152,35 +154,7 @@ export class StateManager {
     processBookLocks.set(lockKey, owner);
 
     try {
-      let acquired = false;
-      for (let attempt = 0; attempt < 4 && !acquired; attempt++) {
-        try {
-          await this.createLockFile(lockPath, owner.metadata);
-          acquired = true;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException | undefined)?.code !== "EEXIST") {
-            throw error;
-          }
-
-          let snapshot: Awaited<ReturnType<StateManager["readLockSnapshot"]>>;
-          try {
-            snapshot = await this.readLockSnapshot(lockPath);
-          } catch (snapshotError) {
-            if ((snapshotError as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
-              continue;
-            }
-            throw snapshotError;
-          }
-          if (!this.isStaleLock(snapshot.metadata, snapshot.mtimeMs)) {
-            throw new BookWriteLockError(bookId, lockPath, snapshot.raw);
-          }
-          await this.removeStaleLock(lockPath, snapshot.raw);
-        }
-      }
-
-      if (!acquired) {
-        throw new BookWriteLockError(bookId, lockPath);
-      }
+      withBookLockGuard(lockPath, () => this.claimLockFile(bookId, lockPath, owner.metadata));
 
       this.startLockHeartbeat(lockPath, lockKey, owner);
       let released = false;
@@ -188,20 +162,15 @@ export class StateManager {
         if (released) return;
         released = true;
         if (owner.heartbeatTimer) clearInterval(owner.heartbeatTimer);
-        await owner.heartbeatTask;
-        if (processBookLocks.get(lockKey)?.metadata.token === owner.metadata.token) {
-          processBookLocks.delete(lockKey);
-        }
         try {
-          const snapshot = await this.readLockSnapshot(lockPath);
-          if (snapshot.metadata?.token !== owner.metadata.token) {
-            return;
-          }
-          await this.unlinkWithRetry(lockPath);
+          await this.releaseLockFile(lockPath, owner.metadata.token);
         } catch (error) {
           if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") {
             console.warn(`[inkos] Failed to release book lock ${lockPath}: ${String(error)}`);
           }
+        } finally {
+          // Keep the local reservation through guarded deletion and all retries.
+          if (processBookLocks.get(lockKey)?.metadata.token === owner.metadata.token) processBookLocks.delete(lockKey);
         }
       };
     } catch (error) {
@@ -225,22 +194,37 @@ export class StateManager {
     return `pid:${metadata.pid} started:${new Date(metadata.startedAt).toISOString()}`;
   }
 
-  private async createLockFile(lockPath: string, metadata: BookLockMetadata): Promise<void> {
-    const handle = await open(lockPath, "wx");
-    try {
-      await handle.writeFile(this.serializeLock(metadata), "utf-8");
-    } catch (error) {
-      await handle.close().catch(() => undefined);
-      await this.unlinkWithRetry(lockPath).catch(() => undefined);
-      throw error;
+  private claimLockFile(bookId: string, lockPath: string, metadata: BookLockMetadata): void {
+    // The cross-process guard covers inspection, stale deletion and new claim.
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try { this.createLockFile(lockPath, metadata); return; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      let snapshot: ReturnType<StateManager["readLockSnapshot"]>;
+      try { snapshot = this.readLockSnapshot(lockPath); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+      if (!this.isStaleLock(snapshot.metadata)) throw new BookWriteLockError(bookId, lockPath, snapshot.raw);
+      this.removeStaleLock(lockPath);
     }
-    await handle.close();
+    throw new BookWriteLockError(bookId, lockPath);
+  }
+
+  private createLockFile(lockPath: string, metadata: BookLockMetadata): void {
+    const handle = openSync(lockPath, "wx");
+    let failure: unknown;
+    try { writeFileSync(handle, this.serializeLock(metadata), "utf-8"); }
+    catch (error) { failure = error; }
+    finally { closeSync(handle); }
+    if (failure) {
+      try { unlinkSync(lockPath); }
+      catch (cleanupError) { throw new AggregateError([failure, cleanupError], "Failed to create and clean up the book lock."); }
+      throw failure;
+    }
   }
 
   private parseLockMetadata(lockData: string): Partial<BookLockMetadata> | undefined {
     try {
       const parsed = JSON.parse(lockData) as Record<string, unknown>;
-      const pid = typeof parsed.pid === "number" ? parsed.pid : undefined;
+      const pid = typeof parsed.pid === "number" && Number.isSafeInteger(parsed.pid) && parsed.pid > 0 ? parsed.pid : undefined;
       const startedAt = typeof parsed.startedAt === "number" ? parsed.startedAt : undefined;
       const heartbeatAt = typeof parsed.heartbeatAt === "number" ? parsed.heartbeatAt : startedAt;
       return {
@@ -255,77 +239,61 @@ export class StateManager {
     }
   }
 
-  private async readLockSnapshot(lockPath: string): Promise<{
+  private readLockSnapshot(lockPath: string): {
     readonly raw: string;
     readonly metadata?: Partial<BookLockMetadata>;
-    readonly mtimeMs: number;
-  }> {
-    const [raw, lockStat] = await Promise.all([
-      readFile(lockPath, "utf-8"),
-      stat(lockPath),
-    ]);
-    return { raw, metadata: this.parseLockMetadata(raw), mtimeMs: lockStat.mtimeMs };
+  } {
+    const raw = readFileSync(lockPath, "utf-8");
+    return { raw, metadata: this.parseLockMetadata(raw) };
   }
 
-  private isStaleLock(metadata: Partial<BookLockMetadata> | undefined, mtimeMs: number): boolean {
+  private isStaleLock(metadata: Partial<BookLockMetadata> | undefined): boolean {
     if (metadata?.pid === process.pid) {
       // No processBookLocks owner existed before this acquisition reserved its
       // slot, so a same-pid file here can only be orphaned from an older task.
       return true;
     }
-    if (metadata?.pid !== undefined && !this.isProcessAlive(metadata.pid)) {
-      return true;
-    }
-    const heartbeatAt = metadata?.heartbeatAt ?? mtimeMs;
-    const hasLeaseMetadata = metadata?.version === 1 && typeof metadata.token === "string";
-    return hasLeaseMetadata && Date.now() - heartbeatAt > BOOK_LOCK_LEASE_MS;
+    // Silence is not proof of exit: a paused process or an uncooperative host
+    // tool can still write. PID reuse and EPERM may retain an orphan longer,
+    // but must never authorize stealing a lock from a potentially live owner.
+    // Unknown/legacy owner metadata likewise requires explicit reconciliation.
+    return metadata?.pid !== undefined && !this.isProcessAlive(metadata.pid);
   }
 
-  private async removeStaleLock(lockPath: string, expectedRaw: string): Promise<void> {
-    const currentRaw = await readFile(lockPath, "utf-8").catch((error) => {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-      throw error;
-    });
-    if (currentRaw === undefined) return;
-    if (currentRaw !== expectedRaw) {
-      return;
-    }
-    await this.unlinkWithRetry(lockPath);
+  private removeStaleLock(lockPath: string): void {
+    // Called only within the same guard transaction as inspection and claim.
+    unlinkSync(lockPath);
   }
 
   private startLockHeartbeat(lockPath: string, lockKey: string, owner: ProcessBookLock): void {
-    const refresh = async () => {
+    const refresh = () => withBookLockGuard(lockPath, () => {
       if (processBookLocks.get(lockKey)?.metadata.token !== owner.metadata.token) return;
-      const handle = await open(lockPath, "r+");
+      const handle = openSync(lockPath, "r+");
       try {
-        const currentRaw = await handle.readFile("utf-8");
+        const currentRaw = readFileSync(handle, "utf-8");
         if (this.parseLockMetadata(currentRaw)?.token !== owner.metadata.token) return;
         owner.metadata.heartbeatAt = Date.now();
         const serialized = Buffer.from(this.serializeLock(owner.metadata), "utf-8");
-        await handle.write(serialized, 0, serialized.length, 0);
-        await handle.truncate(serialized.length);
+        writeSync(handle, serialized, 0, serialized.length, 0);
+        ftruncateSync(handle, serialized.length);
       } finally {
-        await handle.close();
+        closeSync(handle);
       }
-    };
+    });
     owner.heartbeatTimer = setInterval(() => {
-      if (owner.heartbeatTask) return;
-      const task = refresh()
-        .catch((error) => {
-          console.warn(`[inkos] Failed to refresh book lock ${lockPath}: ${String(error)}`);
-        })
-        .finally(() => {
-          if (owner.heartbeatTask === task) owner.heartbeatTask = undefined;
-        });
-      owner.heartbeatTask = task;
+      try { refresh(); }
+      catch (error) { console.warn(`[inkos] Failed to refresh book lock ${lockPath}: ${String(error)}`); }
     }, BOOK_LOCK_HEARTBEAT_MS);
     owner.heartbeatTimer.unref?.();
   }
 
-  private async unlinkWithRetry(lockPath: string): Promise<void> {
+  private async releaseLockFile(lockPath: string, token: string): Promise<void> {
     for (let attempt = 0; attempt < BOOK_LOCK_RELEASE_RETRIES; attempt++) {
       try {
-        await unlink(lockPath);
+        withBookLockGuard(lockPath, () => {
+          const snapshot = this.readLockSnapshot(lockPath);
+          if (snapshot.metadata?.token === token) unlinkSync(lockPath);
+        });
         return;
       } catch (error) {
         const code = (error as NodeJS.ErrnoException | undefined)?.code;

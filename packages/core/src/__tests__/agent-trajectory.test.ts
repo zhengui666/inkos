@@ -12,7 +12,8 @@ describe("InkOS agent trajectory metadata", () => {
   it("uses an opaque stable conversation id", () => {
     const first = opaqueConversationId("session-with-user-visible-name");
     expect(first).toBe(opaqueConversationId("session-with-user-visible-name"));
-    expect(first).toMatch(/^inkos-[0-9a-f]{32}$/);
+    expect(first).toMatch(/^inkos-session-[A-Za-z0-9_-]+$/);
+    expect(opaqueConversationId("session-with-user-visible-name", "inkos-existing-recorded-id")).toBe("inkos-existing-recorded-id");
     expect(first).not.toContain("user-visible-name");
   });
 

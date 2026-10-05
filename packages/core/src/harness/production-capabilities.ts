@@ -1,3 +1,4 @@
+import { createChapterGoalTools } from './tools/chapter-goals.js';
 import { createListResearchReportsTool, createReadResearchReportTool } from "../agent/project-research-tools.js";
 import { createProfileWorkTools } from "./tools/work-creation.js";
 import {existsSync} from "node:fs";
@@ -295,6 +296,9 @@ export function createProductionCapabilityRegistry(
       })), writeAction(createWriteChaptersTool(environment.pipeline, null, {
         language: lang, activeSkills: environment.activeSkills, workerSkills: environment.workerSkills,
       }))];
+  if (environment.work) longformTools.push(...createChapterGoalTools(environment.pipeline, environment.projectRoot, environment.work.id, {
+    activeSkills: environment.activeSkills, workerSkills: environment.workerSkills,
+  }).map(tool => tool.name === 'inspect_chapter_goal' ? readAction(tool) : committedAction(tool)));
   registerToolCapability(registry, "longform", "Long-form creation", longformTools);
 
   registerToolCapability(registry, "short-fiction", "Short fiction", [
@@ -554,7 +558,7 @@ async function normalizeToolResult(
   syncArtifacts: boolean,
   summary: string,
   artifactsCommitted = false,
-  beforeSources?: ReadonlyMap<string, string>,
+  beforeSources?: ReadonlyMap<string, Buffer>,
   existingWorkIds: ReadonlySet<string> = new Set(),
   exactCommittedArtifacts = false,
 ): Promise<ActionResult> {

@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
@@ -57,7 +56,7 @@ import {
   COVER_PROVIDER_PRESETS,
   createPlayDB,
   PlayStore,
-  playSceneImageKey,
+  findPlaySceneImageKey,
   playImageContext,
   createPlayImageTool,
   readPlayImageManifest,
@@ -124,6 +123,7 @@ import {
   createRemoveNodeTool,
   deleteLatestChapter,
   executeEditTransaction,
+  readChapterEditRevision,
   listChapterVersions,
   readChapterPlanDocument,
   readChapterUserBrief,
@@ -2805,7 +2805,6 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       const revision = artifact?.revisions.find((candidate) => candidate.id === c.req.param("revisionId"));
       if (!artifact || !revision) return c.json({ error: "Artifact revision not found" }, 404);
       const bytes = await readFile(safeChildPath(workDirectory(root, id), revision.snapshotPath ?? revision.path));
-      if (`sha256:${createHash("sha256").update(bytes).digest("hex")}` !== revision.checksum) throw new ApiError(409, "ARTIFACT_SNAPSHOT_UNAVAILABLE", "Revision content does not match its recorded checksum");
       const textLike = revision.contentType.startsWith("text/")
         || revision.contentType === "application/json";
       return c.json({
@@ -3025,7 +3024,13 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       const match = files.find((f) => f.startsWith(paddedNum) && f.endsWith(".md"));
       if (!match) return c.json({ error: "Chapter not found" }, 404);
       const content = await readFile(join(chaptersDir, match), "utf-8");
-      return c.json({ chapterNumber: num, filename: match, content });
+      const revision = await readChapterEditRevision(root, id, match);
+      // The editor returns its opened text on save; no content digest is needed.
+      const revisionId = revision?.revisionId ?? null;
+      const meta = (await state.loadChapterIndex(id)).find(chapter => chapter.number === num);
+      return c.json({ chapterNumber: num, filename: match, content, revisionId,
+        stateNeedsSync: (meta?.observations.some(observation => observation.code === "state-sync-required") ?? false)
+          || Boolean(revision?.content !== undefined && revision.content !== content) });
     } catch {
       return c.json({ error: "Chapter not found" }, 404);
     }
@@ -3164,6 +3169,8 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       );
       const result = await executeEditTransaction(
         {
+          projectRoot: root,
+          loadBookLanguage: async (bookId) => (await state.loadBookConfig(bookId)).language,
           bookDir: (bookId) => state.bookDir(bookId),
           loadChapterIndex: (bookId) => state.loadChapterIndex(bookId),
           saveChapterIndex: (bookId, index) => state.saveChapterIndex(bookId, index),
@@ -3204,13 +3211,22 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 
   app.put("/api/v1/books/:id/chapters/:num", async (c) => {
     const id = c.req.param("id");
-    const num = parseInt(c.req.param("num"), 10);
-    const { content } = await c.req.json<{ content: string }>();
+    const chapterParam = c.req.param("num");
+    const num = Number(chapterParam);
+    const { content, expectedRevisionId, expectedContent } = await c.req.json<{ content: string; expectedRevisionId?: string; expectedContent?: string }>();
+    if (!/^\d+$/.test(chapterParam) || !Number.isSafeInteger(num) || num < 1 || typeof content !== "string"
+      || (expectedRevisionId !== undefined && (typeof expectedRevisionId !== "string" || !expectedRevisionId))
+      || (expectedContent !== undefined && typeof expectedContent !== "string")) {
+      return c.json({ error: "Invalid chapter save request" }, 400);
+    }
 
-    const releaseLock = await state.acquireBookLock(id);
+    let releaseLock: Awaited<ReturnType<typeof state.acquireBookLock>> | undefined;
     try {
+      releaseLock = await state.acquireBookLock(id);
       const result = await executeEditTransaction(
         {
+          projectRoot: root,
+          loadBookLanguage: async (bookId) => (await state.loadBookConfig(bookId)).language,
           bookDir: (bookId) => state.bookDir(bookId),
           loadChapterIndex: (bookId) => state.loadChapterIndex(bookId),
           saveChapterIndex: (bookId, index) => state.saveChapterIndex(bookId, index),
@@ -3220,14 +3236,17 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           bookId: id,
           chapterNumber: num,
           fullText: content,
+          expectedRevisionId, expectedContent,
           versionSource: "manual",
         },
       );
       return c.json({ ok: true, chapterNumber: num, result });
     } catch (e) {
-      return c.json({ error: String(e) }, 500);
+      const code = (e as { code?: string }).code;
+      return c.json({ error: e instanceof Error ? e.message : String(e), code },
+        code === "ARTIFACT_REVISION_CONFLICT" || code === "BOOK_BUSY" ? 409 : 500);
     } finally {
-      await releaseLock();
+      await releaseLock?.();
     }
   });
 
@@ -4348,7 +4367,8 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const sceneTurn = (currentState as { turn?: number } | null)?.turn ?? 0;
     const currentPresentation = await store.readPresentation(worldId, runId);
     const sceneText = currentPresentation?.sceneText ?? await store.readProjection(worldId, runId, "projections/scene.md").catch(() => "");
-    const sceneEntry = manifest[playSceneImageKey(sceneTurn, sceneText, playImageContext(world ?? undefined,graph,currentState))];
+    const sceneKey = await findPlaySceneImageKey(runDir, sceneTurn, sceneText, playImageContext(world ?? undefined,graph,currentState));
+    const sceneEntry = sceneKey ? manifest[sceneKey] : undefined;
     const sceneImageUrl = sceneEntry?.status === "ready" ? imageUrlFor(sceneEntry.file) : undefined;
     // The current turn may have been replayed. Its old turn-only image cannot
     // identify which prose variant it illustrates.

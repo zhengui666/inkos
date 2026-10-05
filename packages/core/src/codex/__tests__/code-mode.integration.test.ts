@@ -1,17 +1,15 @@
 import { createServer } from 'node:http';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
-import { createCodexClient } from '../app-server.js';
+import { createLoopbackCodexClient } from './loopback-client.js';
 
 /** Exercise the advertised functions.exec path, not an injected direct function
  * call that bypasses the code-mode host. No login or external inference. */
 describe.skipIf(process.env.INKOS_CODEX_INTEGRATION !== '1')('Codex code-mode dynamic tool transport', () => {
   it.each([false, true])('runs the actual multi-tool cell only with a host (enabled=%s)', async enabled => {
     const root = await mkdtemp(join(tmpdir(), 'inkos-code-mode-'));
-    const packageRoot = dirname(createRequire(import.meta.url).resolve('@openai/codex/package.json'));
     const bodies: Array<Record<string, any>> = [];
     const calls: Array<Record<string, any>> = [];
     let resolveDone!: (result: any) => void;
@@ -40,13 +38,11 @@ describe.skipIf(process.env.INKOS_CODEX_INTEGRATION !== '1')('Codex code-mode dy
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('Missing fixture address');
-    let client: Awaited<ReturnType<typeof createCodexClient>> | undefined;
+    let client: Awaited<ReturnType<typeof createLoopbackCodexClient>> | undefined;
     try {
-      client = await createCodexClient(root, { stateRoot: join(root, 'state'), command: process.execPath,
-        args: [join(packageRoot, 'bin', 'codex.js'), '-c', 'features.enable_request_compression=false',
+      client = await createLoopbackCodexClient(root, [ '-c', 'features.enable_request_compression=false',
           ...(enabled ? [] : ['-c', 'features.code_mode_host=false']), '-c', 'model_provider="fixture"', '-c', 'model="gpt-6.1-sol"',
-          '-c', `model_providers.fixture={name="Fixture",base_url="http://127.0.0.1:${address.port}/v1",wire_api="responses",requires_openai_auth=false,supports_websockets=false,request_max_retries=0,stream_max_retries=0}`],
-      });
+          '-c', `model_providers.fixture={name="Fixture",base_url="http://127.0.0.1:${address.port}/v1",wire_api="responses",requires_openai_auth=false,supports_websockets=false,request_max_retries=0,stream_max_retries=0}`]);
       client.onRequest((method, params) => {
         if (method !== 'item/tool/call') return undefined;
         calls.push(params as Record<string, any>);

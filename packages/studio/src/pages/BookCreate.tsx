@@ -108,7 +108,7 @@ export function pickValidValue(current: string, available: ReadonlyArray<string>
 }
 
 export function defaultChapterWordsForLanguage(language: "zh" | "en"): string {
-  return language === "en" ? "2000" : "3000";
+  return language === "en" ? "2000" : "2400";
 }
 
 export function platformOptionsForLanguage(language: "zh" | "en"): ReadonlyArray<PlatformOption> {

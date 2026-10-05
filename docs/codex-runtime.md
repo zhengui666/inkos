@@ -72,16 +72,65 @@ combinations or silently downgrade a requested tier.
 Only non-secret settings are written to `.inkos/codex-config.json`:
 
 ```json
-{"model":"<model ID from Codex>","reasoningEffort":"medium","serviceTier":"default"}
+{"model":"gpt-6.1-sol","reasoningEffort":"ultra","serviceTier":"priority"}
 ```
 
-A server operator can set `INKOS_CODEX_STATE_ROOT` to a private writable directory
-when the OS home is unavailable; each project still gets its own hashed subdirectory.
-Never point it at an existing personal Codex home.
+New project-local state uses `<projectRoot>/.inkos/codex/home`. A server operator can
+set `INKOS_CODEX_STATE_ROOT` to a private writable directory; that directory then
+uses its `home` child and is not automatically divided by project. Use a distinct
+root per project. An explicit `INKOS_CODEX_HOME` or client `codexHome` takes priority
+and can retain a recorded older project account directory. Never substitute an
+unrelated personal Codex home or copy its credentials.
 
-The default model is resolved from Codex's current model catalog. Effort defaults
-to `medium` and speed to `default`. A saved unsupported combination is rejected
-with an actionable error rather than sent to a legacy API provider.
+### Startup and account checks
+
+Inkos no longer writes `config.toml` or changes permissions on existing Codex
+state directories when starting an account or worker peer. Missing directories
+are created privately; existing POSIX directories must already belong to the
+current OS user and have no group/other permissions. Incompatible permissions
+fail with an error instead of being repaired automatically.
+
+The existing project-home config, when present, is read only to check compatibility
+with the flat, JSON-valued TOML subset emitted by earlier Inkos versions. Known
+scalar/array keys are overridden using official, process-local `-c key=value`
+arguments. Empty MCP/plugin tables are accepted. Unknown keys, profiles, provider
+or instruction overrides, nonempty tables, duplicate keys, symlinks, and other
+TOML syntax fail before spawning; the existing file is not rewritten or migrated.
+This intentionally accepts less than arbitrary valid TOML. Inspect incompatible
+configuration separately rather than pointing Inkos at a personal Codex home.
+
+This guard matters because Codex merges CLI tables recursively: `-c
+mcp_servers={}` does **not** clear existing entries. Scalar and array overrides
+replace their values. The pinned implementation is documented in
+[override construction](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/config/src/overrides.rs)
+and [configuration merging](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/config/src/merge.rs).
+
+Account/catalog preflight performs no inference and uses `account/read` with
+`refreshToken: false`. A cold account service still initializes the official App
+Server. That process owns its account/runtime files and may write logs, caches,
+SQLite state, or authentication state as part of its normal lifecycle; the host's
+no-config-write guarantee is **not** a zero-write guarantee for App Server.
+Actual worker startup uses the same process isolation settings, then applies the
+saved application model/effort/tier to an ephemeral thread and starts inference.
+Neither path copies credentials or changes the saved application model settings.
+The runtime may also be subject to system/managed Codex policies; CLI overrides
+are not a way to bypass those policies.
+
+For path-only diagnosis, no App Server or account API is necessary. Check the
+actual configured `INKOS_CODEX_HOME` first, then the selected state root's `home`
+child, or the project-local default above. No content digest or project-path
+fingerprint is calculated. Check directory/config-file metadata without opening
+`auth.json`. A connected service does not prove that another process resolved the
+same account directory.
+
+Fresh application settings request `gpt-6.1-sol`, `ultra`, and `priority`; process
+startup pins the same model/effort with the official config tier `fast`. Saved
+application settings still take precedence at thread/turn creation and must match
+the current model catalog. Explicitly choosing the catalog-default model persists
+`model: null` and returns settings with no selected model, including after reread.
+A saved unsupported combination is rejected with an actionable error rather than
+sent to a legacy API provider. These values describe requested configuration, not
+proof of successful inference or an account's available quota.
 
 Codex App Server does not expose a per-turn temperature or `max_output_tokens`
 parameter. Legacy temperature/web-search worker options are deprecated. Worker

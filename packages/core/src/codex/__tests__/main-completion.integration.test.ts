@@ -1,10 +1,9 @@
 import { createServer } from 'node:http';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
-import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
-import { createCodexClient } from '../app-server.js';
+import { createLoopbackCodexClient } from './loopback-client.js';
 import { abortAgentSession, runAgentSession } from '../../agent/agent-session.js';
 import { listWorkManifests } from '../../harness/work-store.js';
 import { loadBookSession } from '../../interaction/book-session-store.js';
@@ -19,7 +18,6 @@ vi.mock('../client.js', () => ({ createCodexClient: factory }));
 describe.skipIf(process.env.INKOS_CODEX_INTEGRATION !== '1')('Codex main-agent code-mode completion', () => {
   it.each(['native', 'dynamic'])('creates once through two real host tools and completes via %s', async mode => {
     const root = await mkdtemp(join(tmpdir(), 'inkos-main-wire-'));
-    const packageRoot = dirname(createRequire(import.meta.url).resolve('@openai/codex/package.json'));
     const bodies: Array<Record<string, any>> = [];
     const calls: Array<Record<string, any>> = [];
     const starts: Array<Record<string, any>> = [];
@@ -52,11 +50,9 @@ describe.skipIf(process.env.INKOS_CODEX_INTEGRATION !== '1')('Codex main-agent c
     if (!address || typeof address === 'string') throw new Error('Missing loopback address');
     factory.mockImplementation(async () => {
       session++;
-      const peer = await createCodexClient(root, { stateRoot: join(root, 'state'), command: process.execPath,
-        args: [join(packageRoot, 'bin', 'codex.js'), '-c', 'features.enable_request_compression=false',
+      const peer = await createLoopbackCodexClient(root, [ '-c', 'features.enable_request_compression=false',
           '-c', 'model_provider="fixture"', '-c', 'model="gpt-6.1-sol"',
-          '-c', `model_providers.fixture={name="Fixture",base_url="http://127.0.0.1:${address.port}/v1",wire_api="responses",requires_openai_auth=false,supports_websockets=false,request_max_retries=0,stream_max_retries=0}`],
-      });
+          '-c', `model_providers.fixture={name="Fixture",base_url="http://127.0.0.1:${address.port}/v1",wire_api="responses",requires_openai_auth=false,supports_websockets=false,request_max_retries=0,stream_max_retries=0}`]);
       peer.onRequest((method, params) => { if (method === 'item/tool/call') calls.push(params as Record<string, any>); return undefined; });
       const request = peer.request.bind(peer);
       peer.request = async (method, params, options) => {

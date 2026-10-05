@@ -1,6 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, readdir, readFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
 import { createWorkManifest, saveWorkManifest, loadWorkManifest } from "../harness/work-store.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -36,7 +35,7 @@ describe("authoring-store", () => {
     expect(await loadAuthoringState(root, "p")).toEqual({ phase: "structure", rev: 1 });
     const work = await loadWorkManifest(root,'p');
     const artifact = work.artifacts.find(a=>a.revisions.some(r=>r.id===a.currentRevisionId&&r.path==='source/story-graph.json'))!;
-    expect(artifact.revisions.find(r=>r.id===artifact.currentRevisionId)?.checksum).toBe('sha256:'+createHash('sha256').update(await readFile(join(root,'works/p/source/story-graph.json'))).digest('hex'));
+    expect(await readFile(join(root,'works/p',artifact.revisions.find(r=>r.id===artifact.currentRevisionId)!.snapshotPath!))).toEqual(await readFile(join(root,'works/p/source/story-graph.json')));
   });
 
   it("writes a snapshot before applying, and revert restores it", async () => {

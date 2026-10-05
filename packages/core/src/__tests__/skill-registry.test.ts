@@ -113,6 +113,8 @@ describe("AgentSkills registry", () => {
         source: "builtin" as const,
       },
     ];
+    skills.push({ id: "inkos-story-deslop", name: "Prose Craft", description: "Shared prose method.",
+      body: "Preserve author voice.", source: "builtin" as const });
     const registry = createSkillRegistry({ skills });
     const work = createWorkManifest({
       id: "fanfic-work",
@@ -131,10 +133,12 @@ describe("AgentSkills registry", () => {
 
     expect(effective.usedSkills.map((skill) => skill.id)).toEqual([
       "inkos-long-writing",
+      "inkos-story-deslop",
       "inkos-fanfic-writing",
     ]);
     expect(effective.forcedSkillIds).toEqual([
       "inkos-long-writing",
+      "inkos-story-deslop",
       "inkos-fanfic-writing",
     ]);
   });
@@ -187,6 +191,7 @@ describe("AgentSkills registry", () => {
 
       expect(activations.map((item) => [item.skill.id, item.skill.source])).toEqual([
         ["inkos-long-writing", "project"],
+        ["inkos-story-deslop", "builtin"],
       ]);
       expect(messages[0]?.content).toContain("PROJECT_LONGFORM_METHOD");
     } finally {

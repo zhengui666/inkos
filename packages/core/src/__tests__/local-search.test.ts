@@ -1,4 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { DatabaseSync } from "node:sqlite";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   LocalSearchIndex,
   splitMarkdownForSearch,
@@ -87,6 +91,25 @@ describe("LocalSearchIndex", () => {
     } finally {
       index.close();
     }
+  });
+
+  it("opens legacy cache rows and updates actual fields while retaining document identity", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "inkos-search-legacy-"));
+    const path = join(dir, "index.sqlite");
+    let index = new LocalSearchIndex(path);
+    const document = {id: "saved-id", scope: "story", kind: "hook", source: "chapter.md", title: "Mentor", body: "An old debt", metadata: {chapter: 1}};
+    const db = new DatabaseSync(path);
+    try {
+      index.replaceScope("story", [document]);
+      db.prepare("UPDATE retrieval_documents SET content_hash = 'recorded-legacy-value', updated_at = 'before-update'").run();
+      index.close(); index = new LocalSearchIndex(path);
+      index.replaceScope("story", [document]);
+      expect(db.prepare("SELECT updated_at FROM retrieval_documents").get()?.updated_at).toBe("before-update");
+      index.replaceScope("story", [{...document, body: "A new journey", metadata: {chapter: 2}}]);
+      expect(index.search("debt", {scope: "story"})).toEqual([]);
+      expect(index.search("journey", {scope: "story"})[0]).toMatchObject({id: "saved-id", metadata: {chapter: 2}});
+      expect(db.prepare("SELECT rowid FROM retrieval_documents").get()?.rowid).toBe(1);
+    } finally { index.close(); db.close(); await rm(dir, {recursive: true, force: true}); }
   });
 
   it("segments Markdown without truncating the selected paragraphs", () => {

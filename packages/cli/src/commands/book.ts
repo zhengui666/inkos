@@ -1,3 +1,4 @@
+import { defaultChapterLength as defaultNovelChapterLength } from "@actalk/inkos-core";
 import { Command } from "commander";
 import { access, readFile, rm } from "node:fs/promises";
 import { createInterface } from "node:readline";
@@ -36,7 +37,7 @@ bookCommand
   .option("--genre <genre>", "Genre", "xuanhuan")
   .option("--platform <platform>", "Target platform", "tomato")
   .option("--target-chapters <n>", "Target chapter count", "200")
-  .option("--chapter-words <n>", "Words per chapter", "3000")
+  .option("--chapter-words <n>", "Per-chapter target in zh characters or en words; defaults from language")
   .option("--brief <path>", "Path to creative brief file (.md/.txt) — Architect builds from your ideas instead of generating from scratch")
   .option("--lang <language>", "Writing language: zh (Chinese) or en (English). Defaults from genre.")
   .option("--json", "Output JSON")
@@ -68,7 +69,9 @@ bookCommand
         genre: opts.genre,
         status: "outlining",
         targetChapters: parseInt(opts.targetChapters, 10),
-        chapterWordCount: parseInt(opts.chapterWords, 10),
+        chapterWordCount: opts.chapterWords === undefined
+          ? defaultNovelChapterLength(resolveCliLanguage(opts.lang ?? config.language))
+          : parseInt(opts.chapterWords, 10),
         language: resolveCliLanguage(opts.lang ?? config.language),
         createdAt: now,
         updatedAt: now,

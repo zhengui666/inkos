@@ -14,16 +14,18 @@ const PROFILE_INPUTS = [
   {
     id: "longform-novel",
     title: "Long-form novel",
+    description: "Fiction defaults to accessible commercial web fiction in the requested language: opposed interests, protagonist initiative, consequential progress and felt stage payoffs. Explicit author choices override this default.",
     capabilityIds: ["workspace", "longform", "adaptation", "visual"],
-    requiredSkillIds: ["inkos-long-writing"],
+    requiredSkillIds: ["inkos-long-writing", "inkos-story-deslop"],
     recommendedSkillIds: ["inkos-story-review"],
     artifactKinds: ["foundation", "chapter-plan", "chapter", "review", "cover"],
   },
   {
     id: "short-fiction",
     title: "Short fiction",
+    description: "Fiction defaults to accessible commercial web fiction in the requested language: opening opposition, protagonist initiative and a consequential, complete emotional payoff. Explicit author choices override this default.",
     capabilityIds: ["workspace", "short-fiction", "adaptation", "visual"],
-    requiredSkillIds: ["inkos-short-writing"],
+    requiredSkillIds: ["inkos-short-writing", "inkos-story-deslop"],
     artifactKinds: ["outline", "manuscript", "sales-package", "cover"],
   },
   {

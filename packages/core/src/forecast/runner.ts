@@ -176,7 +176,10 @@ async function isForecastStale(
 ): Promise<boolean> {
   if (forecast.status === "stale") return true;
   const context = await buildForecastContext({ bookDir, bookId });
-  return context.contextFingerprint !== forecast.contextFingerprint;
+  // Old digest-only forecasts stay readable/selectable. Their input bytes were
+  // not saved, so report freshness as stale rather than reconstructing a digest.
+  return !forecast.contextFingerprint.startsWith("{")
+    || context.contextFingerprint !== forecast.contextFingerprint;
 }
 
 async function resolveBookDir(projectRoot: string, bookId: string): Promise<string> {

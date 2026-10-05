@@ -1,7 +1,6 @@
 import { mkdtemp, readFile, rm, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createHash } from "node:crypto";
 import { afterEach, expect, it } from "vitest";
 import { commitAtomicFileSet } from "../utils/atomic-file-set.js";
 import { createInitialWorkManifestWrite } from "../harness/source-sync.js";
@@ -65,10 +64,15 @@ it('assigns the same artifact roles at creation and later registration using sto
   for(const before of legacy.artifacts){
     const after=repaired.artifacts.find(artifact=>artifact.id===before.id)!;
     const path=before.revisions[0]!.path;
-    expect(after.kind).toBe(before.id==='custom-reference'?'reference':['source/notes/plain.md','source/notes/prescript.md'].includes(path)?'script':paths.find(([value])=>value===path)![1]);
+    expect(after.kind).toBe(before.kind); // Historical roles are retained rather than inferred again from an old ID.
     if(before.metadata.kindSource)expect(after.metadata.kindSource).toBe(before.metadata.kindSource);
     expect(after.currentRevisionId).toBe(before.currentRevisionId);
-    expect(after.revisions.map(revision=>revision.checksum)).toEqual(before.revisions.map(revision=>revision.checksum));
+    expect(after.revisions.map(({id,path})=>({id,path}))).toEqual(before.revisions.map(({id,path})=>({id,path})));
+    for(const revision of after.revisions){
+      const old=before.revisions.find(item=>item.id===revision.id)!;
+      if(old.snapshotPath)expect(revision.snapshotPath).toBe(old.snapshotPath);
+      expect(await readFile(join(root,'works/roles',revision.snapshotPath!),'utf8')).toBe(writes.find(write=>write.relativePath===`works/roles/${revision.path}`)!.content);
+    }
   }
   for(const write of writes)expect(await readFile(join(root,write.relativePath),'utf8')).toBe(write.content);
 });
@@ -228,7 +232,7 @@ it("rejects invalid authority edits and atomically records valid manuscript proj
     const revision = item.revisions.find(revision => revision.id === item.currentRevisionId);
     if (!revision) continue;
     const bytes = await readFile(join(root, "works/fixture", revision.path));
-    expect(`sha256:${createHash("sha256").update(bytes).digest("hex")}`).toBe(revision.checksum);
+    expect(await readFile(join(root, "works/fixture", revision.snapshotPath!))).toEqual(bytes);
   }
   await expect(execute(JSON.stringify(draft))).rejects.toThrow();
   const packagePath = 'source/final/sales-package.json';

@@ -29,7 +29,9 @@ import { createStudioCommand, launchStudioEntry } from "./commands/studio.js";
 import { createInteractCommand, type InteractCommandHooks } from "./commands/interact.js";
 import { createTuiCommand } from "./commands/tui.js";
 import { launchTui } from "./tui/app.js";
+import { createPublishingCommand } from './commands/publishing.js';
 import { workCommand } from "./commands/work.js";
+import { createGoalCommand } from "./commands/goal.js";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json") as { version: string };
@@ -67,6 +69,8 @@ export function createProgram(hooks: ProgramHooks = {}): Command {
   program.addCommand(configCommand);
   program.addCommand(bookCommand);
   program.addCommand(workCommand);
+  program.addCommand(createGoalCommand());
+  program.addCommand(createPublishingCommand());
   program.addCommand(chapterCommand);
   program.addCommand(writeCommand);
   program.addCommand(autoCommand);

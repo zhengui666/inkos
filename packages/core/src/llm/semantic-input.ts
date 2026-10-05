@@ -1,4 +1,3 @@
-import { resolveCodexModel } from "../codex/model.js";
 import type { LLMClient } from "./provider.js";
 import { estimateTextTokens } from "./provider.js";
 
@@ -6,8 +5,9 @@ export function semanticInputBudget(
   client: LLMClient,
   options: { readonly reservedOutputTokens: number; readonly promptOverheadTokens?: number },
 ): number | undefined {
+  // Native Codex resolves its own window; do not force host-side chunking.
   const contextWindow = client._codex
-    ? resolveCodexModel(client._codex.settings).contextWindow
+    ? undefined
     : client._piModel?.contextWindow;
   if (!contextWindow || !Number.isFinite(contextWindow)) return undefined;
   const overhead = options.promptOverheadTokens ?? 4096;

@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { readFile, realpath } from "node:fs/promises";
 import { join, relative, isAbsolute } from "node:path";
 import { loadWorkManifest } from "./work-store.js";
@@ -22,6 +21,9 @@ export async function readArtifactRevision(input: {
     } });
   };
   if (!artifact || !revision) return fail("ARTIFACT_NOT_FOUND", "The requested artifact revision is not registered.");
+  if (!revision.snapshotPath && revision.contentBase64 !== undefined) {
+    return { work, artifact, revision, bytes: Buffer.from(revision.contentBase64, "base64") };
+  }
   const root = await realpath(join(input.projectRoot, "works", workId));
   let path: string;
   try { path = await realpath(join(root, revision.snapshotPath ?? revision.path)); }
@@ -32,8 +34,6 @@ export async function readArtifactRevision(input: {
   const child = relative(root, path);
   if (child === ".." || child.startsWith("../") || isAbsolute(child)) return fail("ARTIFACT_PATH_OUTSIDE_WORK", "The revision resolves outside its Work.");
   const bytes = await readFile(path);
-  if (`sha256:${createHash("sha256").update(bytes).digest("hex")}` !== revision.checksum) {
-    return fail("ARTIFACT_REVISION_CONFLICT", "The stored bytes do not match the registered revision.");
-  }
+
   return { work, artifact, revision, bytes };
 }

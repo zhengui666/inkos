@@ -43,9 +43,11 @@ export const ArtifactRevisionSchema = z.object({
   parentRevisionId: HarnessIdSchema.nullable(),
   path: RelativeArtifactPathSchema,
   snapshotPath: RelativeArtifactPathSchema.optional(),
+  contentBase64: z.string().optional(), // Initial revisions retain their bytes before snapshot files exist.
   contentType: z.string().min(1),
   status: ArtifactRevisionStatusSchema,
-  checksum: z.string().min(1),
+  // Legacy metadata is readable; new revisions use ordinary ids and immutable bytes.
+  checksum: z.string().optional(),
   byteLength: z.number().int().nonnegative(),
   episodeId: HarnessIdSchema.optional(),
   createdAt: z.string().min(1),

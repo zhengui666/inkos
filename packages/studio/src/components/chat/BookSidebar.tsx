@@ -61,12 +61,23 @@ function renderTruthBody(
 function ArtifactView({ bookId }: { readonly bookId: string }) {
   const artifactFile = useChatStore((s) => s.artifactFile);
   const artifactChapter = useChatStore((s) => s.artifactChapter);
+  return <ArtifactEditor key={JSON.stringify([bookId, artifactFile, artifactChapter])}
+    bookId={bookId} artifactFile={artifactFile} artifactChapter={artifactChapter} />;
+}
+
+function ArtifactEditor({ bookId, artifactFile, artifactChapter }: {
+  readonly bookId: string; readonly artifactFile: string | null; readonly artifactChapter: number | null;
+}) {
   const closeArtifact = useChatStore((s) => s.closeArtifact);
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState(false);
   const [editContent, setEditContent] = useState("");
   const [saving, setSaving] = useState(false);
+  const [revisionId, setRevisionId] = useState<string | undefined>();
+  const [editRevisionId, setEditRevisionId] = useState<string | undefined>();
+  const [openedContent, setOpenedContent] = useState("");
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const isChapter = artifactChapter !== null;
   const label = isChapter
@@ -76,9 +87,10 @@ function ArtifactView({ bookId }: { readonly bookId: string }) {
   useEffect(() => {
     setEditing(false);
     setLoading(true);
+    setRevisionId(undefined);
     if (isChapter) {
-      fetchJson<{ content: string }>(`/books/${bookId}/chapters/${artifactChapter}`)
-        .then((data) => setContent(data.content ?? ""))
+      fetchJson<{ content: string; revisionId?: string | null }>(`/books/${bookId}/chapters/${artifactChapter}`)
+        .then((data) => { setContent(data.content ?? ""); setRevisionId(data.revisionId ?? undefined); })
         .catch(() => setContent(null))
         .finally(() => setLoading(false));
     } else if (artifactFile) {
@@ -95,18 +107,23 @@ function ArtifactView({ bookId }: { readonly bookId: string }) {
 
   const handleEdit = useCallback(() => {
     setEditContent(content ?? "");
+    setOpenedContent(content ?? "");
+    setEditRevisionId(revisionId);
+    setSaveError(null);
     setEditing(true);
-  }, [content]);
+  }, [content, revisionId]);
 
   const handleSave = useCallback(async () => {
     setSaving(true);
+    setSaveError(null);
     try {
       if (isChapter) {
-        await fetchJson(`/books/${bookId}/chapters/${artifactChapter}`, {
+        const saved = await fetchJson<{ result: { revisionId?: string } }>(`/books/${bookId}/chapters/${artifactChapter}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content: editContent }),
+          body: JSON.stringify({ content: editContent, expectedRevisionId: editRevisionId, expectedContent: openedContent }),
         });
+        setRevisionId(saved.result.revisionId);
       } else if (artifactFile) {
         await fetchJson(`/books/${bookId}/truth/${artifactFile}`, {
           method: "PUT",
@@ -116,12 +133,12 @@ function ArtifactView({ bookId }: { readonly bookId: string }) {
       }
       setContent(editContent);
       setEditing(false);
-    } catch {
-      // keep editing state on error
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : "Save failed. Your draft has been kept.");
     } finally {
       setSaving(false);
     }
-  }, [bookId, artifactFile, artifactChapter, isChapter, editContent]);
+  }, [bookId, artifactFile, artifactChapter, isChapter, editContent, editRevisionId, openedContent]);
 
   return (
     <div className="flex flex-col h-full">
@@ -159,6 +176,7 @@ function ArtifactView({ bookId }: { readonly bookId: string }) {
           </div>
         )}
       </div>
+      {editing && saveError && <p role="alert" className="px-4 py-2 text-sm text-destructive">{saveError}</p>}
       <div className="flex-1 overflow-y-auto">
         {loading ? (
           <div className="flex items-center justify-center py-8">

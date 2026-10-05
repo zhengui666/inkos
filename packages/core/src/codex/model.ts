@@ -6,7 +6,8 @@ export function resolveCodexModel(settings: Partial<CodexSettings> = {}): Model<
   return {
     id: settings.model || "codex-default", name: settings.model || "Codex",
     api: "openai-responses", provider: "openai", baseUrl: "",
-    reasoning: true, input: ["text", "image"], contextWindow: 128_000,
+    // Zero means unknown here; App Server resolves the actual model capacity.
+    reasoning: true, input: ["text", "image"], contextWindow: 0,
     maxTokens: 8192, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
   };
 }

@@ -1,7 +1,7 @@
-import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
+import { openHarnessDatabase } from "./sqlite.js";
 import {
   HARNESS_VERSION,
   CreativeEpisodeEventSchema,
@@ -30,11 +30,7 @@ export class CreativeEpisodeStore {
 
   constructor(path: string) {
     this.ownerNamespace = path === ":memory:" ? randomUUID() : resolve(path);
-    if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
-    this.db = new DatabaseSync(path);
-    this.db.exec("PRAGMA journal_mode = WAL");
-    this.db.exec("PRAGMA foreign_keys = ON");
-    this.db.exec("PRAGMA busy_timeout = 5000");
+    this.db = openHarnessDatabase(path);
     this.initializeSchema();
     this.db.exec("BEGIN IMMEDIATE");
     try {

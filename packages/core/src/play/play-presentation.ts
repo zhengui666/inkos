@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
 export const PlayPresentationSchema = z.object({
@@ -21,6 +21,5 @@ export function legacyPresentation(turn: number, sceneText: string, transcriptRa
   const suggestedActions = latest?.role === "assistant" && latest.content?.trim() === sceneText.trim()
     && Array.isArray(latest.suggestedActions) && latest.suggestedActions.every((item: unknown) => typeof item === "string")
     ? latest.suggestedActions as string[] : null;
-  const identity = JSON.stringify({ turn, sceneText, suggestedActions });
-  return { version: 1, renderId: `legacy-${createHash("sha256").update(identity).digest("hex").slice(0,24)}`, turn, sceneText, suggestedActions };
+  return { version: 1, renderId: `legacy-${turn}-${typeof latest?.timestamp === "number" ? latest.timestamp : 0}`, turn, sceneText, suggestedActions };
 }
