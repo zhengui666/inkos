@@ -19,10 +19,7 @@ function run(args: string[], expectedStatus = 0) {
   return JSON.parse(result.stdout);
 }
 
-describe('manual publishing CLI', () => {
-  it('prepares, verifies, begins and reconciles a real package across separate CLI processes', async () => {
-    expect(run(['capabilities']).map((capability: {platform: string}) => capability.platform).sort())
-      .toEqual(['dreame', 'fanqie', 'goodnovel', 'meganovel', 'qidian', 'qimao']);
+async function prepareFixture() {
     const content = '# 第1章 归来\n\n这是待作者检查后自行提交的正文。\n';
     const writes = [{relativePath: 'works/novel/source/chapters/1.md', content}];
     const initial = createInitialWorkManifestWrite({workId: 'novel', title: '归来', profileId: 'long-form', language: 'zh', writes});
@@ -32,10 +29,30 @@ describe('manual publishing CLI', () => {
     await writeFile(join(root, 'selection.json'), JSON.stringify([{artifactId: artifact.id, revisionId: artifact.currentRevisionId, number: 1, title: '归来'}]));
     const prepared = run(['prepare', mapping.id, '--selection', 'selection.json', '--formats', 'txt,md']);
     const id = prepared.package.manifest.id;
+    return { content, writes, mapping, prepared, id };
+}
+
+describe('manual publishing CLI', () => {
+  it('prepares and verifies frozen, reusable exports across separate CLI processes', async () => {
+    expect(run(['capabilities']).map((capability: {platform: string}) => capability.platform).sort())
+      .toEqual(['dreame', 'fanqie', 'goodnovel', 'meganovel', 'qidian', 'qimao']);
+    const { content, writes, mapping, prepared, id } = await prepareFixture();
     expect(prepared.package.chapters[0].status).toBe('awaiting_submission');
     expect(await readFile(join(prepared.directory, 'chapters/000001_chapter.md'), 'utf8')).toBe(content);
-    expect(run(['prepare', mapping.id, '--selection', 'selection.json', '--formats', 'txt,md']).package.manifest.id).toBe(id);
-    expect(run(['verify', id]).package.remoteVerified).toBe(false);
+    const repeated = run(['prepare', mapping.id, '--selection', 'selection.json', '--formats', 'txt,md']);
+    expect(repeated.package.manifest.id).toBe(id);
+    expect(repeated.package).toEqual(prepared.package);
+    const verified = run(['verify', id]);
+    expect(verified.package.remoteVerified).toBe(false);
+    expect(verified.package).toEqual(prepared.package);
+    expect(prepared.package.version).toBe(0);
+    expect(run(['list', '--target', mapping.id])).toHaveLength(1);
+    expect(await readFile(join(root, writes[0]!.relativePath), 'utf8')).toBe(content);
+  }, 30000);
+
+  it('reconciles an unknown submission without replay across separate CLI processes', async () => {
+    // A separate fresh fixture proves receipt persistence without sharing state between tests.
+    const { content, writes, id } = await prepareFixture();
     expect(run(['begin', id, '1', '--version', '0', '--event-id', 'manual-1']).version).toBe(1);
     const unknown = run(['receipt', id, '1', '--version', '1', '--event-id', 'unknown-1', '--status', 'submission_unknown', '--evidence', 'The author portal timed out.']);
     expect(unknown.chapters[0].status).toBe('submission_unknown');
@@ -46,7 +63,6 @@ describe('manual publishing CLI', () => {
     expect(published.chapters[0]).toMatchObject({status: 'published_reported', provenance: 'user_reported'});
     expect(published.remoteVerified).toBe(false);
     expect(run(['show', id])).toEqual(published);
-    expect(run(['list', '--target', mapping.id])).toHaveLength(1);
     expect(await readFile(join(root, writes[0]!.relativePath), 'utf8')).toBe(content);
   }, 30000);
 
