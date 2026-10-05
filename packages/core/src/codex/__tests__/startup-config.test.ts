@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
-import { join, sep } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { CODEX_ISOLATED_CONFIG, codexIsolationArgs, createCodexClient, resolveCodexHome } from '../app-server.js';
 import { createCodexAccountService } from '../account.js';
@@ -50,7 +50,7 @@ function assertNoStateMutation(stateRoot: string) {
       expect(args.some(path => typeof path === 'string' && (path === stateRoot || path.startsWith(stateRoot + sep)))).toBe(false);
     }
   }
-  expect(vi.mocked(fs.readFile).mock.calls.some(([path]) => String(path).endsWith('/auth.json'))).toBe(false);
+  expect(vi.mocked(fs.readFile).mock.calls.some(([path]) => /[\\/]auth\.json$/.test(String(path)))).toBe(false);
 }
 async function snapshot(path: string) {
   const stat = await fs.lstat(path, { bigint: true });
@@ -66,13 +66,17 @@ describe('Codex startup config is process-local', () => {
     vi.stubEnv('INKOS_CODEX_HOME', ''); vi.stubEnv('INKOS_CODEX_STATE_ROOT', '');
     // Remove empty environment overrides rather than treating cwd as a state root.
     delete process.env.INKOS_CODEX_HOME; delete process.env.INKOS_CODEX_STATE_ROOT;
-    expect(resolveCodexHome('/fixture/one')).toBe('/fixture/one/.inkos/codex/home');
-    expect(resolveCodexHome('/fixture/two')).toBe('/fixture/two/.inkos/codex/home');
-    vi.stubEnv('INKOS_CODEX_STATE_ROOT', '/fixture/old-root');
-    expect(resolveCodexHome('/fixture/one')).toBe('/fixture/old-root/home');
-    vi.stubEnv('INKOS_CODEX_HOME', '/fixture/old-root/recorded-id');
-    expect(resolveCodexHome('/fixture/one', {stateRoot: '/ignored'})).toBe('/fixture/old-root/recorded-id');
-    expect(resolveCodexHome('/fixture/one', {codexHome: '/fixture/explicit'})).toBe('/fixture/explicit');
+    const one = resolve('/fixture/one'), two = resolve('/fixture/two');
+    const stateRoot = resolve('/fixture/old-root'), recordedHome = join(stateRoot, 'recorded-id');
+    expect(resolveCodexHome(one)).toBe(join(one, '.inkos', 'codex', 'home'));
+    expect(resolveCodexHome(two)).toBe(join(two, '.inkos', 'codex', 'home'));
+    vi.stubEnv('INKOS_CODEX_STATE_ROOT', stateRoot);
+    expect(resolveCodexHome(one)).toBe(join(stateRoot, 'home'));
+    vi.stubEnv('INKOS_CODEX_HOME', recordedHome);
+    expect(resolveCodexHome(one)).toBe(recordedHome);
+    expect(resolveCodexHome(one, {stateRoot: resolve('/ignored')})).toBe(recordedHome);
+    const explicitHome = resolve('/fixture/explicit');
+    expect(resolveCodexHome(one, {codexHome: explicitHome})).toBe(explicitHome);
   });
   it('retains existing shared bytes, inode, permissions and directories across account startup/disposal', async () => {
     const f = await fixture();

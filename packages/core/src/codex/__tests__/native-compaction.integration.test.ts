@@ -1,12 +1,11 @@
 import { createServer } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
-import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
 import { Type } from "@sinclair/typebox";
 import { Agent } from "../agent.js";
-import { createCodexClient } from "../app-server.js";
+import { createLoopbackCodexClient } from "./loopback-client.js";
 import { resolveCodexModel } from "../model.js";
 
 const factory = vi.hoisted(() => vi.fn());
@@ -17,7 +16,6 @@ vi.mock("../client.js", () => ({ createCodexClient: factory }));
 describe.skipIf(process.env.INKOS_CODEX_INTEGRATION !== "1")("Codex native compaction bridge", () => {
   it.each(["local", "remote"])("continues an ephemeral turn after native %s tool-loop compaction", async mode => {
     const root = await mkdtemp(join(tmpdir(), "inkos-native-compaction-"));
-    const packageRoot = dirname(createRequire(import.meta.url).resolve("@openai/codex/package.json"));
     const bodies: Array<Record<string, any>> = [];
     const compactionEvents: string[] = [];
     const server = createServer((request, response) => {
@@ -51,13 +49,10 @@ describe.skipIf(process.env.INKOS_CODEX_INTEGRATION !== "1")("Codex native compa
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("Missing fixture address");
     factory.mockImplementation(async () => {
-      const peer = await createCodexClient(root, {
-        stateRoot: join(root, "state"), command: process.execPath,
-        args: [join(packageRoot, "bin", "codex.js"), "-c", "features.enable_request_compression=false",
+      const peer = await createLoopbackCodexClient(root, [ "-c", "features.enable_request_compression=false",
           "-c", 'model_provider="fixture"', "-c", 'model="gpt-5.3-codex"',
           "-c", "model_context_window=10000", "-c", "model_auto_compact_token_limit=5000",
-          "-c", `model_providers.fixture={name="${mode === "remote" ? "OpenAI" : "Fixture"}",base_url="http://127.0.0.1:${address.port}/v1",wire_api="responses",requires_openai_auth=false,supports_websockets=false,request_max_retries=0,stream_max_retries=0}`],
-      });
+          "-c", `model_providers.fixture={name="${mode === "remote" ? "OpenAI" : "Fixture"}",base_url="http://127.0.0.1:${address.port}/v1",wire_api="responses",requires_openai_auth=false,supports_websockets=false,request_max_retries=0,stream_max_retries=0}`]);
       peer.onNotification((method, params) => {
         const item = (params as { item?: { type?: string } }).item;
         if (item?.type === "contextCompaction") compactionEvents.push(method);

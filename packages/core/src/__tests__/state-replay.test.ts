@@ -3,7 +3,7 @@ const faults = vi.hoisted(() => ({ destination: "" }));
 vi.mock("node:fs/promises", async importOriginal => {
   const fs = await importOriginal<typeof import("node:fs/promises")>();
   return { ...fs, rename: async (from: string, to: string) => {
-    if (faults.destination && to === faults.destination && from.includes("/staged/")) {
+    if (faults.destination && to === faults.destination && /[\\/]staged[\\/]/.test(from)) {
       faults.destination = "";
       throw new Error("injected file commit failure");
     }
@@ -108,7 +108,9 @@ function workers() {
     expect(w.calls).toEqual([28, 29, 30]); // Commit invokes no model.
     expect((await loadRuntimeStateSnapshot(f.bookDir)).manifest.lastAppliedChapter).toBe(30);
     const after = await tree(f.root);
-    for (const [path, bytes] of Object.entries(before).filter(([path]) => /source\/chapters\/\d+_.*\.md$/.test(path))) expect(after[path]).toEqual(bytes);
+    const proseBefore = Object.entries(before).filter(([path]) => /source[\\/]chapters[\\/]\d+_.*\.md$/.test(path));
+    expect(proseBefore).toHaveLength(30);
+    for (const [path, bytes] of proseBefore) expect(after[path]).toEqual(bytes);
     for (const chapter of [28, 29, 30]) {
       const snapshot = await loadRuntimeStateSnapshotAtChapter({ bookDir: f.bookDir, chapterNumber: chapter, language: "en" });
       expect(snapshot.manifest.lastAppliedChapter).toBe(chapter);
@@ -196,6 +198,7 @@ function workers() {
     const before = await tree(f.root);
     faults.destination = join(f.bookDir, "story/state/hooks.json");
     await expect(commitStateReplay({ projectRoot: f.root, plan, expectedPlanId: stateReplayPlanId(plan) })).rejects.toThrow("injected");
+    expect(faults.destination).toBe("");
     expect(await tree(f.root)).toEqual(before);
   });
   it("does not trust a snapshot directory named 27 whose manifest is 26", async () => {

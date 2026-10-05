@@ -1,11 +1,10 @@
 import { createServer } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
-import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
 import { Type } from "@sinclair/typebox";
-import { createCodexClient } from "../app-server.js";
+import { createLoopbackCodexClient } from "./loopback-client.js";
 import { runWorkerAgentTool } from "../../agent/worker-agent.js";
 import { prepareWorkerInput } from "../../agents/base.js";
 import { RadarResultToolSchema } from "../../agents/radar-tool.js";
@@ -20,7 +19,6 @@ vi.mock("../client.js", () => ({ createCodexClient: factory }));
 describe.skipIf(process.env.INKOS_CODEX_INTEGRATION !== "1")("Codex native structured worker transport", () => {
   it.each(["radar", "open-schema", "dynamic", "large-input"])("validates %s through the production worker", async mode => {
     const root = await mkdtemp(join(tmpdir(), "inkos-worker-wire-"));
-    const packageRoot = dirname(createRequire(import.meta.url).resolve("@openai/codex/package.json"));
     const bodies: Array<Record<string, any>> = [];
     const dynamicCalls: unknown[] = [];
     const value = mode === "radar"
@@ -50,12 +48,9 @@ describe.skipIf(process.env.INKOS_CODEX_INTEGRATION !== "1")("Codex native struc
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("Missing fixture address");
     factory.mockImplementation(async () => {
-      const peer = await createCodexClient(root, {
-      stateRoot: join(root, "state"), command: process.execPath,
-      args: [join(packageRoot, "bin", "codex.js"), "-c", "features.enable_request_compression=false",
+      const peer = await createLoopbackCodexClient(root, [ "-c", "features.enable_request_compression=false",
         "-c", 'model_provider="fixture"', "-c", 'model="gpt-5.3-codex"',
-        "-c", `model_providers.fixture={name="Fixture",base_url="http://127.0.0.1:${address.port}/v1",wire_api="responses",requires_openai_auth=false,supports_websockets=false,request_max_retries=0,stream_max_retries=0}`],
-      });
+        "-c", `model_providers.fixture={name="Fixture",base_url="http://127.0.0.1:${address.port}/v1",wire_api="responses",requires_openai_auth=false,supports_websockets=false,request_max_retries=0,stream_max_retries=0}`]);
       peer.onRequest((method, params) => { if (method === "item/tool/call") dynamicCalls.push(params); return undefined; });
       return peer;
     });
