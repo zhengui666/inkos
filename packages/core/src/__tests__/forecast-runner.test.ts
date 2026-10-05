@@ -99,6 +99,19 @@ describe("narrative forecast mini-flow", () => {
     expect({ stale: loaded.stale, status: loaded.forecast.status }).toEqual({ stale: true, status: "stale" });
   });
 
+  it("keeps older digest-only forecasts readable and selectable without recomputing them", async () => {
+    const { root } = await fixture();
+    stubForecastAgent();
+    const created = await createNarrativeForecast({projectRoot: root, bookId: "demo-book", divergence: "A choice", runtime: runtime(root)});
+    await writeFile(created.forecastJsonPath, JSON.stringify({...created.forecast, contextFingerprint: "legacy-recorded-input"}));
+    const loaded = await getNarrativeForecast({projectRoot: root, bookId: "demo-book", forecastId: created.forecast.forecastId});
+    expect(loaded.stale).toBe(true);
+    expect(loaded.forecast.forecastId).toBe(created.forecast.forecastId);
+    const selected = await selectNarrativeBranch({projectRoot: root, bookId: "demo-book", forecastId: created.forecast.forecastId, branchId: "branch-1"});
+    expect(selected.branch.branchId).toBe("branch-1");
+    expect(await readFile(selected.planPath, "utf8")).toContain("接受提议");
+  });
+
   it("does not write a selection artifact for an unknown branch", async () => {
     const { root } = await fixture();
     stubForecastAgent();

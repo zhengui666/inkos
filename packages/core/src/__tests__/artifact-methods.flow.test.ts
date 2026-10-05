@@ -46,7 +46,7 @@ it('reviews a pinned graph with deterministic structural facts and persists the 
     const reviewed=await createArtifactMethodTools(pipeline,root,'film')[0]!.execute('review',{artifactId:artifact.id,revisionId:revision.id,instruction:'Review this saved revision against the current requirements.'});
     expect(requests).toHaveLength(1);
     const input=JSON.parse(requests[0].messages.find((m:any)=>m.role==='user').content);
-    expect(input.structure).toMatchObject({revisionId:revision.id,targetHash:revision.checksum,nodeCount:2,longestObservedSimpleRoute:{choices:1},delivery:{status:'needs_revision',issues:expect.arrayContaining([{code:'FILM_NODE_COUNT',expected:3,actual:2}])}});
+    expect(input.structure).toMatchObject({revisionId:revision.id,nodeCount:2,longestObservedSimpleRoute:{choices:1},delivery:{status:'needs_revision',issues:expect.arrayContaining([{code:'FILM_NODE_COUNT',expected:3,actual:2}])}});
     const report=JSON.parse(await readFile(join(root,'works/film',(reviewed.details as {path:string}).path),'utf8'));
     expect(report.structure).toEqual(input.structure);
   }finally{await rm(root,{recursive:true,force:true});}
@@ -76,14 +76,14 @@ it('reviews an explicit candidate snapshot without adopting it or unrelated sour
     const after=await loadWorkManifest(root,'candidate');
     for(const original of before.artifacts) expect(after.artifacts.find(a=>a.id===original.id)).toEqual(original);
     const report=JSON.parse(await readFile(join(root,'works/candidate',(result.data as {path:string}).path),'utf8'));
-    expect(report).toMatchObject({artifactId:target.id,revisionId:target.revisions[0].id,targetHash:target.revisions[0].checksum,scope:authorRequest,coordinatorInstruction:delegatedInstruction,reviewBasis:'author_request'});
+    expect(report).toMatchObject({artifactId:target.id,revisionId:target.revisions[0].id,scope:authorRequest,coordinatorInstruction:delegatedInstruction,reviewBasis:'author_request'});
     const request = JSON.parse([...requests[0]!.messages].reverse().find(message => message.role === 'user')!.content);
     expect(request).toMatchObject({instruction:authorRequest});
     expect(request).not.toHaveProperty('reviewFocus');
     const authorContexts=requests[0]!.messages.flatMap(message=>message.content.split('\n\n')).flatMap(block=>{try{const value=JSON.parse(block);return value.authorRequest?[value.authorRequest]:[];}catch{return[];}});
     expect(authorContexts).toEqual([authorRequest]);
     expect(currentExecutionAuthorRequest()).toBeUndefined();
-    expect(request.sources[0]).toMatchObject({revisionId:target.revisions[0].id,checksum:target.revisions[0].checksum});
+    expect(request.sources[0]).toMatchObject({revisionId:target.revisions[0].id});
     expect(request.sources[0].measurements).toEqual(report.measurements);
     expect(report.measurements).toMatchObject({scope:'full_artifact',lineCount:1,hanCharacters:0,englishWords:4});
     expect(result.data).toMatchObject({artifactId:target.id,revisionId:target.revisions[0].id,measurements:report.measurements});
@@ -120,7 +120,7 @@ it('reviews a sales package with the manuscript and outline versions used to cre
     for(const source of input.sources){
       const artifact=work.artifacts.find(item=>item.id===source.sourceId)!;
       const revision=artifact.revisions.find(item=>item.id===artifact.currentRevisionId)!;
-      expect(source).toMatchObject({revisionId:revision.id,checksum:revision.checksum,path:revision.path});
+      expect(source).toMatchObject({revisionId:revision.id,path:revision.path});
     }
     expect(result.details).toMatchObject({kind:'artifact_reviewed',reviewedReferences:expect.any(Array)});
     expect((result.details as {reviewedReferences:unknown[]}).reviewedReferences).toHaveLength(2);
@@ -144,7 +144,7 @@ it('regenerates a cover into the active canonical Work and preserves its earlier
     const before=await syncWorkSourceArtifacts({projectRoot:root,workId:'cover-test',accept:true});
     const source=before.artifacts.find(a=>a.revisions.some(r=>r.path==='source/source-material.md'))!;
     const sourceRevision=source.revisions.find(r=>r.id===source.currentRevisionId)!;
-    const sourceReference={artifactId:source.id,revisionId:sourceRevision.id,checksum:sourceRevision.checksum,content:storySource};
+    const sourceReference={artifactId:source.id,revisionId:sourceRevision.id,content:storySource};
     const initialContext={intro:'A tailor prepares a community performance.',sellingPoints:['A repaired costume brings old friends together.']};
     const generated=await createGenerateCoverTool(root,{activeWorkId:'cover-test'}).execute('cover',{
       title:'Fixture',...initialContext,coverPrompt:'Revised visual direction',outputDir:'works/cover-test/source',
@@ -166,7 +166,7 @@ it('regenerates a cover into the active canonical Work and preserves its earlier
     const updated=await syncWorkSourceArtifacts({projectRoot:root,workId:'cover-test',accept:true,writes:[{relativePath:'works/cover-test/source/source-material.md',content:updatedSource}]});
     const updatedArtifact=updated.artifacts.find(a=>a.id===source.id)!;
     const updatedRevision=updatedArtifact.revisions.find(r=>r.id===updatedArtifact.currentRevisionId)!;
-    const currentReference={artifactId:source.id,revisionId:updatedRevision.id,checksum:updatedRevision.checksum,content:updatedSource};
+    const currentReference={artifactId:source.id,revisionId:updatedRevision.id,content:updatedSource};
     await createGenerateCoverTool(root,{activeWorkId:'cover-test'}).execute('updated-source',{title:'Fixture',coverPrompt:'Use a quieter composition.'});
     const currentRequest=JSON.parse(requests.at(-1)!.prompt.split('```json\n').at(-1)!.split('\n```')[0]!);
     expect(currentRequest.storyReference).toEqual({title:'Fixture',synopsis:'',sellingPoints:[],sources:[currentReference]});

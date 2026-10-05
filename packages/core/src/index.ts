@@ -101,7 +101,7 @@ export {
   buildPlayEntityImagePrompt,
   buildPlaySceneImagePrompt,
   playImageContext,
-  playSceneImageKey,
+  findPlaySceneImageKey,
   readPlayImageManifest,
   setPlayImageEntry,
   playImageFileName,
@@ -300,6 +300,7 @@ export {
 } from "./interaction/truth-authority.js";
 export {
   executeEditTransaction,
+  readChapterEditRevision,
   planEditTransaction,
   type EditRequest,
   type EditExecutionDeps,
@@ -604,3 +605,19 @@ export * from "./codex/settings.js";
 export * from "./codex/types.js";
 
 export { inspectCodexReadiness, selectCodexModel, CodexConfigurationError } from "./codex/account.js";
+export { GoalStore } from "./goals/store.js";
+export { GoalExecutor } from "./goals/executor.js";
+export { chapterGoalInput, createChapterGoalAdapter, CHAPTER_GOAL_KIND } from "./goals/chapters.js";
+export { GoalSchema, GoalInputSchema, GoalStepSchema, GoalReceiptSchema } from "./goals/contracts.js";
+export type {
+  Goal, GoalInput, GoalStep, GoalReceipt, GoalStatus, GoalError, GoalEvent,
+  GoalLease, GoalReconciliation, GoalStepAdapter, GoalStepContext,
+} from "./goals/contracts.js";
+
+export { prepareStateReplay, commitStateReplay, stateReplayPlanId, hashStateReplayPlan, StateReplayPlanSchema,
+  type StateReplayPlan, type StateReplayWorkers, type PrepareStateReplayInput } from "./state/state-replay.js";
+
+export * from './publishing/index.js';
+export { ChapterGoalService, chapterGoalView,
+  type ChapterGoalCreateInput, type ChapterGoalServiceOptions, type GoalPipeline } from './goals/service.js';
+export { createChapterGoalTools } from './harness/tools/chapter-goals.js';

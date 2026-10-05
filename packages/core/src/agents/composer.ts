@@ -1,4 +1,3 @@
-import { resolveCodexModel } from "../codex/model.js";
 import { readFile, mkdir, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { BaseAgent, prepareWorkerInput } from "./base.js";
@@ -321,7 +320,7 @@ export class ComposerAgent extends BaseAgent {
       outlineSectionSelector: input.outlineSectionSelector ?? ((request) => this.selectOutlineSections(request)),
       memorySemanticSelector: input.memorySemanticSelector ?? ((request) => this.selectMemoryCandidates(request)),
     };
-    if (contextBudget && !input.outlineSectionSelector && !input.memorySemanticSelector) {
+    if ((contextBudget || this.ctx.client._codex) && !input.outlineSectionSelector && !input.memorySemanticSelector) {
       const reference = await loadReferenceContext(configured);
       const complete = await this.completeContextWithinBudget(input.bookDir, input.plan, input.book.language, contextBudget, reference.entries);
       if (complete) return persistComposedContext(configured, complete, reference);
@@ -352,7 +351,7 @@ export class ComposerAgent extends BaseAgent {
       plannerInputs: [],
     };
     const budget = input.contextBudget ?? contextBudgetFromClient(this.ctx.client);
-    const complete = budget ? await this.completeContextWithinBudget(input.bookDir, plan, input.language, budget) : undefined;
+    const complete = budget || this.ctx.client._codex ? await this.completeContextWithinBudget(input.bookDir, plan, input.language, budget) : undefined;
     const selected = complete ?? await collectSelectedContext(
       join(input.bookDir, "story"),
       plan,
@@ -367,18 +366,18 @@ export class ComposerAgent extends BaseAgent {
   }
 
   private async completeContextWithinBudget(
-    bookDir: string, plan: PlanChapterOutput, language: "zh" | "en", budget: ContextBudget,
+    bookDir: string, plan: PlanChapterOutput, language: "zh" | "en", budget: ContextBudget | undefined,
     references: ContextPackage["selectedContext"] = [],
   ): Promise<Awaited<ReturnType<typeof collectSelectedContext>> | undefined> {
-    // Reserve the other half for the consumer's instructions, methods, current
-    // manuscript and protocol. This is a context allocation, not a prose limit.
-    const contextAllowance = Math.floor((budget.contextWindowTokens - Math.max(0, budget.reservedOutputTokens)) / 2);
-    if (contextAllowance <= 0) return undefined;
+    // With an explicit provider budget, reserve half for the consumer envelope.
+    // Native Codex has no host capacity guess: retain the complete source corpus.
+    const contextAllowance = budget ? Math.floor((budget.contextWindowTokens - Math.max(0, budget.reservedOutputTokens)) / 2) : undefined;
+    if (contextAllowance !== undefined && contextAllowance <= 0) return undefined;
     const complete = await collectSelectedContext(join(bookDir, "story"), plan, language,
       async request => request.candidates.map(candidate => candidate.source),
       async request => request.candidates.map(candidate => candidate.id));
     const tokens = estimateSelectedContextTokens([...complete.entries, ...references]);
-    if (tokens > contextAllowance) return undefined;
+    if (contextAllowance !== undefined && tokens > contextAllowance) return undefined;
     recordExecutionEvidence("context-selection", {scope:"story_context",mode:"complete",estimatedTokens:tokens,budgetTokens:contextAllowance,
       sourceCount:complete.entries.length,modelCalls:0});
     return {...complete,retrievalTrace:{...complete.retrievalTrace,selectionMode:"complete",semanticSelectedIds:[]}};
@@ -629,7 +628,7 @@ async function loadReferenceContext(input: ComposeChapterInput): Promise<BookRef
 
 export function contextBudgetFromClient(client: LLMClient): ContextBudget | undefined {
   const contextWindowTokens = client._codex
-    ? resolveCodexModel(client._codex.settings).contextWindow
+    ? undefined
     : client._piModel?.contextWindow;
   if (!Number.isFinite(contextWindowTokens) || !contextWindowTokens || contextWindowTokens <= 0) {
     return undefined;

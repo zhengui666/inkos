@@ -1,6 +1,7 @@
 import { BaseAgent } from "./base.js";
 import { StateValidationToolSchema } from "./state-validation-tool.js";
 import type { Observation } from "../models/observation.js";
+import type { ChapterSummaryRow } from "../models/runtime-state.js";
 import { renderProjectionComparison } from "./state-validation-context.js";
 
 export interface ValidationResult {
@@ -13,6 +14,11 @@ export interface StateValidationAuthorityContext {
   readonly storyFrame?: string;
   readonly bookRules?: string;
   readonly chapterSummaries?: string;
+}
+
+/** Proposed derived content to check against the prose, never an accepted authority. */
+export interface StateValidationCandidateProjection {
+  readonly chapterSummary?: ChapterSummaryRow;
 }
 
 /**
@@ -35,8 +41,9 @@ export class StateValidatorAgent extends BaseAgent {
     newHooks: string,
     language: "zh" | "en" = "zh",
     authorityContext?: StateValidationAuthorityContext,
+    candidateProjection?: StateValidationCandidateProjection,
   ): Promise<ValidationResult> {
-    if (oldState === newState && oldHooks === newHooks) {
+    if (oldState === newState && oldHooks === newHooks && !candidateProjection?.chapterSummary) {
       return { observations: [], consistent: true, reconciliationRequired: false };
     }
 
@@ -45,9 +52,12 @@ export class StateValidatorAgent extends BaseAgent {
       : "用中文回答。";
 
     const systemPrompt = `Validate the derived truth projection against the current chapter and supplied authority using the activated long-writing Skill. ${langInstruction}
-Do not rewrite the chapter or silently resolve contradictory sources. A hook marked superseded retains an explicitly withdrawn plan for history; its original premise is not active canon or a future promise. Verify its notes against the current withdrawal authority, rather than requiring that premise to occur in the chapter. Set reconciliationRequired=true only when a different truth projection can resolve the mismatch; a contradiction inside the chapter or between authorities remains a reported observation and does not authorize another settlement pass. Submit the Boolean decision and a concise Markdown report with concrete evidence through the validation tool. Use an empty report when there are no findings.`;
+Do not rewrite the chapter or silently resolve contradictory sources. Candidate projections are unverified derived content, not authority. Check every supplied candidate chapter summary against the chapter text; unsupported events, characters, state changes or hook activity require reconciliation before that summary can become future context. A hook marked superseded retains an explicitly withdrawn plan for history; its original premise is not active canon or a future promise. Verify its notes against the current withdrawal authority, rather than requiring that premise to occur in the chapter. Set reconciliationRequired=true only when a different truth projection can resolve the mismatch; a contradiction inside the chapter or between authorities remains a reported observation and does not authorize another settlement pass. Submit the Boolean decision and a concise Markdown report with concrete evidence through the validation tool. Use an empty report when there are no findings.`;
 
     const authorityBlock = this.buildAuthorityContextBlock(authorityContext);
+    const candidateBlock = candidateProjection?.chapterSummary
+      ? `\n\n## Candidate Projection (unverified; not authority)\n### Candidate Chapter Summary\n${JSON.stringify(candidateProjection.chapterSummary, null, 2)}`
+      : "";
 
     const userPrompt = `Chapter ${chapterNumber} validation:
 
@@ -55,7 +65,7 @@ ${authorityBlock}
 
 ${renderProjectionComparison("State Card", oldState, newState)}
 
-${renderProjectionComparison("Hooks", oldHooks, newHooks)}
+${renderProjectionComparison("Hooks", oldHooks, newHooks)}${candidateBlock}
 
 ## Chapter Text (for reference)
 ${chapterContent}`;

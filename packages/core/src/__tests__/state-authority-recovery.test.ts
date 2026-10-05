@@ -7,7 +7,6 @@ import type {WriteChapterOutput} from '../agents/writer.js';
 import type {ValidationResult} from '../agents/state-validator.js';
 import {StateValidatorAgent} from '../agents/state-validator.js';
 import {createLLMClient} from '../llm/provider.js';
-import {createHash} from 'node:crypto';
 
 it('retains the same authority context through initial validation and settlement reconciliation',async()=>{
   const authority={storyFrame:'Current author-approved setting',bookRules:'Current professional boundary',chapterSummaries:'Earlier chapters only'};
@@ -33,8 +32,7 @@ it('requires a concrete report for reconciliation and preserves it through a Cod
     const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:'https://fixture.invalid/v1',apiFormat:'chat',stream:true,temperature:0,thinkingBudget:0});
     const result=await new StateValidatorAgent({client,model:'fixture',projectRoot:'/tmp'}).validate('Current chapter',1,'Prior state','Proposed state','Prior hooks','Proposed hooks','en',{storyFrame:'Current authority'});
     expect(result).toMatchObject({consistent:false,reconciliationRequired:true,observations:[{code:'state-reconciliation'}]});
-    const sha=(value:string)=>createHash('sha256').update(value).digest('hex');
-    expect(sha(result.observations[0].summary)).toBe(sha(report));
+    expect(result.observations[0].summary).toBe(report);
     expect(requests).toHaveLength(2);
     expect(JSON.parse(requests[1].messages.find(m=>m.role==='tool')!.content)).toMatchObject({code:'STATE_RECONCILIATION_REASON_REQUIRED'});
   }finally{codex.create.mockReset();}

@@ -1,3 +1,5 @@
+import { prepareStateReplay, commitStateReplay } from "../state/state-replay.js";
+import { withWorkMutationScope } from "../utils/work-mutation-scope.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {readPinnedParentCanon} from "../harness/parent-canon.js";
 import {renderChapterDocument,chapterDocumentBody} from '../utils/chapter-document.js';
@@ -7,7 +9,7 @@ import type { LLMClient, OnStreamProgress } from "../llm/provider.js";
 import { createLLMClient } from "../llm/provider.js";
 import type { Logger } from "../utils/logger.js";
 import type { BookConfig, FanficMode } from "../models/book.js";
-import type { ChapterMeta } from "../models/chapter.js";
+import { mergeChapterReviewObservations, type ChapterMeta } from "../models/chapter.js";
 import type { NotifyChannel, LLMConfig, AgentLLMOverride } from "../models/project.js";
 import { ArchitectAgent, type ArchitectOutput } from "../agents/architect.js";
 import { PlannerAgent, type PlanChapterOutput } from "../agents/planner.js";
@@ -201,6 +203,7 @@ export class PipelineRunner {
     readonly signal?: AbortSignal;
     readonly activatedSkills?: ReadonlyArray<ActivatedSkillGuidance>;
     readonly workerSkills?: (agent: string) => ReadonlyArray<ActivatedSkillGuidance>;
+    readonly stateRecoveryRange?: { readonly startChapter: number; readonly endChapter: number };
   }>();
 
   constructor(config: PipelineConfig) {
@@ -223,6 +226,7 @@ export class PipelineRunner {
       readonly signal?: AbortSignal;
       readonly activatedSkills?: ReadonlyArray<ActivatedSkillGuidance>;
       readonly workerSkills?: (agent: string) => ReadonlyArray<ActivatedSkillGuidance>;
+    readonly stateRecoveryRange?: { readonly startChapter: number; readonly endChapter: number };
     },
     task: () => Promise<T>,
   ): Promise<T> {
@@ -231,6 +235,7 @@ export class PipelineRunner {
       signal: context.signal ?? current?.signal,
       activatedSkills: context.activatedSkills ?? current?.activatedSkills,
       workerSkills: context.workerSkills ?? current?.workerSkills,
+      stateRecoveryRange: context.stateRecoveryRange ?? current?.stateRecoveryRange,
     };
     merged.signal?.throwIfAborted();
     return this.operationContext.run(merged, async () => {
@@ -862,7 +867,7 @@ export class PipelineRunner {
         ? {
             ...ch,
             updatedAt: new Date().toISOString(),
-            observations: [...result.observations],
+            observations: mergeChapterReviewObservations(ch.observations, result.observations),
           }
         : ch,
     );
@@ -1265,6 +1270,39 @@ export class PipelineRunner {
     }
   }
 
+  private async reconcileEditedChaptersForWrite(bookId: string): Promise<void> {
+    const index = await this.state.loadChapterIndex(bookId);
+    const edited = index.filter(chapter => chapter.observations.some(observation => observation.code === "state-sync-required"));
+    if (!edited.length) return;
+    const startChapter = Math.min(...edited.map(chapter => chapter.number));
+    const endChapter = Math.max(...index.map(chapter => chapter.number));
+    const authorized = this.operationContext.getStore()?.stateRecoveryRange;
+    const signal = this.currentAbortSignal();
+    if (!authorized || !signal || authorized.startChapter > startChapter || authorized.endChapter < endChapter) {
+      throw Object.assign(new Error(`Writing needs the retained state for chapters ${startChapter}–${endChapter}. No extra model work was started.`), {
+        code: "CHAPTER_STATE_RECOVERY_REQUIRED", bookId,
+        requiredRange: { startChapter, endChapter }, recoveryAction: "chapter replay-state",
+      });
+    }
+    signal.throwIfAborted();
+    const language = await this.resolveBookLanguageById(bookId);
+    this.logStage(language, { zh: `同步保留第${startChapter}–${endChapter}章状态，再继续新章`,
+      en: `recovering retained chapter ${startChapter}–${endChapter} state before continuing` });
+    // This private path is already inside the caller's book lock. Reuse that
+    // ownership in the existing replay path instead of acquiring a second lock.
+    await withWorkMutationScope(this.config.projectRoot, bookId, async () => async () => {}, async () => {
+      const plan = await prepareStateReplay({ projectRoot: this.config.projectRoot, bookId,
+        baselineChapter: startChapter - 1, signal,
+        createWorkers: isolatedRoot => ({
+          writer: new WriterAgent({ ...this.agentCtxFor("writer", bookId), projectRoot: isolatedRoot, runtimeProjectRoot: this.config.projectRoot }),
+          validator: new StateValidatorAgent({ ...this.agentCtxFor("state-validator", bookId), projectRoot: isolatedRoot, runtimeProjectRoot: this.config.projectRoot }),
+        }),
+      });
+      signal.throwIfAborted();
+      await commitStateReplay({ projectRoot: this.config.projectRoot, plan, expectedPlanId: plan.id, signal });
+    });
+  }
+
   private async _writeNextChapterLocked(
     bookId: string,
     wordCount?: number,
@@ -1277,6 +1315,7 @@ export class PipelineRunner {
         code: "WORK_NOT_READY", workId: bookId, recoveryAction: "revise_foundation",
       });
     }
+    await this.reconcileEditedChaptersForWrite(bookId);
     const chapterNumber = await this.state.getNextChapterNumber(bookId);
     const paddedChapter = String(chapterNumber).padStart(4, "0");
     const sourceBefore = await captureWorkSourceState(this.config.projectRoot, bookId);

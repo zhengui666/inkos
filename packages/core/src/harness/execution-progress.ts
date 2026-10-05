@@ -1,11 +1,10 @@
 import type {AgentMessage} from '../codex/contracts.js';
-import {createHash} from 'node:crypto';
 import {actionResultFacts} from './action-observation.js';
 
 /** Exact receipts from tool exchanges. These record actions, never infer task completion. */
 export function executionProgress(messages: readonly AgentMessage[], maxChars: number): string {
   const calls=new Map<string,{name:string;arguments:Record<string,unknown>}>();
-  const entries:Array<{tool:string;status:'success'|'error';arguments:Record<string,unknown>;resultHash:string;facts?:Record<string,unknown>;execution?:{risk:string;status:string;artifacts:unknown[]}}>=[];
+  const entries:Array<{tool:string;status:'success'|'error';arguments:Record<string,unknown>;facts?:Record<string,unknown>;execution?:{risk:string;status:string;artifacts:unknown[]}}>=[];
   for(const message of messages){
     if(message.role==='assistant')for(const part of message.content)if(part.type==='toolCall')calls.set(part.id,{name:part.name,arguments:part.arguments});
     if(message.role!=='toolResult')continue;
@@ -14,7 +13,7 @@ export function executionProgress(messages: readonly AgentMessage[], maxChars: n
     const details=message.details as {data?:Record<string,unknown>;hostExecution?:{risk:string;status:string;artifacts:unknown[]}}|undefined;
     const data=(details?.data??details) as Record<string,unknown>|undefined;
     const facts=actionResultFacts(data);
-    entries.push({tool:call.name,status:message.isError?'error':'success',arguments:args,resultHash:createHash('sha256').update(JSON.stringify(message.content)).digest('hex').slice(0,16),...(Object.keys(facts).length?{facts}:{}),...(details?.hostExecution?{execution:details.hostExecution}:{})});
+    entries.push({tool:call.name,status:message.isError?'error':'success',arguments:args,...(Object.keys(facts).length?{facts}:{}),...(details?.hostExecution?{execution:details.hostExecution}:{})});
   }
   if(!entries.length)return '';
   const readPaths=[...new Set(entries.filter(e=>e.status==='success'&&e.tool.split('__').at(-1)==='read').map(e=>e.arguments.path).filter((p):p is string=>typeof p==='string'))];

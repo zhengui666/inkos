@@ -3,9 +3,9 @@ const codex = vi.hoisted(() => ({ create: vi.fn() }));
 vi.mock('../codex/client.js', () => ({ createCodexClient: codex.create }));
 import{Type}from'@sinclair/typebox';
 import{createServer}from'node:http';import{once}from'node:events';import{mkdtemp,readFile,writeFile,rm}from'node:fs/promises';
-import{tmpdir}from'node:os';import{join}from'node:path';import{createHash}from'node:crypto';import{it,expect,vi}from'vitest';
+import{tmpdir}from'node:os';import{join}from'node:path';import{it,expect,vi}from'vitest';
 import{PlayCurrentStateSchema}from'../models/play.js';
-import{PlayStore}from'../play/play-store.js';import{playSceneImageKey,readPlayImageManifest,generatePlayImage,playImageContext,buildPlaySceneImagePrompt}from'../play/play-image.js';
+import{PlayStore}from'../play/play-store.js';import{findPlaySceneImageKey,readPlayImageManifest,generatePlayImage,playImageContext,buildPlaySceneImagePrompt}from'../play/play-image.js';
 import{createPlayImageTool}from'../harness/tools/play-image.js';import{executeExplicitCapabilityTool}from'../harness/explicit-action.js';
 import{loadWorkManifest}from'../harness/work-store.js';import{CreativeEpisodeStore}from'../harness/episode-store.js';
 
@@ -14,19 +14,19 @@ it('includes current entity descriptions in image identity and preserves graph i
   const original={entities:[{id:'box',type:'item' as const,label:'Toolbox',summary:'Red toolbox',status:'held',createdEventId:'e0',updatedEventId:'manual-edit'}],edges:[]};
   const before=JSON.stringify(original),context=playImageContext(world,original);
   const changed=playImageContext(world,{...original,entities:[{...original.entities[0],summary:'Blue toolbox'}]});
-  expect(playSceneImageKey(1,scene,context)).not.toBe(playSceneImageKey(1,scene,changed));
+  expect(buildPlaySceneImagePrompt(scene,context)).not.toBe(buildPlaySceneImagePrompt(scene,changed));
   expect(JSON.parse(context!.visualFacts!).entities[0].summary).toBe(original.entities[0].summary);
   expect(buildPlaySceneImagePrompt(scene,context)).not.toBe(buildPlaySceneImagePrompt(scene,world));
   expect(JSON.stringify(original)).toBe(before);
   const current=playImageContext(world,original,PlayCurrentStateSchema.parse({turn:5,lastSummary:'Work has ended.',timeAdvance:{elapsed:'4 minutes',anchor:'19:31',rationale:'Closing',synchronized:[]},lastEventId:null,blocked:false}));
   expect(current?.currentMoment).toEqual({turn:5,anchor:'19:31',summary:'Work has ended.'});
-  expect(playSceneImageKey(1,scene,current)).not.toBe(playSceneImageKey(1,scene,context));
+  expect(buildPlaySceneImagePrompt(scene,current)).not.toBe(buildPlaySceneImagePrompt(scene,context));
   const transferred=playImageContext(world,{...original,edges:[
     {id:'old',fromId:'actor_player',toId:'box',type:'holds',value:{role:'holding'},visibility:{},validFromEventId:'e0',validUntilEventId:'e4',sourceEventId:'e0'},
     {id:'new',fromId:'caretaker',toId:'box',type:'holds',value:{role:'holding'},visibility:{},validFromEventId:'e4',validUntilEventId:null,sourceEventId:'e4'},
   ]});
   expect(JSON.parse(transferred!.visualFacts!).currentHoldings).toEqual([{holderId:'caretaker',holder:'caretaker',itemId:'box',item:'Toolbox',sinceEventId:'e4'}]);
-  expect(playSceneImageKey(1,scene,transferred)).not.toBe(playSceneImageKey(1,scene,context));
+  expect(buildPlaySceneImagePrompt(scene,transferred)).not.toBe(buildPlaySceneImagePrompt(scene,context));
 });
 
 it('records illustration methods and versioned output, invalidates stale scene images and preserves generation failures',async()=>{
@@ -57,11 +57,12 @@ it('records illustration methods and versioned output, invalidates stale scene i
   await store.ensureRun('world','main');await store.saveCurrentState('world','main',{turn:2});await store.writeProjection('world','main','projections/scene.md','A toolbox outside a locked door.');
   const run=(episodeId:string,instruction?:string)=>executeExplicitCapabilityTool({projectRoot:root,workId:'world',episodeId,conversationId:'fixture',binding:{capabilityId:'interactive-world',actionId:'generate_play_image',profileId:'interactive-world',risk:'recoverable-write'},tool:createPlayImageTool(root,'world'),parameters:{target:'scene',instruction}});
   const result=await run('image-ready');expect(result.status).toBe('success');
-  const key=playSceneImageKey(2,'A toolbox outside a locked door.',playImageContext(world,{entities:[],edges:[]},await store.loadCurrentState('world','main'))),dir=store.runDir('world','main');
+  const dir=store.runDir('world','main');
+  const key=(await findPlaySceneImageKey(dir,2,'A toolbox outside a locked door.',playImageContext(world,{entities:[],edges:[]},await store.loadCurrentState('world','main'))))!;
   const manifest=await readPlayImageManifest(dir);expect(manifest[key].status).toBe('ready');
   expect(await readFile(join(dir,'images',manifest[key].file!))).toEqual(png);
   const recordedPrompt=await readFile(join(dir,'images',key+'.request.md'),'utf8');
-  expect(createHash('sha256').update(recordedPrompt).digest('hex')).toBe(createHash('sha256').update(requests[0].prompt).digest('hex'));
+  expect(recordedPrompt).toBe(requests[0].prompt);
   const work=await loadWorkManifest(root,'world');expect(work.artifacts.some(a=>a.revisions.some(r=>r.id===a.currentRevisionId&&r.contentType==='image/png'))).toBe(true);
   const beforeState=await store.loadCurrentState('world','main'),beforeScene=await store.readProjection('world','main','projections/scene.md');
   const direction='Closer framing with warm side lighting.';
@@ -82,7 +83,8 @@ it('records illustration methods and versioned output, invalidates stale scene i
   expect(await store.loadCurrentState('world','main')).toEqual(beforeState);
   expect(await store.readProjection('world','main','projections/scene.md')).toBe(beforeScene);
   await store.writeProjection('world','main','projections/scene.md','The same toolbox is now inside the open door.');
-  const changedKey=playSceneImageKey(2,'The same toolbox is now inside the open door.',playImageContext(world,{entities:[],edges:[]},await store.loadCurrentState('world','main')));expect(changedKey).not.toBe(key);
+  const changedContext=playImageContext(world,{entities:[],edges:[]},await store.loadCurrentState('world','main'));
+  expect(await findPlaySceneImageKey(dir,2,'The same toolbox is now inside the open door.',changedContext)).toBeUndefined();
   const pending=run('image-pending');await imagePending;
   try{
    const advance=await executeExplicitCapabilityTool({projectRoot:root,workId:'world',episodeId:'advance-during-image',binding:{capabilityId:'interactive-world',actionId:'play_step',profileId:'interactive-world',risk:'recoverable-write'},tool:{name:'play_step',label:'Advance world',description:'Fixture transition through the real action lock and artifact adapter',parameters:Type.Object({}),async execute(){await store.saveCurrentState('world','main',{turn:3});await store.writeProjection('world','main','projections/scene.md','The worker leaves the workshop.');return{content:[],details:{workId:'world'}};}},parameters:{}});
@@ -91,10 +93,12 @@ it('records illustration methods and versioned output, invalidates stale scene i
   const late=await pending;expect(late.artifacts.length).toBeGreaterThan(0);
   expect(late.artifacts.every(a=>a.path?.startsWith('source/runs/main/images/'))).toBe(true);
   expect((await store.loadCurrentState('world','main'))?.turn).toBe(3);
+  const changedKey=(await findPlaySceneImageKey(dir,2,'The same toolbox is now inside the open door.',changedContext))!;
   const pendingManifest=await readPlayImageManifest(dir);expect(pendingManifest[changedKey].status).toBe('ready');
-  const newestKey=playSceneImageKey(3,await store.readProjection('world','main','projections/scene.md'),playImageContext(world,{entities:[],edges:[]},await store.loadCurrentState('world','main')));
-  expect(pendingManifest[newestKey]).toBeUndefined();
+  const newestScene=await store.readProjection('world','main','projections/scene.md'),newestContext=playImageContext(world,{entities:[],edges:[]},await store.loadCurrentState('world','main'));
+  expect(await findPlaySceneImageKey(dir,3,newestScene,newestContext)).toBeUndefined();
   await expect(run('image-failed')).rejects.toMatchObject({code:'PLAY_IMAGE_GENERATION_FAILED'});
+  const newestKey=(await findPlaySceneImageKey(dir,3,newestScene,newestContext))!;
   const after=await readPlayImageManifest(dir);expect(after[key].status).toBe('ready');expect(after[newestKey].status).toBe('failed');
   const failedEdit=await generatePlayImage({root,runDir:dir,key,prompt:'Revise the existing illustration.'});
   expect(failedEdit.status).toBe('failed');

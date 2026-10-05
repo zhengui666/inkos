@@ -1,7 +1,5 @@
-import { resolveCodexModel } from "../codex/model.js";
 import { compileContext, ContextSourceRegistry, ProtectedContextOverflowError } from "../harness/context-compiler.js";
 import { createBuiltInWorkProfileRegistry } from "../harness/builtin-profiles.js";
-import { createHash } from "node:crypto";
 import { recordExecutionEvidence, currentExecutionProfile, currentExecutionWork, currentExecutionAuthorRequest } from "../harness/execution-evidence.js";
 import { loadWorkManifest } from "../harness/work-store.js";
 import { loadAvailableAgentSkills } from "../skills/builtin-loader.js";
@@ -21,6 +19,8 @@ export interface AgentContext {
   readonly client: LLMClient;
   readonly model: string;
   readonly projectRoot: string;
+  /** Persisted account/model settings can stay in the live project while data is isolated. */
+  readonly runtimeProjectRoot?: string;
   readonly bookId?: string;
   readonly logger?: Logger;
   readonly onStreamProgress?: OnStreamProgress;
@@ -45,7 +45,7 @@ export abstract class BaseAgent {
   ): Promise<LLMResponse> {
     return runWorkerAgent(this.ctx.client, this.ctx.model, await this.appendTaskSkillGuidance(messages, options?.maxTokens, options?.professionalGuidance), {
       ...options,
-      projectRoot: this.ctx.projectRoot,
+      projectRoot: this.ctx.runtimeProjectRoot ?? this.ctx.projectRoot,
       onStreamProgress: this.ctx.onStreamProgress,
       signal: this.ctx.signal,
     });
@@ -71,7 +71,7 @@ export abstract class BaseAgent {
       resultTool,
       {
         ...options,
-        projectRoot: this.ctx.projectRoot,
+        projectRoot: this.ctx.runtimeProjectRoot ?? this.ctx.projectRoot,
         signal: this.ctx.signal,
         onStreamProgress: this.ctx.onStreamProgress,
         onUsage: (value) => { usage = value; },
@@ -165,14 +165,13 @@ export async function prepareWorkerInput(
     // author request, without a writing method encouraging broader changes.
     const activations = professionalGuidance ? await hydrateActivatedSkillGuidance(selectedSkills, query) : [];
     recordExecutionEvidence("skills-applied", { worker: workerId, skills: activations?.map(({ skill, resources }) => ({
-      id: skill.id, source: skill.source, hash: createHash("sha256").update(skill.body).digest("hex"),
-      references: resources.map(resource => ({ path: resource.path, charStart: resource.charStart, charEnd: resource.charEnd,
-        hash: createHash("sha256").update(resource.body).digest("hex") })),
+      id: skill.id, source: skill.source,
+      references: resources.map(resource => ({ path: resource.path, charStart: resource.charStart, charEnd: resource.charEnd })),
     })) ?? [] });
-    const window = context.client._codex
-      ? resolveCodexModel(context.client._codex.settings).contextWindow
-      : context.client._piModel?.contextWindow;
-    if (window) {
+    // Codex owns its model limits and automatic compaction. Compatibility
+    // transcript metadata is not a model catalog and must never veto input.
+    const window = context.client._codex ? undefined : context.client._piModel?.contextWindow;
+    if (context.client._codex || window) {
       const sources = new ContextSourceRegistry();
       sources.register({ id: "task", load: async () => messages.map((message, index) => ({
         id: `message-${index}`, source: `${workerId}:${message.role}`, content: message.content,
@@ -184,7 +183,7 @@ export async function prepareWorkerInput(
       const compiled = await compileContext({
         recipe: { id: `${profile.contextRecipe?.id ?? profile.id}-${workerId}${professionalGuidance?'':'-task'}`, sourceIds: professionalGuidance ? [...new Set(["task", ...(guidance?["skills"]:[]), ...(profile.contextRecipe?.sourceIds ?? [])])] : ['task'] }, sources,
         request: { projectRoot: context.projectRoot ?? "", work, profile, actionId: workerId, intent: query, signal: context.signal },
-        budgetTokens: Math.max(1, window - (maxTokens ?? context.client.defaults.maxTokens) - 2048),
+        budgetTokens: window ? Math.max(1, window - (maxTokens ?? context.client.defaults.maxTokens) - 2048) : undefined,
       }).catch(error => {
         if (error instanceof ProtectedContextOverflowError) {
           // Counts and stable source ids only; never log author text/manuscripts.

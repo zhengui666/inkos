@@ -3,14 +3,14 @@ import { recordExecutionEvidence, currentExecutionAuthorRequest } from "../harne
 import { createBuiltInWorkProfileRegistry } from "../harness/builtin-profiles.js";
 import { withWorkMutationScope } from "../utils/work-mutation-scope.js";
 import { Buffer } from "node:buffer";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { Value } from "@sinclair/typebox/value";
 import { ShortRevisionPlanSchema, ShortPackageToolSchema } from "../agents/short-fiction-tool.js";
 import { access, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, isAbsolute, relative } from "node:path";
 import type { AgentContext } from "../agents/base.js";
 import {
-  SHORT_FICTION_DEFAULT_CHAPTERS,
+  defaultShortFictionChapterCount,
   SHORT_FICTION_DEFAULT_CHARS_PER_CHAPTER,
   SHORT_FICTION_EN_DEFAULT_WORDS_PER_CHAPTER,
   ShortFictionDraftReviewerAgent,
@@ -57,6 +57,21 @@ import { readShortProductionState, writeShortProductionState, shortInputHash, ty
 
 const SHORT_FICTION_DRAFT_COMPLETION_ATTEMPTS = 3;
 const SHORT_DELIVERY_CONTRACT_CODES=new Set(["SHORT_CHAPTER_CONTRACT","SHORT_TITLE_MISMATCH","SHORT_OPENING_HOOK_CONTRACT"]);
+
+/** Omitted resume fields inherit the persisted production contract before any stage or reuse check. */
+function restoreShortTarget(options: ShortFictionRunOptions, target: ShortProductionState["target"]): ShortFictionRunOptions {
+  if (!target) return options;
+  return {
+    ...options,
+    title: options.title ?? target.title,
+    chapterCount: options.chapterCount ?? target.chapterCount,
+    charsPerChapter: options.charsPerChapter ?? target.charsPerChapter,
+    minChapterLength: options.minChapterLength ?? target.minChapterLength,
+    maxChapterLength: options.maxChapterLength ?? target.maxChapterLength,
+    openingHookChars: options.openingHookChars ?? target.openingHookChars,
+    language: options.language ?? target.language,
+  };
+}
 
 function shortDraftMinimum(options: ShortFictionRunOptions) {
   const language = options.language ?? "zh";
@@ -159,7 +174,7 @@ export interface ShortFictionCoverResult {
 interface CoverStorySource {
   readonly artifactId: string;
   readonly revisionId: string;
-  readonly checksum: string;
+  readonly checksum?: string;
   readonly content: string;
 }
 
@@ -174,7 +189,7 @@ function coverContextFromRequest(markdown: string, currentSources: readonly Cove
   if (value.version !== 1 || !value.storyReference) return undefined;
   const priorSources = Array.isArray(value.storyReference.sources) ? value.storyReference.sources : [];
   if (priorSources.length !== currentSources.length || !currentSources.every(current => priorSources.some(prior =>
-    prior?.artifactId === current.artifactId && prior.revisionId === current.revisionId && prior.checksum === current.checksum))) return undefined;
+    prior?.artifactId === current.artifactId && prior.revisionId === current.revisionId))) return undefined;
   const context = { title: value.storyReference.title, intro: value.storyReference.synopsis,
     sellingPoints: value.storyReference.sellingPoints, coverPrompt: value.visualBrief };
   if (typeof context.title !== 'string' || typeof context.intro !== 'string' || typeof context.coverPrompt !== 'string'
@@ -194,6 +209,7 @@ export async function runShortFictionProduction(
 
   const execute = async () => {
   if (providedStoryId) {
+    options = restoreShortTarget(options, (await readShortProductionState(root, shortWorkBaseDir(providedStoryId)))?.target);
     const completed = await loadCompletedShortRun(root, providedStoryId, options);
     if (completed) return completed;
   }
@@ -234,7 +250,7 @@ async function loadCompletedShortRun(
   const draft = await tryReadShortFictionDraft(root, join(baseDir, "final", "short-story.json"));
   if (!draft) return null;
   try { validateShortFictionDraftForFinal(draft, {
-    expectedChapters: options.chapterCount ?? SHORT_FICTION_DEFAULT_CHAPTERS,
+    expectedChapters: options.chapterCount ?? defaultShortFictionChapterCount(options.language),
     ...shortDraftMinimum(options),
   }); } catch { return null; }
   if (await projectFileExists(root, join(baseDir, "reviews", "package-warning.md"))) return null;
@@ -317,10 +333,10 @@ async function produceShort(
   stopAfter?: ShortProductionStage,
 ): Promise<ShortFictionRunResult | ShortProductionStageResult> {
   const savedTarget=providedStoryId?(await readShortProductionState(root,shortWorkBaseDir(providedStoryId)))?.target:undefined;
-  options={...options,title:options.title??savedTarget?.title,minChapterLength:options.minChapterLength??savedTarget?.minChapterLength,openingHookChars:options.openingHookChars??savedTarget?.openingHookChars,maxChapterLength:options.maxChapterLength??savedTarget?.maxChapterLength,chapterCount:options.chapterCount??savedTarget?.chapterCount,charsPerChapter:options.charsPerChapter??savedTarget?.charsPerChapter};
+  options = restoreShortTarget(options, savedTarget);
   const language = options.language ?? "zh";
   let minimum = shortDraftMinimum(options);
-  const chapterCount = positiveInteger(options.chapterCount, SHORT_FICTION_DEFAULT_CHAPTERS, "chapterCount");
+  const chapterCount = positiveInteger(options.chapterCount, defaultShortFictionChapterCount(language), "chapterCount");
   const charsPerChapter = language === "en"
     ? positiveInteger(options.charsPerChapter, SHORT_FICTION_EN_DEFAULT_WORDS_PER_CHAPTER, "charsPerChapter")
     : positiveInteger(options.charsPerChapter, SHORT_FICTION_DEFAULT_CHARS_PER_CHAPTER, "charsPerChapter");
@@ -334,7 +350,7 @@ async function produceShort(
   let storyId: string;
   let baseDir: string;
   let workTitle: string;
-  let sourceBefore: ReadonlyMap<string, string>;
+  let sourceBefore: ReadonlyMap<string, Buffer>;
   if (providedStoryId && resumedOutline?.trim()) {
     storyId = providedStoryId;
     baseDir = shortWorkBaseDir(storyId);
@@ -473,8 +489,13 @@ async function produceShort(
     finalDraft = draftV1;
     const reviewedWork = await syncWorkSourceArtifacts({ projectRoot: root, workId: storyId, accept: false });
     const reviewedArtifact = reviewedWork.artifacts.find(artifact => artifact.revisions.some(revision => revision.path === "source/drafts/v001/draft.json"))!;
-    const reviewedHash = `sha256:${createHash("sha256").update(await readFile(safeChildPath(root, join(baseDir, "drafts", "v001", "draft.json")))).digest("hex")}`;
-    const reviewedRevision = reviewedArtifact.revisions.find(revision => revision.checksum === reviewedHash)!;
+    const reviewedBytes = await readFile(safeChildPath(root, join(baseDir, "drafts", "v001", "draft.json")));
+    let reviewedRevision: typeof reviewedArtifact.revisions[number] | undefined;
+    for (const revision of [...reviewedArtifact.revisions].reverse()) {
+      const saved = await readArtifactRevision({ projectRoot: root, workId: storyId, artifactId: reviewedArtifact.id, revisionId: revision.id });
+      if (saved.bytes.equals(reviewedBytes)) { reviewedRevision = revision; break; }
+    }
+    if (!reviewedRevision) throw new Error("The current draft has no retained revision.");
     if (stopAfter === "draft") {
       await writeFinalArtifacts(root, baseDir, finalDraft, language);
       return stageResult("draft", ["final/short-story.json", "final/full.md"]);
@@ -501,7 +522,7 @@ async function produceShort(
         language,
       });
       draftReviewObservations = draftReview.observations.map(observation => ({ ...observation,
-        category: "quality", assessment: observation.assessment ?? "observation", scope: productionState.reviewScope, targetHash: reviewedHash, target: { workId: storyId, artifactId: reviewedArtifact.id, revisionId: reviewedRevision.id } }));
+        category: "quality", assessment: observation.assessment ?? "observation", scope: productionState.reviewScope, target: { workId: storyId, artifactId: reviewedArtifact.id, revisionId: reviewedRevision.id } }));
       if (!reuseReview) await writeText(
         root,
         join(baseDir, "reviews", "draft-v001.md"),
@@ -695,7 +716,7 @@ async function reviseShortFictionWithLock(options: ShortFictionRunOptions & { re
   const minimum = shortDraftMinimum(revisionOptions);
   const chapterNumbers=options.revisionChapterNumbers;
   if(chapterNumbers?.some(number=>!Number.isInteger(number)||number<1||number>draft.chapters.length)) throw new Error("Invalid revision chapter scope");
-  const inputHash=createHash("sha256").update(JSON.stringify({revisionPlanVersion:6,draft,outlineMarkdown,review,direction:options.direction,target:revisionOptions.charsPerChapter,chapterCount,chapterNumbers,minimum})).digest("hex");
+  const inputHash=JSON.stringify({revisionPlanVersion:6,draft,outlineMarkdown,review,direction:options.direction,target:revisionOptions.charsPerChapter,chapterCount,chapterNumbers,minimum});
   const reuse = saved && !options.restartPendingRevision && (options.resumeOperationId || saved.inputHash === inputHash);
   if (saved && !reuse && !options.restartPendingRevision) {
     throw Object.assign(new Error("A revision is already pending. Resume it by ID or explicitly replace it; changed retry wording does not discard its progress."), {
@@ -1129,11 +1150,11 @@ export async function generateImageFromPrompt(
 ): Promise<{ readonly buffer: Buffer; readonly extension: "png" | "jpg" }> {
   const trace = beginAgentModelCall();
   recordExecutionEvidence("model-call-started", { trace, model: request.model, modality: "image", prompt, size,
-    ...(reference ? {reference:{mimeType:reference.mimeType,byteLength:reference.buffer.length,checksum:`sha256:${createHash("sha256").update(reference.buffer).digest("hex")}`}} : {}),
+    ...(reference ? {reference:{mimeType:reference.mimeType,byteLength:reference.buffer.length}} : {}),
   });
   try {
     const image = await generateImageFromPromptImpl({ ...request, trace }, prompt, size, signal, reference);
-    recordExecutionEvidence("model-call-completed", { modelCallId: trace?.modelCallId, status: "done", modality: "image", byteLength: image.buffer.length, checksum: `sha256:${createHash("sha256").update(image.buffer).digest("hex")}` });
+    recordExecutionEvidence("model-call-completed", { modelCallId: trace?.modelCallId, status: "done", modality: "image", byteLength: image.buffer.length });
     return image;
   } catch (error) {
     recordExecutionEvidence("model-call-completed", { modelCallId: trace?.modelCallId, status: "error", modality: "image", error: String(error) });
@@ -1309,7 +1330,7 @@ async function generateImagesCover(
   const image = extractImagesGenerationImage(payload);
   recordExecutionEvidence('image-http-response',{
     modelCallId:request.trace?.modelCallId,status:response.status,requestId:response.headers.get('x-request-id'),
-    responseBytes:Buffer.byteLength(text),responseHash:createHash('sha256').update(text).digest('hex'),
+    responseBytes:Buffer.byteLength(text),
     payloadKeys:payload&&typeof payload==='object'?Object.keys(payload):[],imagePresent:!!image,
   });
   if (image?.base64) {

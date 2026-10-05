@@ -47,7 +47,7 @@ export class ContinuityAuditor extends BaseAgent {
     const sources = new Map([["governed-context", governedContext], [`chapter-${chapterNumber}`, chapterContent]]);
     const primarySourceId=`chapter-${chapterNumber}`;
     let reviewedArtifact:AuditResult['reviewedArtifact'];
-    let comparison:{scope:'episode_start'|'parent_revision';sourceId:string;before:{revisionId:string;checksum:string};after:{revisionId:string;checksum:string};changedRegion:ReturnType<typeof changedSourceRegion>}|undefined;
+    let comparison:{scope:'episode_start'|'parent_revision';sourceId:string;before:{revisionId:string;checksum?:string};after:{revisionId:string;checksum?:string};changedRegion:ReturnType<typeof changedSourceRegion>}|undefined;
     if(this.ctx.bookId){
       let work;
       try{work=await loadWorkManifest(this.ctx.projectRoot,this.ctx.bookId);}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}

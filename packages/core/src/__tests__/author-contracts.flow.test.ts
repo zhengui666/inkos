@@ -5,7 +5,6 @@ vi.mock('../codex/client.js',()=>({createCodexClient}));
 import {mkdtemp,mkdir,readFile,writeFile,rm,readdir} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {createHash} from 'node:crypto';
 import {createLLMClient} from '../llm/provider.js';
 import {createWorkManifest,saveWorkManifest,loadWorkManifest} from '../harness/work-store.js';
 import {syncWorkSourceArtifacts} from '../harness/source-sync.js';
@@ -62,7 +61,7 @@ it('revises only an opening, then applies an author-requested chapter reduction 
     expect(removed.currentRevisionId).toBeNull();
     const originalManuscript=original.artifacts.find(a=>a.revisions.some(r=>r.path==='source/final/short-story.json'))!;
     const previous=after.artifacts.find(a=>a.id===originalManuscript.id)!.revisions.find(r=>r.id===originalManuscript.currentRevisionId)!;
-    expect(createHash('sha256').update(await readFile(join(root,'works/tea',previous.snapshotPath!))).digest('hex')).toBe(previous.checksum.slice(7));
+    expect(await readFile(join(root,'works/tea',previous.snapshotPath!), 'utf8')).toBe(JSON.stringify(draft));
     expect(calls.filter(name=>name==='submit_short_revision_chapter')).toHaveLength(0);
     expect(planNumber).toBe(3);
   }finally{await rm(root,{recursive:true,force:true});}

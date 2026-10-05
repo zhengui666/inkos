@@ -8,9 +8,9 @@
  * from the event log — generation is async and is not part of game state.
  */
 import { Buffer } from "node:buffer";
-import { createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { basename, join, relative } from "node:path";
 import { commitAtomicFileSet, type AtomicFileWrite } from '../utils/atomic-file-set.js';
 import { loadAvailableAgentSkills } from '../skills/builtin-loader.js';
 import { hydrateActivatedSkillGuidance } from '../agent/skill-tool.js';
@@ -100,10 +100,33 @@ export function buildPlaySceneImagePrompt(sceneText: string, worldPremise?: Play
   ].filter(Boolean).join("\n");
 }
 
-/** Replayed prose or a changed visual contract must not reuse an older image. */
-export function playSceneImageKey(turn: number, sceneText: string, world?: PlayImageWorldInput): string {
-  const hash=createHash('sha256').update(buildPlaySceneImagePrompt(sceneText,world)).digest('hex').slice(0,16);
-  return `scene-turn-${turn}-${hash}`;
+/** Find a saved scene by its actual prompt, preserving old keys and image paths. */
+export async function findPlaySceneImageKey(
+  runDir: string, turn: number, sceneText: string, world?: PlayImageWorldInput,
+): Promise<string | undefined> {
+  const prompt = buildPlaySceneImagePrompt(sceneText, world);
+  const entries = Object.entries(await readPlayImageManifest(runDir));
+  for (const [key, entry] of entries.reverse()) {
+    if (!key.startsWith(`scene-turn-${turn}-`)) continue;
+    if (entry.scenePrompt !== undefined) {
+      if (entry.scenePrompt === prompt) return key;
+      continue;
+    }
+    // Older manifests have digest-shaped keys but store the input beside the
+    // image. Read those bytes without deriving or validating an old digest.
+    const stems = [playImageFileName(key, "png").slice(0, -4),
+      ...(entry.file ? [basename(entry.file).replace(/\.(png|jpg)$/u, "")] : [])];
+    for (const stem of stems) {
+      for (const suffix of [".source.md", ".request.md"]) {
+        let source: string;
+        try { source = await readFile(join(runDir, "images", stem + suffix), "utf8"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+        const input = source.split("\n\nRequested visual direction:\n")[0]!;
+        if (input === prompt || input.endsWith(`\n\n${prompt}`)) return key;
+      }
+    }
+  }
+  return undefined;
 }
 
 export type PlayImageStatus = "ready" | "failed";
@@ -112,13 +135,14 @@ export interface PlayImageEntry {
   readonly status: PlayImageStatus;
   readonly file?: string;
   readonly error?: string;
+  readonly scenePrompt?: string;
 }
 
 export type PlayImageManifest = Record<string, PlayImageEntry>;
 
 const PlayImageEntrySchema = z.discriminatedUnion("status", [
-  z.object({ status: z.literal("ready"), file: z.string().min(1), error: z.string().optional() }).strict(),
-  z.object({ status: z.literal("failed"), file: z.string().optional(), error: z.string().min(1) }).strict(),
+  z.object({ status: z.literal("ready"), file: z.string().min(1), error: z.string().optional(), scenePrompt: z.string().optional() }).strict(),
+  z.object({ status: z.literal("failed"), file: z.string().optional(), error: z.string().min(1), scenePrompt: z.string().optional() }).strict(),
 ]);
 const PlayImageManifestSchema = z.record(z.string(), PlayImageEntrySchema);
 
@@ -211,6 +235,7 @@ export async function generatePlayImage(input: {
   readonly runDir: string;
   readonly key: string;
   readonly prompt: string;
+  readonly scenePrompt?: string;
   readonly size?: string;
   readonly signal?: AbortSignal;
   readonly prepareSceneBrief?: boolean;
@@ -227,8 +252,8 @@ export async function generatePlayImage(input: {
   const sourcePrompt=appendActivatedSkillGuidance([{role:'user',content:input.prompt}],activations).map(message=>message.content).join('\n\n');
   let prompt=sourcePrompt;
   recordExecutionEvidence('skills-applied',{worker:'play-image',skills:activations.map(({skill,resources})=>({
-    id:skill.id,source:skill.source,hash:createHash('sha256').update(skill.body).digest('hex'),
-    references:resources.map(resource=>({path:resource.path,hash:createHash('sha256').update(resource.body).digest('hex')})),
+    id:skill.id,source:skill.source,
+    references:resources.map(resource=>({path:resource.path})),
   }))});
   const imageDir=join(input.runDir,'images');
   const locked = input.withCommitLock ?? (async <T>(task: () => Promise<T>) => task());
@@ -243,6 +268,7 @@ export async function generatePlayImage(input: {
   }]));
   const persist=async(entry:PlayImageEntry,image?:{file:string;buffer:Buffer})=>locked(async()=>{
     if(image)input.signal?.throwIfAborted();
+    if (input.scenePrompt !== undefined) entry = {...entry, scenePrompt: input.scenePrompt};
     const previous = await readPlayImageManifest(input.runDir);
     const current = previous[input.key];
     const manifest={...previous,[input.key]:entry.status === "failed" && current?.status === "ready"
@@ -276,10 +302,8 @@ export async function generatePlayImage(input: {
       input.signal,
       reference,
     );
-    // A stable scene key selects the current image; each distinct image gets a
-    // stable immutable URL so regeneration preserves history and refreshes UI.
-    const contentHash=createHash('sha256').update(buffer).digest('hex').slice(0,16);
-    const file = playImageFileName(`${contentHash}-${input.key}`, extension);
+    // Keep each generated image at its own URL; old file paths remain valid.
+    const file = playImageFileName(`${randomUUID()}-${input.key}`, extension);
     const entry: PlayImageEntry = { status: "ready", file };
     return persist(entry,{file,buffer});
   } catch (error) {

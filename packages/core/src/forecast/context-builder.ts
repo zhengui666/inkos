@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { readCharacterContext, readStoryFrame, readVolumeMap } from "../utils/outline-paths.js";
@@ -92,7 +91,7 @@ export async function buildForecastContext(params: {
 }
 
 /**
- * Content hash over the canonical forecast inputs (chapter count + every file
+ * Direct snapshot of the canonical forecast inputs (chapter count + every file
  * this builder feeds into the prompt). Deliberately mtime-free and
  * order-independent so copies, checkouts and CI runs produce identical
  * fingerprints for identical canon.
@@ -101,11 +100,10 @@ export function computeContextFingerprint(input: {
   readonly baseChapter: number;
   readonly files: ReadonlyArray<readonly [string, string]>;
 }): string {
-  const canonical = JSON.stringify({
+  return JSON.stringify({
     baseChapter: input.baseChapter,
     files: [...input.files].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)),
   });
-  return createHash("sha256").update(canonical, "utf8").digest("hex");
 }
 
 // Every fixed-path file buildForecastContext reads into the prompt. story/runtime/** —

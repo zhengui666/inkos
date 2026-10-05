@@ -1,7 +1,6 @@
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createHash } from "node:crypto";
 import { afterEach, expect, it, vi } from "vitest";
 import { ShortFictionOutlineAgent, ShortFictionWriterAgent, ShortFictionDraftReviewerAgent, ShortFictionPackagingAgent, renderShortFictionDraftMarkdown } from "../agents/short-fiction.js";
 import { createInspectWorkTool, createShortFictionReviseTool } from "../agent/agent-tools.js";
@@ -189,7 +188,8 @@ it("exposes the outline and partial draft during generation without marking them
   const revisions = (await loadWorkManifest(root,"short")).artifacts.flatMap(artifact=>artifact.revisions);
   for (const artifact of (await inspect()).artifacts) {
     const bytes=await readFile(join(root,artifact.path));
-    expect(`sha256:${createHash("sha256").update(bytes).digest("hex")}`).toBe(revisions.find(revision=>revision.id===artifact.revisionId)?.checksum);
+    const revision = revisions.find(revision=>revision.id===artifact.revisionId)!;
+    expect(await readFile(join(root,"works/short",revision.snapshotPath!))).toEqual(bytes);
   }
 });
 
@@ -286,7 +286,7 @@ it.each(["resume", "restart", "finalize"] as const)("%s preserves revision owner
   expect(artifact.currentRevisionId).not.toBe(original.currentRevisionId);
   expect(artifact.revisions.find(r=>r.id===artifact.currentRevisionId)?.parentRevisionId).toBe(previous.id);
   const bytes=await readFile(join(root,"works/short/source/final/full.md"));
-  expect(`sha256:${createHash("sha256").update(bytes).digest("hex")}`).toBe(artifact.revisions.find(r=>r.id===artifact.currentRevisionId)?.checksum);
-  expect(`sha256:${createHash("sha256").update(await readFile(join(root,"works/short",previous.snapshotPath!))).digest("hex")}`).toBe(previous.checksum);
+  expect(await readFile(join(root,"works/short",artifact.revisions.find(r=>r.id===artifact.currentRevisionId)!.snapshotPath!))).toEqual(bytes);
+  expect(await readFile(join(root,"works/short",previous.snapshotPath!),"utf8")).toBe(renderShortFictionDraftMarkdown(draft,"en"));
   expect(result.artifacts.some(a=>a.path==="source/final/sales-package.json")).toBe(true);
 });

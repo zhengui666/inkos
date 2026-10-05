@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { loadTranslationManifest, loadTranslationChapter, loadTranslationGlossary } from "./run-store.js";
 import { syncWorkSourceArtifacts } from "../harness/source-sync.js";
 import type { TranslationModelPort } from "./types.js";
@@ -37,10 +36,9 @@ export async function reviseTranslationSegment(projectRoot:string,projectId:stri
       {relativePath:`works/${projectId}/source/manifest.json`,content:JSON.stringify(nextManifest,null,2)+"\n"},
     ]});
   }
-  const hash=(text:string)=>"sha256:"+createHash("sha256").update(text).digest("hex");
   const excerpt=(text:string)=>text.slice(0,400);
   return {projectId,chapterNumber:info.number,paragraphNumber,paragraphCount:source.segments.length,sourceSegmentIndex:current.index,isLastParagraph:paragraphNumber===source.segments.length,changed,
-    previousTargetHash:hash(current.target),targetHash:hash(nextTarget),sourcePreserved:true,otherSegmentsPreserved:true,
+    sourcePreserved:true,otherSegmentsPreserved:true,
     sourceExcerpt:excerpt(sourceSegment.source),previousTargetExcerpt:excerpt(current.target),targetExcerpt:excerpt(nextTarget),
     reviewRequired:changed,exportRequired:changed};
 }

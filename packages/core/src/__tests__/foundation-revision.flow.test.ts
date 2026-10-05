@@ -70,7 +70,7 @@ it('recovers a partial draft with its canon and candidate revision preserved',as
     expect(after.status).toBe('active');
     for(const artifact of before.artifacts) {
       expect(after.artifacts.find(item=>item.id===artifact.id)?.revisions).toEqual(expect.arrayContaining(
-        artifact.revisions.map(({id,checksum,snapshotPath})=>expect.objectContaining({id,checksum,snapshotPath})),
+        artifact.revisions.map(({id,snapshotPath})=>expect.objectContaining({id,snapshotPath})),
       ));
     }
     expect(await readFile(join(state.bookDir('draft'),'story/parent_canon.md'),'utf8')).toBe('Sealed letters remain sealed.');
@@ -98,7 +98,7 @@ it('preserves a timed-out foundation draft and recovers it without losing candid
     expect(after.status).toBe('active');
     for(const artifact of before.artifacts) {
       expect(after.artifacts.find(item=>item.id===artifact.id)?.revisions).toEqual(expect.arrayContaining(
-        artifact.revisions.map(({id,checksum,snapshotPath})=>expect.objectContaining({id,checksum,snapshotPath})),
+        artifact.revisions.map(({id,snapshotPath})=>expect.objectContaining({id,snapshotPath})),
       ));
     }
     expect(await readFile(join(state.bookDir(book.id),'story/brief.md'),'utf8')).toBe('Keep the sealed-letter premise.');

@@ -1,3 +1,4 @@
+import { stateReplayCommand } from "./state-replay.js";
 import { Command } from "commander";
 import { createInterface } from "node:readline";
 import { deleteLatestChapter, StateManager, syncChapterWordCounts } from "@actalk/inkos-core";
@@ -115,3 +116,5 @@ chapterCommand
       process.exit(1);
     }
   });
+
+chapterCommand.addCommand(stateReplayCommand);

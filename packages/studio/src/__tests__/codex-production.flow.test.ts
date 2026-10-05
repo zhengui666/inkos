@@ -41,7 +41,7 @@ describe("Studio Codex-only production routes", () => {
     expect(codex.turns).toHaveLength(2);
     expect(createCodexClient).toHaveBeenCalledWith(root);
     expect(codex.requests.filter(request => request.method === "thread/start")).toEqual(expect.arrayContaining([
-      expect.objectContaining({ params: expect.objectContaining({ model: "fixture" }) }),
+      expect.objectContaining({ params: expect.objectContaining({ model: "gpt-6.1-sol", serviceTier: "priority" }) }),
     ]));
   });
 
@@ -97,7 +97,7 @@ describe("Studio Codex-only production routes", () => {
     expect(response.status, await response.clone().text()).toBe(200);
     expect(await response.json()).toMatchObject({ guide: "# Style guide\nUse the supplied evidence." });
     expect(codex.turns[0]?.turn).toMatchObject({ effort: "high", serviceTier: "fast", serviceTierForTurn: "fast" });
-    await writeFile(settingsPath, JSON.stringify({ reasoningEffort: "medium", serviceTier: "default" }));
+    await writeFile(settingsPath, JSON.stringify({ model: "fixture", reasoningEffort: "medium", serviceTier: "default" }));
     expect((await app.request("/api/v1/style/analyze", post({ text: "Another sample" }))).status).toBe(200);
     expect(codex.turns[1]?.turn).toMatchObject({ effort: "medium", serviceTier: null, serviceTierForTurn: "default" });
   });

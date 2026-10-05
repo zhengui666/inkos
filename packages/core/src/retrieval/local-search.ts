@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -44,14 +43,13 @@ export class LocalSearchIndex {
     const normalized = documents.map((document) => normalizeDocument(document, scope));
     const keepIds = new Set(normalized.map((document) => document.id));
     const existing = this.db.prepare(
-      "SELECT document_id AS id, content_hash AS contentHash FROM retrieval_documents WHERE scope = ?",
-    ).all(scope) as unknown as ReadonlyArray<{ readonly id: string; readonly contentHash: string }>;
-    const existingHashes = new Map(existing.map((row) => [row.id, row.contentHash]));
+      "SELECT document_id AS id FROM retrieval_documents WHERE scope = ?",
+    ).all(scope) as unknown as ReadonlyArray<{ readonly id: string }>;
     const upsert = this.db.prepare(`
       INSERT INTO retrieval_documents (
         document_id, scope, kind, source, title, body,
         title_tokens, body_tokens, metadata_json, content_hash
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '')
       ON CONFLICT(scope, document_id) DO UPDATE SET
         kind = excluded.kind,
         source = excluded.source,
@@ -60,8 +58,14 @@ export class LocalSearchIndex {
         title_tokens = excluded.title_tokens,
         body_tokens = excluded.body_tokens,
         metadata_json = excluded.metadata_json,
-        content_hash = excluded.content_hash,
         updated_at = datetime('now')
+      WHERE retrieval_documents.kind != excluded.kind
+        OR retrieval_documents.source != excluded.source
+        OR retrieval_documents.title != excluded.title
+        OR retrieval_documents.body != excluded.body
+        OR retrieval_documents.metadata_json != excluded.metadata_json
+        OR retrieval_documents.title_tokens != excluded.title_tokens
+        OR retrieval_documents.body_tokens != excluded.body_tokens
     `);
     const remove = this.db.prepare(
       "DELETE FROM retrieval_documents WHERE scope = ? AND document_id = ?",
@@ -70,7 +74,6 @@ export class LocalSearchIndex {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const document of normalized) {
-        if (existingHashes.get(document.id) === document.contentHash) continue;
         upsert.run(
           document.id,
           document.scope,
@@ -81,7 +84,6 @@ export class LocalSearchIndex {
           document.titleTokens,
           document.bodyTokens,
           document.metadataJson,
-          document.contentHash,
         );
       }
       for (const row of existing) {
@@ -163,7 +165,8 @@ export class LocalSearchIndex {
         title_tokens TEXT NOT NULL,
         body_tokens TEXT NOT NULL,
         metadata_json TEXT NOT NULL DEFAULT '{}',
-        content_hash TEXT NOT NULL,
+        -- Retained for existing databases; new writes do not use content digests.
+        content_hash TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL DEFAULT (datetime('now')),
         UNIQUE(scope, document_id)
       );
@@ -244,8 +247,10 @@ export function tokenizeSearchText(text: string): string[] {
       tokens.push(`${left}${right}`);
     }
   }
-  for (const match of normalized.matchAll(/[\p{L}\p{N}]+(?:[-_][\p{L}\p{N}]+)+/gu)) {
-    tokens.push(match[0]);
+  // Consume even unjoined words once; requiring a separator in the regex makes
+  // a long separator-free run retry at every character (quadratic scanning).
+  for (const match of normalized.matchAll(/[\p{L}\p{N}]+(?:[-_][\p{L}\p{N}]+)*/gu)) {
+    if (match[0].includes("-") || match[0].includes("_")) tokens.push(match[0]);
   }
   return tokens;
 }
@@ -260,15 +265,11 @@ function normalizeDocument(document: SearchDocument, scope: string) {
   const metadataJson = JSON.stringify(document.metadata ?? {});
   const titleTokens = tokenizeSearchText(document.title).join(" ");
   const bodyTokens = tokenizeSearchText(document.body).join(" ");
-  const contentHash = createHash("sha256")
-    .update([normalized.kind, normalized.source, normalized.title, normalized.body, metadataJson].join("\0"))
-    .digest("hex");
   return {
     ...normalized,
     metadataJson,
     titleTokens,
     bodyTokens,
-    contentHash,
   };
 }
 

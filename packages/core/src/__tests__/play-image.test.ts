@@ -1,9 +1,11 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   readPlayImageManifest,
+  findPlaySceneImageKey,
+  buildPlaySceneImagePrompt,
   setPlayImageEntry,
   playImageFileName,
   readPlayImageSettings,
@@ -18,6 +20,23 @@ describe("play image manifest", () => {
 
   it("returns {} for a run with no manifest yet", async () => {
     expect(await readPlayImageManifest(runDir)).toEqual({});
+  });
+
+  it("reuses old scene keys from saved prompt bytes and distinguishes changed scenes", async () => {
+    const key = "scene-turn-2-legacy-recorded-key";
+    const prompt = buildPlaySceneImagePrompt("The door is closed.", "Workshop");
+    await setPlayImageEntry(runDir, key, {status: "ready", file: "old-image.png"});
+    await writeFile(join(runDir, "images", key + ".source.md"), "Original skill guidance\n\n" + prompt);
+    expect(await findPlaySceneImageKey(runDir, 2, "The door is closed.", "Workshop")).toBe(key);
+    expect(await findPlaySceneImageKey(runDir, 2, "The door is open.", "Workshop")).toBeUndefined();
+    expect((await readPlayImageManifest(runDir))[key]?.file).toBe("old-image.png");
+  });
+
+  it("finds ordinary new keys by the stored scene prompt without sidecars", async () => {
+    const key = "scene-turn-3-saved-id";
+    await setPlayImageEntry(runDir, key, {status: "ready", file: "saved-image.png", scenePrompt: buildPlaySceneImagePrompt("An empty room.")});
+    expect(await findPlaySceneImageKey(runDir, 3, "An empty room.")).toBe(key);
+    expect(await findPlaySceneImageKey(runDir, 3, "A crowded room.")).toBeUndefined();
   });
 
   it("round-trips an entry and merges without dropping existing keys", async () => {

@@ -112,10 +112,13 @@ it("reads a bound artifact through the real harness, pins pagination and reports
     expect((await read(first.facts.nextRead)).content).toBe("2\tscene-1");
     expect((await read({ artifactId: artifact.id })).content).toBe("1\tscript\n2\tscene-1\n3\tscene-2");
     expect((await read({ artifactId: artifact.id, revisionId: pending.id })).content).toBe("1\tcandidate");
-    expect((await read({ artifactId: artifact.id, workId: "reference" })).content).toBe("1\treference\n2\tscene-1\n3\tscene-2");
+    const referenceArtifact = (await loadWorkManifest(root, "reference")).artifacts.find(item =>
+      item.revisions.some(revision => revision.id === item.currentRevisionId && revision.path === "source/script.md"))!;
+    expect((await read({ artifactId: referenceArtifact.id, workId: "reference" })).content).toBe("1\treference\n2\tscene-1\n3\tscene-2");
     expect((await loadWorkManifest(root, work.id)).artifacts[0]!.currentRevisionId).toBe(artifact.currentRevisionId);
-    await writeFile(join(root, "works/script", pending.snapshotPath!), "damaged");
-    await expect(read({ artifactId: artifact.id, revisionId: pending.id })).rejects.toMatchObject({ code: "ARTIFACT_REVISION_CONFLICT" });
+    await rm(join(root, "works/script", pending.snapshotPath!));
+    // Missing selected history is reported directly; it must not silently read the current revision.
+    await expect(read({ artifactId: artifact.id, revisionId: pending.id })).rejects.toMatchObject({ code: "ARTIFACT_SNAPSHOT_UNAVAILABLE" });
     const missing = await read({ artifactId: "missing" }).then(() => null, error => JSON.parse(error.message));
     expect(missing).toMatchObject({ status: "error", code: "ARTIFACT_NOT_FOUND", recovery: { action: "workspace__inspect_work", parameters: { workId: "script" } } });
     expect(await readFile(join(root, "works/script/work.json"))).toEqual(staged);
@@ -130,7 +133,7 @@ it("keeps delivery, counts and exact options in observations and compaction with
     sourceRefs: [{ sourceId: "chapter-1" }] };
   const data = { kind: "play_turn_revised", workId: "world", completedCount: 1,
     suggestedActions: ["wait", "leave"], currentState: { turn: 10, lastEventId: "evt-10", blocked: false },
-    delivery: { status: "needs_revision", inputHash: "sha256:fixture", observations: [finding] },
+    delivery: { status: "needs_revision", inputHash: "legacy-fixture-input", observations: [finding] },
     graph: { body: "state details".repeat(10000) }, chapters: [{ content: "manuscript".repeat(10000) }],
   };
   const rendered = renderActionResultForAgent({ status: "success", summary: "Saved", content: "Scene",
@@ -139,7 +142,7 @@ it("keeps delivery, counts and exact options in observations and compaction with
   expect(observation.artifacts).toEqual([{ workId: "world", artifactId: "scene", revisionId: "r1", path: "source/scene.md" }]);
   expect(observation.facts).toEqual({ kind: data.kind, workId: data.workId, completedCount: 1,
     suggestedActions: data.suggestedActions, state: data.currentState,
-    delivery: { status: "needs_revision", inputHash: "sha256:fixture", observations: [projectedFinding] } });
+    delivery: { status: "needs_revision", inputHash: "legacy-fixture-input", observations: [projectedFinding] } });
   expect(observation.observations).toEqual([projectedFinding]);
   expect(data.delivery.observations[0].sourceRefs[0]!.quote).toBe("Exact quoted passage");
   const progress = JSON.parse(executionProgress([

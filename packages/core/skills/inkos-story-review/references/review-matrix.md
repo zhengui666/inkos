@@ -18,7 +18,17 @@ Adjust by form:
 - Commercial serials require continuation pressure without sacrificing scene completeness.
 - Literary work may trade plot velocity for perception, language, or thematic movement, but not for empty repetition.
 
-For every blocking issue, include evidence, impact, and a repair direction. Separate objective contradiction from taste preference.
+For each issue, include a passage, its reading impact and a repair direction. Separate objective contradiction from the chosen reader experience. An operational failure or a length count does not determine prose quality.
+
+## Commercial reading promise
+
+At the scale of the promised contest, locate the protagonist's wanted gain, the action that obstructs it, the opposing interest, the protagonist's consequential choice and the changed position. Merely finding a goal, an action and a payment is insufficient. Judge how much the gain matters after the earlier pressure and whether the scene lets the reader feel it.
+
+If the requested reversal has become only cooperative task completion, repair the premise or scene design; louder insults will not supply incompatible interests. Supporting roles can be clearly helpful, selfish or malicious. Evaluate their concrete effect and basic motive, without demanding a sympathetic biography or moral ambiguity.
+
+Read dialogue as attempts to obtain, withhold, conceal, refuse or bargain. Check for distinct purposes and responses. Locate explanations that repeat what action and dialogue already establish, while preserving a new cost, reaction or implication. A payoff or rest scene may let earlier gains matter without fresh opposition.
+
+For Chinese prose, inspect natural paragraph variation around the requested 20–80-character preference and avoid habitual tiny fragments or bare question-answer chains. Do not pad paragraphs or merge speakers to satisfy a count. Check chapter length against the declared language/unit and separate it from total work length; English word budgets are independent.
 
 ## Long-form progression
 

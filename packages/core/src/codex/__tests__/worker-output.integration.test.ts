@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import { Type } from "@sinclair/typebox";
 import { createCodexClient } from "../app-server.js";
 import { runWorkerAgentTool } from "../../agent/worker-agent.js";
+import { prepareWorkerInput } from "../../agents/base.js";
 import { RadarResultToolSchema } from "../../agents/radar-tool.js";
 import type { LLMClient } from "../../llm/provider.js";
 
@@ -17,7 +18,7 @@ vi.mock("../client.js", () => ({ createCodexClient: factory }));
  * Unlike transport mocks, this verifies outputSchema reaches Responses text.format,
  * and real App Server final-item notifications reach the host's domain validator. */
 describe.skipIf(process.env.INKOS_CODEX_INTEGRATION !== "1")("Codex native structured worker transport", () => {
-  it.each(["radar", "open-schema", "dynamic"])("validates %s through the production worker", async mode => {
+  it.each(["radar", "open-schema", "dynamic", "large-input"])("validates %s through the production worker", async mode => {
     const root = await mkdtemp(join(tmpdir(), "inkos-worker-wire-"));
     const packageRoot = dirname(createRequire(import.meta.url).resolve("@openai/codex/package.json"));
     const bodies: Array<Record<string, any>> = [];
@@ -63,11 +64,18 @@ describe.skipIf(process.env.INKOS_CODEX_INTEGRATION !== "1")("Codex native struc
       _codex: { projectRoot: root, settings: { reasoningEffort: "medium", serviceTier: "default" } } };
     const validate = vi.fn((parameters: unknown) => parameters);
     try {
-      const result = await runWorkerAgentTool(client, "ignored", [{ role: "user", content: "Analyze Fixture ranking and return the requested result." }], {
+      const source = mode === "large-input" ? "原".repeat(119500) : "Analyze Fixture ranking and return the requested result.";
+      const prepared = await prepareWorkerInput({ client }, [{ role: "user", content: source }], 4096, "fixture", false);
+      const result = await runWorkerAgentTool(client, "ignored", prepared.messages, {
         name: tool, label: "Result", description: "Submit result", validate: validate as never,
         parameters: mode === "radar" ? RadarResultToolSchema : Type.Object({ value: Type.Record(Type.String(), Type.Unknown()), optional: Type.Optional(Type.String()) }),
       }, { timeoutMs: 20_000 });
       expect(result).toEqual(value);
+      expect(JSON.stringify(bodies[0]!.input)).toContain(source);
+      if (mode === "large-input") {
+        expect(prepared.inputTokens).toBeGreaterThan(117760);
+        expect(prepared.budgetTokens).toBeUndefined();
+      }
       expect(validate).toHaveBeenCalledExactlyOnceWith(value);
       expect(bodies[0]!.text.format).toMatchObject({ type: "json_schema", strict: true,
         schema: { required: ["resultJson"], additionalProperties: false } });

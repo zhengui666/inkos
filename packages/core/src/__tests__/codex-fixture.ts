@@ -107,9 +107,13 @@ export class CodexFixture {
         const params = raw as Record<string, any>;
         fixture.requests.push({ method, params: structuredClone(params) });
         if (method === 'account/read') return { account: { type: 'chatgpt', email: 'fixture@example.test', planType: 'plus' }, requiresOpenaiAuth: false } as T;
-        if (method === 'model/list') return { data: [{ id: 'fixture', model: 'fixture', isDefault: true,
-          defaultReasoningEffort: 'medium', supportedReasoningEfforts: [{ reasoningEffort: 'medium' }] }], nextCursor: null } as T;
-        if (method === 'thread/start') { thread = params; return { thread: { id: threadId }, model: 'fixture' } as T; }
+        if (method === 'model/list') return { data: [
+          { id: 'fixture', model: 'fixture', isDefault: true,
+            defaultReasoningEffort: 'medium', supportedReasoningEfforts: [{ reasoningEffort: 'medium' }] },
+          { id: 'gpt-6.1-sol', model: 'gpt-6.1-sol', isDefault: false,
+            defaultReasoningEffort: 'ultra', supportedReasoningEfforts: [{ reasoningEffort: 'ultra' }], serviceTiers: [{ id: 'priority' }, { id: 'fast' }] },
+        ], nextCursor: null } as T;
+        if (method === 'thread/start') { thread = params; return { thread: { id: threadId }, model: params.model ?? 'fixture' } as T; }
         if (method === 'turn/start') { setImmediate(() => { void run(params); }); return { turn: { id: turnId } } as T; }
         if (method === 'turn/interrupt') { interrupted = true; finish('interrupted'); return {} as T; }
         throw new Error(`Unexpected fixture RPC: ${method}`);

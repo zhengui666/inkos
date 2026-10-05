@@ -21,7 +21,7 @@ describe("capability-scoped Codex project configuration", () => {
     const root = await project();
     const result = await resolveEffectiveLLMConfig({ consumer, projectRoot: root, envLayers, purpose: "codex" });
     expect(result.diagnostics.configMode).toBe("codex");
-    expect(result.llm).toMatchObject({ service: "codex", model: "codex-default", apiKey: "" });
+    expect(result.llm).toMatchObject({ service: "codex", model: "gpt-6.1-sol", apiKey: "" });
     const client = createLLMClient(result.llm, root);
     expect(client._codex?.projectRoot).toBe(root);
     expect(client._piModel).toBeUndefined();

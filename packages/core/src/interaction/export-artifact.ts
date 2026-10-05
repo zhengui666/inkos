@@ -37,7 +37,7 @@ export class ChapterExportSourceError extends Error {
   }
 }
 
-function buildChapterFileLookup(files: ReadonlyArray<string>, chapters: ReadonlyArray<{ readonly number: number }>): ReadonlyMap<number, string> {
+export function buildChapterFileLookup(files: ReadonlyArray<string>, chapters: ReadonlyArray<{ readonly number: number }>): ReadonlyMap<number, string> {
   const lookup = new Map<number, string>();
   const indexed = new Set<number>();
   const duplicateIndexNumbers = new Set<number>();

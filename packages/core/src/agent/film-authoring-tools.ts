@@ -5,7 +5,6 @@ import type { LLMClient } from "../llm/provider.js";
 import { runWorkerAgentTool } from "./worker-agent.js";
 import { loadStoryGraph, storyGraphPath } from "../interactive-film/graph-store.js";
 import { readFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
 import { validateStoryGraph } from "../interactive-film/validation.js";
 import { buildFilmAuthoringContext } from "../interactive-film/film-context.js";
 import {
@@ -379,13 +378,12 @@ export function createDraftStructureTool(
         const candidate=StoryGraphSchema.parse({...(graph??{schemaVersion:1,projectId,title:projectId}),nodes,endings,variables});
         const requirements=await readFilmRequirements(projectRoot,projectId);
         if(requirements){const report=checkFilmRequirements(candidate,requirements);if(report.status!=='checks_passed')throw Object.assign(new Error(JSON.stringify({code:'FILM_REFERENCE_REQUIREMENTS_UNMET',issues:report.issues})),{code:'FILM_REFERENCE_REQUIREMENTS_UNMET',issues:report.issues});}
-        const sourceHash='sha256:'+createHash('sha256').update(referenceBytes).digest('hex');
         const {graph:next,rev}=await applyGraphDelta({projectRoot,projectId,phase:'structure',delta:{
           nodes:{upsert:nodes,remove:graph?.nodes.filter(node=>!nodes.some(item=>item.id===node.id)).map(node=>node.id)??[]},
           variables:{upsert:reference.variables,remove:[]},endings:{upsert:endings,remove:graph?.endings.filter(ending=>!endings.some(item=>item.id===ending.id)).map(ending=>ending.id)??[]},notes:[],
         }});
         const missingSceneNodeIds=next.nodes.filter(node=>!node.sceneDesc.trim()).map(node=>node.id);
-        return textResult(`Reference topology applied: ${next.nodes.length} nodes; ${missingSceneNodeIds.length} scenes still need generation.`,graphUpdatedDetails(rev,{skillIds:deps.skillIds?.()??[],referenceTopology:{workId:params.referenceWorkId,sourceHash},missingSceneNodeIds}));
+        return textResult(`Reference topology applied: ${next.nodes.length} nodes; ${missingSceneNodeIds.length} scenes still need generation.`,graphUpdatedDetails(rev,{skillIds:deps.skillIds?.()??[],referenceTopology:{workId:params.referenceWorkId},missingSceneNodeIds}));
       }
       const context = graph ? buildFilmAuthoringContext(graph) : "(empty graph)";
       const systemPrompt = language === "en" ? STRUCT_SYSTEM_EN : STRUCT_SYSTEM_ZH;

@@ -6,7 +6,7 @@ import type { CodexSettings, CodexReasoningEffort } from './types.js';
 export type { CodexSettings, CodexReasoningEffort } from './types.js';
 export type CodexSettingsPatch = Partial<Omit<CodexSettings, 'model'>> & { model?: string | null };
 export const DEFAULT_CODEX_SETTINGS: Readonly<CodexSettings> = Object.freeze({
-  reasoningEffort: 'medium', serviceTier: 'default',
+  model: 'gpt-6.1-sol', reasoningEffort: 'ultra', serviceTier: 'priority',
 });
 const efforts = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 const allowed = new Set(['model', 'reasoningEffort', 'serviceTier']);
@@ -64,7 +64,9 @@ export async function updateCodexSettings(projectRoot: string, value: unknown): 
     await mkdir(dir, { recursive: true, mode: 0o700 });
     const temp = join(dir, `codex-config.${randomUUID()}.tmp`);
     try {
-      await writeFile(temp, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+      // Keep an explicit catalog-default choice across reads after adding a model default.
+      const persisted = settings.model === undefined ? { ...settings, model: null } : settings;
+      await writeFile(temp, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
       await rename(temp, join(dir, 'codex-config.json'));
       return settings;
     } finally {

@@ -1,7 +1,6 @@
 import { createBuiltInWorkProfileRegistry } from "../builtin-profiles.js";
 import { Type, type Static } from "@mariozechner/pi-ai";
 import type { AgentTool } from "../../codex/contracts.js";
-import { createHash } from "node:crypto";
 import { validatedArtifactWrites } from "../artifact-validation.js";
 import { assertGenericArtifactEditable } from '../artifact-edit-policy.js';
 import { loadWorkManifest } from "../work-store.js";
@@ -78,8 +77,8 @@ export function createReplaceWorkArtifactTool(
       }
       const currentContent = await readFile(join(projectRoot, "works", workId, current.path), "utf-8");
       if (currentContent === params.content) throw new Error(`Work artifact already has the supplied content: ${current.path}`);
-      if (current.checksum !== `sha256:${createHash("sha256").update(currentContent).digest("hex")}`) {
-        throw Object.assign(new Error("Source changed since its registered revision"), { code: "ARTIFACT_REVISION_CONFLICT" });
+      if (current.snapshotPath && await readFile(join(projectRoot, "works", workId, current.snapshotPath), "utf8") !== currentContent) {
+        throw Object.assign(new Error("Source changed since this revision was opened"), { code: "ARTIFACT_REVISION_CONFLICT" });
       }
       const writes = validatedArtifactWrites(work, current.path, params.content, profile,currentContent);
       const updated = await syncWorkSourceArtifacts({ projectRoot, workId, accept: true, writes, acceptPaths:writes.map(write=>write.relativePath.slice(`works/${workId}/`.length)),
@@ -124,7 +123,6 @@ export function createAdoptWorkRevisionTool(projectRoot: string, workId: string)
       if (artifact.currentRevisionId !== params.expectedCurrentRevisionId) throw Object.assign(new Error("Current revision changed"), { code: "ARTIFACT_REVISION_CONFLICT" });
       if (!revision.path.startsWith("source/")) throw Object.assign(new Error("Use this domain's revision action"), { code: "ARTIFACT_DERIVED" });
       const bytes = await readFile(join(projectRoot, "works", workId, revision.snapshotPath ?? revision.path));
-      if (`sha256:${createHash("sha256").update(bytes).digest("hex")}` !== revision.checksum) throw Object.assign(new Error("Revision snapshot does not match recorded content"), { code: "ARTIFACT_SNAPSHOT_UNAVAILABLE" });
       const currentBytes=artifact.currentRevisionId?(await readArtifactRevision({projectRoot,workId,artifactId:artifact.id,revisionId:artifact.currentRevisionId})).bytes:undefined;
       const writes = revision.contentType.startsWith("text/") || revision.contentType === "application/json"
         ? validatedArtifactWrites(work, revision.path, bytes.toString("utf8"), profile,currentBytes?.toString("utf8"))

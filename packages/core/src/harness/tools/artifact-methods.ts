@@ -24,8 +24,8 @@ import {Value} from '@sinclair/typebox/value';
 interface ReviewComparison {
   scope: 'episode_start' | 'parent_revision';
   sourceId: string;
-  before: {revisionId: string; checksum: string};
-  after: {revisionId: string; checksum: string};
+  before: {revisionId: string; checksum?: string};
+  after: {revisionId: string; checksum?: string};
   changedRegion: ReturnType<typeof changedSourceRegion>;
 }
 
@@ -92,7 +92,7 @@ class ArtifactWorker extends BaseAgent {
     },{maxTokens:Math.min(8192,this.ctx.client.defaults.maxTokens),temperature:0.2,professionalGuidance:false});
     return selected.result.wholeDocument ? textRangeEditContract(content,[{startLine:1,endLine:splitSourceLines(content).length}]) : textScopedSelectionEditContract(content,selected.result.selections);
   }
-  async review(sources: ReadonlyMap<string, string>, instruction: string, criteria: string[], paths: ReadonlyMap<string,string>, versions:ReadonlyMap<string,{revisionId:string;checksum:string}>, comparison?: ReviewComparison, structure?: unknown) {
+  async review(sources: ReadonlyMap<string, string>, instruction: string, criteria: string[], paths: ReadonlyMap<string,string>, versions:ReadonlyMap<string,{revisionId:string;checksum?:string}>, comparison?: ReviewComparison, structure?: unknown) {
     const authorRequest = currentExecutionAuthorRequest();
     const response = await this.submitSourcedReview([
       ...(authorRequest?.trim() ? [{role:"system" as const,content:"Judge this artifact and its verified changes against the author's original instruction. Other artifacts and operations remain outside this review."}] : []),
@@ -155,7 +155,7 @@ export function createArtifactMethodTools(pipeline: PipelineRunner, root: string
       const sources = new Map([[artifact.id, content]]);
       const paths = new Map([[artifact.id, revision.path]]);
       const versions=new Map([[artifact.id,{revisionId:revision.id,checksum:revision.checksum}]]);
-      const references: Array<{ artifactId: string; revisionId: string; checksum: string }> = [];
+      const references: Array<{ artifactId: string; revisionId: string; checksum?: string }> = [];
       let comparison: ReviewComparison | undefined;
       if (mode === 'review') {
         const baselineId = baselineWork === undefined ? revision.parentRevisionId
@@ -217,11 +217,11 @@ export function createArtifactMethodTools(pipeline: PipelineRunner, root: string
         }
         const authorRequest = currentExecutionAuthorRequest();
         const scope = authorRequest?.trim() ? authorRequest : params.instruction;
-        let structure: (ReturnType<typeof inspectFilmGraph> & {revisionId:string;targetHash:string}) | undefined;
+        let structure: (ReturnType<typeof inspectFilmGraph> & {revisionId:string}) | undefined;
         if(profile.capabilityIds.includes('interactive-film')&&revision.path==='source/story-graph.json'){
           const requirementId=[...paths].find(([,path])=>path==='source/delivery-requirements.json')?.[0];
           const requirements=requirementId?Value.Parse(FilmRequirementsSchema,JSON.parse(sources.get(requirementId)!)) as FilmRequirements:undefined;
-          structure={revisionId:revision.id,targetHash:revision.checksum,...inspectFilmGraph(StoryGraphSchema.parse(JSON.parse(content)),requirements)};
+          structure={revisionId:revision.id,...inspectFilmGraph(StoryGraphSchema.parse(JSON.parse(content)),requirements)};
         }
         const review = await worker.review(sources, params.instruction, profile.qualityCriteria, paths, versions, comparison, structure);
         const observations = review.observations.map(observation => ({ ...observation,
