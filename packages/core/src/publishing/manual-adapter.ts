@@ -5,6 +5,7 @@ import { buildExportArtifact } from '../interaction/export-artifact.js';
 import { readArtifactRevision } from '../harness/artifact-reader.js';
 import { loadWorkManifest } from '../harness/work-store.js';
 import { HarnessIdSchema } from '../harness/contracts.js';
+import { runInWorkMutationQueue } from '../utils/work-mutation-scope.js';
 import {
   PublishingSelectionSchema, PublishingFormatsSchema, PublishingManifestSchema, publishingManifestValue, publishingError,
   type PublishingSelection, type PublishingManifest, type PublishingPackage, type PublishingTarget,
@@ -115,6 +116,13 @@ export class ManualPublishingAdapter {
   }
 
   private async finishPreparation(preparation: PublishingPreparation, root: string): Promise<PublishingPackage> {
+    // Separate adapters must not read a staging directory while another local
+    // caller promotes it. Each queued caller still checks its own frozen record.
+    return runInWorkMutationQueue(`publishing-promotion\0${join(root, preparation.manifest.id)}`,
+      () => this.promotePreparation(preparation, root));
+  }
+
+  private async promotePreparation(preparation: PublishingPreparation, root: string): Promise<PublishingPackage> {
     const {manifest, stagingDirectory} = preparation;
     const directory = join(root, manifest.id);
     if (!await this.readExistingManifest(directory)) {

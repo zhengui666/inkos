@@ -41,6 +41,8 @@ The original manuscripts and Work manifest are unchanged. Later writing cannot c
 
 Legacy packages keep their original IDs and receipts. `legacyFilesWithoutSnapshot` in the CLI result identifies old export files without retained original bytes; those bytes are not independently proven frozen. No new content digest is calculated.
 
+Inside one Node process, promotion of the same canonical package directory is serialized across adapter/store instances. Each caller independently verifies its expected manifest and retained bytes before registration. Different packages can proceed independently. Separate CLI processes still use the existing SQLite reservation and destination readback; this local queue is not a cross-process lock. Filesystem failures without a complete verified destination remain errors, with the authoritative pending reservation retained for recovery using the same selection.
+
 TXT/Markdown exports can be used for copying/import **only where the current author portal supports that format**. EPUB is also useful for review; platform EPUB import support is not assumed. Platform chapter-length, review, AI disclosure and rights requirements are deliberately not hardcoded from old help pages.
 
 ## Manual submission and receipt

@@ -1,11 +1,13 @@
-import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { setImmediate as nextTurn } from 'node:timers/promises';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createInitialWorkManifestWrite, syncWorkSourceArtifacts } from '../harness/source-sync.js';
 import { loadWorkManifest } from '../harness/work-store.js';
 import { commitAtomicFileSet } from '../utils/atomic-file-set.js';
-import { ManualPublishingAdapter, PublishingStore, listPublishingCapabilities, type PublishingManifest } from '../publishing/index.js';
+import { ManualPublishingAdapter, PublishingStore, listPublishingCapabilities, type PublishingManifest, type PublishingPackage } from '../publishing/index.js';
+import type { PublishingPreparation } from '../publishing/store.js';
 
 let root: string;
 let store: PublishingStore;
@@ -28,6 +30,27 @@ async function prepare(number = 1, formats: Array<'txt'|'md'|'epub'> = ['txt', '
 }
 function action(pkg: Awaited<ReturnType<typeof prepare>>, eventId = 'begin-1') {
   return {packageId: pkg.manifest.id, chapterNumber: 1, expectedVersion: pkg.version, eventId};
+}
+
+type Promotion = {
+  finishPreparation(preparation: PublishingPreparation, root: string): Promise<PublishingPackage>;
+  readExistingManifest(directory: string): Promise<PublishingManifest | undefined>;
+  verifyExpectedManifest(directory: string, manifest: PublishingManifest): Promise<void>;
+};
+async function reserved(number = 1): Promise<PublishingPreparation> {
+  const reserve = store.reservePreparation.bind(store);
+  store.reservePreparation = (...args) => { reserve(...args); throw new Error('interrupted before promotion'); };
+  try { await expect(prepare(number, ['txt', 'md', 'epub'])).rejects.toThrow('interrupted before promotion'); }
+  finally { store.reservePreparation = reserve; }
+  return store.listPreparations().find(item => item.manifest.chapters[0]!.number === number)!;
+}
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+}
+async function waitUntilEntered(entered: ReturnType<typeof deferred>, task: Promise<PublishingPackage>) {
+  await Promise.race([entered.promise, task.then(() => { throw new Error('Promotion completed without reaching the controlled staging read'); })]);
 }
 
 describe('manual publishing flow', () => {
@@ -168,6 +191,111 @@ describe('manual publishing flow', () => {
       await adapter.verify(first.manifest.id);
       expect(store.listPackages()).toHaveLength(1);
     } finally { secondStore.close(); }
+  });
+
+  it('serializes the full promotion across stores and independently checks each queued manifest', async () => {
+    const pending = await reserved(), packageRoot = await realpath(join(root, '.inkos/publishing'));
+    const staging = join(packageRoot, pending.stagingDirectory!);
+    const secondStore = new PublishingStore(join(root, '.inkos/harness.sqlite'));
+    const secondAdapter = new ManualPublishingAdapter(root, secondStore);
+    const first = adapter as unknown as Promotion, second = secondAdapter as unknown as Promotion;
+    const entered = deferred(), release = deferred();
+    const verify = first.verifyExpectedManifest.bind(adapter);
+    first.verifyExpectedManifest = async (directory, manifest) => {
+      if (directory === staging) { entered.resolve(); await release.promise; }
+      return verify(directory, manifest);
+    };
+    let secondReads = 0;
+    const read = second.readExistingManifest.bind(secondAdapter);
+    second.readExistingManifest = async directory => { secondReads++; return read(directory); };
+    const tasks: Promise<PublishingPackage>[] = [];
+    try {
+      tasks.push(first.finishPreparation(pending, packageRoot));
+      await waitUntilEntered(entered, tasks[0]!);
+      tasks.push(second.finishPreparation(pending, packageRoot));
+      tasks.push(second.finishPreparation({...pending, manifest: {...pending.manifest, title: 'Different expected title'}}, packageRoot));
+      expect(secondReads).toBe(0);
+      release.resolve();
+      const [one, two, invalid] = await Promise.allSettled(tasks);
+      expect(one.status).toBe('fulfilled'); expect(two.status).toBe('fulfilled');
+      if (one.status !== 'fulfilled' || two.status !== 'fulfilled') throw new Error('Expected both valid promotions to finish');
+      expect(one.value).toEqual(two.value);
+      expect(secondReads).toBeGreaterThan(0);
+      expect(invalid.status).toBe('rejected');
+      if (invalid.status === 'rejected') expect(invalid.reason).toMatchObject({code: 'PUBLISHING_PACKAGE_INTEGRITY'});
+      const result = await adapter.verify(one.value.manifest.id);
+      for (const file of pending.manifest.files) expect(await readFile(join(result.directory, file.path))).toEqual(Buffer.from(file.contentBase64!, 'base64'));
+      expect(store.listPackages()).toHaveLength(1);
+    } finally { release.resolve(); await Promise.allSettled(tasks); secondStore.close(); }
+  });
+
+  it('preserves the original promotion error and releases a queued caller to recover retained staging', async () => {
+    const pending = await reserved(), packageRoot = await realpath(join(root, '.inkos/publishing'));
+    const staging = join(packageRoot, pending.stagingDirectory!);
+    const secondStore = new PublishingStore(join(root, '.inkos/harness.sqlite'));
+    const secondAdapter = new ManualPublishingAdapter(root, secondStore);
+    const first = adapter as unknown as Promotion, second = secondAdapter as unknown as Promotion;
+    const entered = deferred(), release = deferred();
+    const failure = Object.assign(new Error('original permission failure'), {code: 'EPERM'});
+    const verifyFirst = first.verifyExpectedManifest.bind(adapter);
+    first.verifyExpectedManifest = async (directory, manifest) => {
+      if (directory === staging) { entered.resolve(); await release.promise; throw failure; }
+      return verifyFirst(directory, manifest);
+    };
+    let retained = false;
+    const verifySecond = second.verifyExpectedManifest.bind(secondAdapter);
+    second.verifyExpectedManifest = async (directory, manifest) => {
+      if (directory === staging) { expect(store.findPreparation(pending.manifest.operationKey)).toEqual(pending); retained = true; }
+      return verifySecond(directory, manifest);
+    };
+    const tasks: Promise<PublishingPackage>[] = [];
+    try {
+      tasks.push(first.finishPreparation(pending, packageRoot));
+      await waitUntilEntered(entered, tasks[0]!);
+      tasks.push(second.finishPreparation(pending, packageRoot));
+      release.resolve();
+      const [failed, recovered] = await Promise.allSettled(tasks);
+      expect(failed.status).toBe('rejected');
+      if (failed.status === 'rejected') expect(failed.reason).toBe(failure);
+      expect(recovered.status).toBe('fulfilled'); expect(retained).toBe(true);
+      if (recovered.status !== 'fulfilled') throw new Error('Expected retained staging recovery');
+      expect(recovered.value.manifest.id).toBe(pending.manifest.id);
+      await adapter.verify(recovered.value.manifest.id);
+      expect(store.listPackages()).toHaveLength(1);
+      expect(store.findPreparation(pending.manifest.operationKey)).toBeUndefined();
+    } finally { release.resolve(); await Promise.allSettled(tasks); secondStore.close(); }
+  });
+
+  it('allows a different package promotion while one package is waiting', async () => {
+    const pending = await reserved(1), other = await reserved(2);
+    const packageRoot = await realpath(join(root, '.inkos/publishing'));
+    const first = adapter as unknown as Promotion;
+    const secondStore = new PublishingStore(join(root, '.inkos/harness.sqlite'));
+    const secondAdapter = new ManualPublishingAdapter(root, secondStore);
+    const second = secondAdapter as unknown as Promotion;
+    const entered = deferred(), release = deferred();
+    const verify = first.verifyExpectedManifest.bind(adapter);
+    first.verifyExpectedManifest = async (directory, manifest) => {
+      if (directory === join(packageRoot, pending.stagingDirectory!)) { entered.resolve(); await release.promise; }
+      return verify(directory, manifest);
+    };
+    let secondReads = 0;
+    const read = second.readExistingManifest.bind(secondAdapter);
+    second.readExistingManifest = async directory => { secondReads++; return read(directory); };
+    const tasks: Promise<PublishingPackage>[] = [];
+    try {
+      tasks.push(first.finishPreparation(pending, packageRoot));
+      await waitUntilEntered(entered, tasks[0]!);
+      const independent = second.finishPreparation(other, packageRoot); tasks.push(independent);
+      // Yield the microtask queue without a timer: a mistaken global queue must
+      // fail here and release the first gate instead of deadlocking this test.
+      await nextTurn();
+      expect(secondReads).toBeGreaterThan(0);
+      expect((await independent).manifest.id).toBe(other.manifest.id);
+      expect(store.findPreparation(pending.manifest.operationKey)).toEqual(pending);
+      release.resolve(); await Promise.all(tasks);
+      expect(store.listPackages()).toHaveLength(2);
+    } finally { release.resolve(); await Promise.allSettled(tasks); secondStore.close(); }
   });
 
   it('rechecks SQLite when another preparer finishes between DB lookup and directory read', async () => {
