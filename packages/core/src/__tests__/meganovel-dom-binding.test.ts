@@ -45,7 +45,7 @@ async function fixture(context: BrowserContext) {
     {number: 3, id: '103', title: 'Third', body: 'Third chapter body.\n', published: true},
   ];
   const state = {chapters, saveCount: 0, publishCount: 0, accountId: '700', overflow: false,
-    lastSavedEditor: undefined as {body: string; html: string} | undefined};
+    lastSavedEditor: undefined as {body: string; html: string} | undefined, readerRequests: [] as string[]};
   const handler = async (route: Route) => {
     const url = new URL(route.request().url());
     if (url.origin !== origin) return route.abort();
@@ -72,6 +72,7 @@ async function fixture(context: BrowserContext) {
       const chapter = chapters.find(item => item.id === url.searchParams.get('chapterId'));
       html = editor(chapters, chapter, state.overflow);
     } else if (url.pathname.startsWith('/story/Fixture_99/')) {
+      state.readerRequests.push(url.href);
       const id = /_(\d+)$/u.exec(url.pathname)?.[1];
       const chapter = chapters.find(item => item.id === id && item.published);
       html = chapter ? `<div>Cached catalog count: 1</div><div class="read-box chapter-out" data-chapterid="${chapter.id}" data-chaptername="${escape(chapter.title)}">
@@ -90,10 +91,11 @@ function editor(chapters: Chapter[], chapter: Chapter | undefined, overflow: boo
   return `<div class="top"><div class="side-bar-title" onclick="location.href='/create_chapter/99'">New Chapter</div></div>
     <ul class="episode-list" style="height:${overflow ? 120 : 660}px;overflow:auto;margin:0;padding:0;list-style:none">${empty}${rows}</ul>
     <input type="text" placeholder="Chapter title" value="${escape(chapter?.title ?? '')}"><iframe style="height:120px;width:700px" srcdoc="${escape(iframe)}"></iframe>
-    <div class="menu-publish menu_save" onclick="save()">Save</div><div class="menu-publish menu_preview mr0" onclick="window.open('/story/Fixture_99/Observed_'+id)">Preview</div>
+    <div class="menu-publish menu_save" onclick="save()">Save</div><div class="menu-publish menu_preview mr0" onclick="preview()">Preview</div>
     ${!chapter?.published ? '<div class="menu-publish menu_pub" onclick="document.querySelector(\'#dialog\').style.display=\'block\'">PUBLISH</div>' : ''}
     <div id="dialog" style="display:none"><div>Publish Schedule</div><label><input type="radio" name="schedule" value="now">Now</label><label><input type="radio" name="schedule" value="later">Later</label><button onclick="publish()">Confirm</button><button>CANCEL</button></div>
     <script>let id=${scriptJson(chapter?.id)};
+      function preview(){window.open('/story/Fixture_99/Observed_'+id);}
       async function save(){const r=await fetch('/__fixture_save',{method:'POST',body:JSON.stringify({id,title:document.querySelector('input[placeholder]').value,body:document.querySelector('iframe').contentDocument.body.innerText,html:document.querySelector('iframe').contentDocument.body.innerHTML})});id=(await r.json()).id;location.href='/create_chapter/99?chapterId='+id;}
       async function publish(){await fetch('/__fixture_publish',{method:'POST',body:JSON.stringify({id})});location.reload();}
     </script>`;
@@ -141,6 +143,7 @@ browserFixtures('MegaNovel observed DOM binding in an isolated network-blocked C
     await binding.submit(page, {...input, remoteChapterId: '104'}, signal);
     const published = await binding.snapshot(page, {...input, expectedTitle: input.title, remoteChapterId: '104'}, signal);
     expect(published.candidates[0]!.status).toBe('published');
+    expect(state.readerRequests.filter(url => url === publicUrl(state.chapters[3]!))).toHaveLength(2);
     expect(published.candidates[0]!.title).toBe(input.title);
     expect(normalizeMegaNovelBodyText(published.candidates[0]!.content)).toBe(normalizeMegaNovelBodyText(input.content));
     expect(state.saveCount).toBe(1);
