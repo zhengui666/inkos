@@ -29,7 +29,7 @@ describe('MegaNovel observed DOM configuration', () => {
 // Every page request is intercepted below; no real MegaNovel account or site is accessed.
 const browserFixtures = process.env.INKOS_BROWSER_FIXTURES === '1' ? describe : describe.skip;
 let browser: Browser | undefined;
-afterEach(async () => { await browser?.close(); browser = undefined; });
+afterEach(async () => { await browser?.close(); browser = undefined; vi.restoreAllMocks(); });
 
 type Chapter = {number: number; id: string; title: string; body: string; published: boolean};
 const origin = 'https://www.meganovel.com';
@@ -100,7 +100,13 @@ function editor(chapters: Chapter[], chapter: Chapter | undefined, overflow: boo
 }
 
 browserFixtures('MegaNovel observed DOM binding in an isolated network-blocked Chromium fixture', () => {
-  it('reads real-shaped history, ignores stale totals/empty placeholder, and writes/publishes one new chapter through UI only', async () => {
+  it.each([
+    ['paragraph gap', 'A new reviewed paragraph.\n\nFinal paragraph.\n'],
+    ['single line break', 'First line.\nSecond line.'],
+    ['consecutive blank lines', 'First line.\n\n\nLast line.'],
+    ['leading blank lines', '\n\nFirst paragraph.\nLast paragraph.\n'],
+    ['physical line endings', 'First line.\r\n\r\nLast line.\r\n'],
+  ])('preserves frozen text through draft and publication: %s', async (_description, chapterBody) => {
     browser = await chromium.launch({headless: true, ...(process.env.INKOS_FIXTURE_CHROMIUM ? {executablePath: process.env.INKOS_FIXTURE_CHROMIUM} : {})});
     const context = await browser.newContext();
     const state = await fixture(context);
@@ -124,7 +130,7 @@ browserFixtures('MegaNovel observed DOM binding in an isolated network-blocked C
       expect(normalizeMegaNovelBodyText(snapshot.candidates[0]!.content)).toBe(normalizeMegaNovelBodyText(chapter.body));
     }
     const input = {packageId: 'fixture-four', chapterNumber: 4, scope, aiAssisted: true,
-      title: 'Fourth', content: 'A new reviewed paragraph.\n\nFinal paragraph.\n', revisionId: 'fixture-revision'};
+      title: 'Fourth', content: chapterBody, revisionId: 'fixture-revision'};
     expect((await binding.snapshot(page, {...input, expectedTitle: input.title}, signal)).candidates).toEqual([]);
     await binding.createDraft(page, input, signal);
     expect(normalizeMegaNovelBodyText(state.lastSavedEditor!.body), JSON.stringify(state.lastSavedEditor)).toBe(normalizeMegaNovelBodyText(input.content));
@@ -135,6 +141,8 @@ browserFixtures('MegaNovel observed DOM binding in an isolated network-blocked C
     await binding.submit(page, {...input, remoteChapterId: '104'}, signal);
     const published = await binding.snapshot(page, {...input, expectedTitle: input.title, remoteChapterId: '104'}, signal);
     expect(published.candidates[0]!.status).toBe('published');
+    expect(published.candidates[0]!.title).toBe(input.title);
+    expect(normalizeMegaNovelBodyText(published.candidates[0]!.content)).toBe(normalizeMegaNovelBodyText(input.content));
     expect(state.saveCount).toBe(1);
     expect(state.publishCount).toBe(1);
     expect(state.chapters).toHaveLength(4);
