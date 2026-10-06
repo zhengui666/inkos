@@ -1,8 +1,8 @@
 import type { Frame, Locator, Page } from 'playwright-core';
 import { z } from 'zod';
 import { publishingError } from './contracts.js';
-import { normalizeMegaNovelBodyText, type MegaNovelBrowserPort, type MegaNovelProbe,
-  type MegaNovelScope, type MegaNovelSnapshot } from './meganovel-contracts.js';
+import { normalizeMegaNovelBodyText, MegaNovelSnapshotRequestSchema, type MegaNovelBrowserPort, type MegaNovelProbe,
+  type MegaNovelScope, type MegaNovelSnapshot, type MegaNovelSnapshotRequest } from './meganovel-contracts.js';
 import type { MegaNovelDomBinding } from './meganovel-cdp.js';
 
 const ORIGIN = 'https://www.meganovel.com';
@@ -38,7 +38,8 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
     throw publishingError('MEGANOVEL_DOM_CONFIG', 'Known chapter numbers and remote IDs must be unique.');
   }
   const recent = new Map<string, string>();
-  const key = (input: {packageId: string; chapterNumber: number}) => `${input.packageId}:${input.chapterNumber}`;
+  const key = (input: {scope: MegaNovelScope; chapterNumber: number}) =>
+    JSON.stringify([input.scope.sessionId, input.scope.accountId, input.scope.remoteBookId, input.chapterNumber]);
   const known = (number: number) => config.knownChapters.find(c => c.number === number);
 
   async function beforeEditorEffect(page: Page, scope: MegaNovelScope, signal: AbortSignal) {
@@ -73,7 +74,7 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
     return {scope, origin: ORIGIN, blocker: 'none'};
   }
 
-  async function snapshot(page: Page, input: Parameters<MegaNovelBrowserPort['snapshot']>[0], signal: AbortSignal): Promise<MegaNovelSnapshot> {
+  async function snapshot(page: Page, input: MegaNovelSnapshotRequest, signal: AbortSignal): Promise<MegaNovelSnapshot> {
     await probe(page, input.scope, signal);
     const expected = known(input.chapterNumber);
     const expectedTitle = input.expectedTitle ?? expected?.title;
@@ -146,6 +147,7 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
     calibration: {observedAt: '2026-10-06T00:00:00Z',
       evidence: 'Calibration date has day precision; the midnight timestamp does not identify a session. Authorized visible author-center account menu, editor/TinyMCE, chapter rows and public reader observations on 2026-10-06. Overflow and new UI remain unsupported.'},
     probe, snapshot,
+    observeSnapshot: (page, input, signal) => snapshot(page, MegaNovelSnapshotRequestSchema.parse(input), signal),
     async createDraft(page, input, signal) {
       await probe(page, input.scope, signal);
       const newChapter = page.locator('div.top div.side-bar-title').filter({hasText: /^New Chapter$/u});

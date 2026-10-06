@@ -110,7 +110,10 @@ export async function runProgram(
   hooks: ProgramHooks = {},
 ): Promise<void> {
   const program = createProgram(hooks);
-  program.hook("preAction", async () => {
+  program.hook("preAction", async (_command, actionCommand) => {
+    // Match the actual parsed command; an argument named preflight must not disable recovery.
+    if (actionCommand.name() === 'preflight' && actionCommand.parent?.name() === 'publishing'
+      && actionCommand.parent.parent === program) return;
     let root: string;
     try { root = findProjectRoot(); }
     catch { return; } // init and help may run outside a project.

@@ -3,9 +3,10 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { chapterDocumentBody } from '../utils/chapter-document.js';
 import { publishingError } from './contracts.js';
+import {compareMegaNovelChapter} from './meganovel-observation.js';
 import { ManualPublishingAdapter } from './manual-adapter.js';
 import { PublishingStore } from './store.js';
-import { MegaNovelIntentSchema, MegaNovelProbeSchema, MegaNovelScopeSchema, MegaNovelSnapshotSchema, normalizeMegaNovelBodyText,
+import { MegaNovelIntentSchema, MegaNovelProbeSchema, MegaNovelScopeSchema, MegaNovelSnapshotSchema,
   type MegaNovelIntent, type MegaNovelRun, type MegaNovelScope, type MegaNovelSnapshot,
   type MegaNovelBrowserPort } from './meganovel-contracts.js';
 
@@ -132,16 +133,14 @@ export class MegaNovelPublishingAdapter {
     return snapshot;
   }
   private find(snapshot: MegaNovelSnapshot, chapter: {number: number; title: string; content: string}, prior?: MegaNovelRun) {
-    if (!snapshot.complete) throw publishingError('MEGANOVEL_INCOMPLETE_LOOKUP', 'Check drafts and submission/publication views before writing.');
-    if (snapshot.candidates.length > 1) throw publishingError('MEGANOVEL_DUPLICATE_CHAPTER', 'Multiple rows match this chapter. Resolve without writing.');
-    const found = snapshot.candidates[0];
-    if (found && (found.number !== chapter.number || found.title !== chapter.title
-      || normalizeMegaNovelBodyText(found.content) !== normalizeMegaNovelBodyText(chapter.content)
-      || prior?.remoteChapterId && prior.remoteChapterId !== found.remoteChapterId)) {
-      throw publishingError('MEGANOVEL_CONTENT_CONFLICT', 'Remote chapter identity/title/body differs from the frozen revision.');
+    const comparison = compareMegaNovelChapter(snapshot, chapter, prior?.remoteChapterId ?? undefined);
+    if (comparison.errors.length) {
+      const failure = comparison.errors[0]!;
+      throw publishingError(failure.code, failure.message);
     }
-    return found;
+    return snapshot.candidates[0];
   }
+
   private assertDisclosure(disclosure: string, aiAssisted: boolean) {
     if (disclosure === 'unverified' || disclosure !== 'not_present'
       && disclosure !== (aiAssisted ? 'declared_ai' : 'declared_human')) {
