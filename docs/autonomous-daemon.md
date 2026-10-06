@@ -72,3 +72,57 @@ The ownership regressions use temporary projects, real SQLite locks and disposab
 For host deployment, stop the existing supervisor through its established service workflow, confirm the old process has exited, then replace the validated source and restart that same service. On a host already using the supplied systemd user unit, the commands are `systemctl --user stop inkos-daemon.service`, `systemctl --user start inkos-daemon.service`, `systemctl --user status inkos-daemon.service`, and `journalctl --user -u inkos-daemon.service --since "10 minutes ago"`. Use the actual installed service name; these commands do not install a service or authorize starting writing/publication. Do not delete a retained owner row or sidecar to force recovery. A live legacy PID mismatch requires operator verification.
 
 A green temporary-process regression establishes the ownership mechanism only. A production supervisor restart, two natural source/writing periods and continuous 24-hour operation still require separate acceptance with the authorized work allowlist and live prerequisites. Do not use a crash test against an in-flight production submission.
+
+## Studio and supervised-daemon lifecycle
+
+Studio's Start action honors the saved daemon work allowlist, market settings and
+publication polling interval. Start returns success only after the core scheduler
+has acquired ownership. Concurrent starts, an external CLI owner, or a stop still
+draining return a conflict; no second owner is started. Stop waits for in-flight
+work to settle before reporting stopped. A stop during configuration cancels that
+startup. A failed drain is visible and does not admit a replacement.
+
+The Studio daemon status has an explicit `scope: "studio"` and lifecycle `phase`.
+It describes the scheduler started by that Studio process. It is not proof that a
+separate CLI daemon is stopped. Use `inkos daemon-status --json` and the installed
+host service status for a separately supervised daemon. Studio does not reload or
+restart its in-memory daemon after a Studio process restart. A persistent writing
+service must therefore run the built CLI `up` entry as its own supervised process,
+with the approved project, work allowlist and publication configuration. Keep
+Studio as a separate UI service; do not press Start Daemon while the CLI service
+owns the project. Studio alone does not establish unattended operation.
+
+Standalone Studio now handles SIGTERM/SIGINT by refusing new daemon starts,
+draining its own scheduler, closing its event streams and disposing its account
+connection. This lifecycle change does not promise recovery or graceful completion
+of every unrelated foreground Studio request. The CLI service template uses
+`KillMode=mixed` so the main process receives SIGTERM first; remaining children are
+terminated when its configured stop deadline is reached. A forced termination is
+not successful drainage. Inspect retained jobs before restarting an uncertain
+publication; never clear ownership records to make a service appear healthy.
+
+Deployment acceptance must record the actual Node/CLI paths, project root,
+service unit, work allowlist, existing model identity/budget and explicit writing
+versus publication scope. Do not install or enable a template, enable user linger,
+change sleep policy, create credentials or open a debugging port as a side effect
+of a software update. An authorized operator must separately approve and verify
+those host prerequisites. A template syntax check and a synthetic natural-minute
+process test are not a production supervisor or 24-hour acceptance result.
+
+## Reproducible isolated process checks
+
+After `pnpm build`, run `node scripts/verify-daemon-runtime.mjs /tmp/inkos-runtime-evidence.json`.
+This opt-in smoke test initializes an isolated temporary project, launches the real
+CLI and waits for real minute boundaries. Only the model-facing Agent methods are
+synthetic; scheduler ownership, fixed Goals, chapter persistence and child-process
+lifecycle are the product implementation. It checks a competing owner, a killed
+writer recovering the same Goal/deadline, two natural minute cycles and a delayed
+SIGTERM drain. It leaves the temporary project and JSON receipt for inspection.
+No production config, provider credential or remote platform is loaded. These
+synthetic chapters are not evidence of model or literary quality.
+
+`node scripts/verify-studio-shutdown.mjs` starts the compiled standalone Studio
+server in another isolated project. It keeps a real HTTP event stream connected,
+starts the real scheduler with an empty work list and future deadlines, and checks
+that SIGTERM closes the stream and releases ownership before normal process exit.
+Neither check installs or verifies an OS supervisor or establishes 24-hour uptime.

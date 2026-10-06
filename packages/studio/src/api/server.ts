@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { StudioDaemonController } from "./daemon-controller.js";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import { serve } from "@hono/node-server";
@@ -63,7 +64,6 @@ import {
   readPlayImageSettings,
   writePlayImageSettings,
   type PlayImageSettings,
-  Scheduler,
   coverSecretKey,
   normalizeCoverBaseUrl,
   resolveCoverProviderPreset,
@@ -2476,8 +2476,16 @@ async function probeServiceCapabilities(args: {
 
 // --- Server factory ---
 
+const studioShutdowns = new WeakMap<Hono, () => Promise<void>>();
+
+export async function shutdownStudioServer(app: Hono): Promise<void> {
+  await studioShutdowns.get(app)?.();
+}
+
 export function createStudioServer(initialConfig: ProjectConfig, root: string, overrides: { readonly nodeImageGenerator?: NodeImageDeps; readonly hostname?: string; readonly allowedOrigins?: readonly string[]; readonly codexAccountService?: CodexAccountService } = {}) {
   const app = new Hono();
+  const closeEventStreams = new Set<() => Promise<void>>();
+  let studioClosing = false;
   const state = new StateManager(root);
   const recoveryStore = new CreativeEpisodeStore(join(root, ".inkos", "harness.sqlite"));
   try {
@@ -3421,30 +3429,35 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
   // --- SSE ---
 
   app.get("/api/v1/events", (c) => {
+    if (studioClosing) return c.json({ error: "Studio is shutting down." }, 503);
     return streamSSE(c, async (stream) => {
       const handler: EventHandler = (event, data) => {
-        stream.writeSSE({ event, data: JSON.stringify(data) });
+        void stream.writeSSE({ event, data: JSON.stringify(data) });
       };
-      subscribers.add(handler);
-      await stream.writeSSE({ event: "ping", data: "" });
-      const sessionId = c.req.query("sessionId");
-      if (sessionId) {
-        const task = await loadReconciledTaskSnapshot(sessionId);
-        if (task) await stream.writeSSE({ event: "task:snapshot", data: JSON.stringify(task) });
-      }
-
-      // Keep alive
+      let finish!: () => void;
+      const closed = new Promise<void>(resolve => { finish = resolve; });
       const keepAlive = setInterval(() => {
-        stream.writeSSE({ event: "ping", data: "" });
+        void stream.writeSSE({ event: "ping", data: "" });
       }, 30000);
-
-      stream.onAbort(() => {
+      const cleanup = () => {
         subscribers.delete(handler);
         clearInterval(keepAlive);
-      });
-
-      // Block until aborted
-      await new Promise(() => {});
+        closeEventStreams.delete(close);
+        finish();
+      };
+      const close = async () => { cleanup(); await stream.close(); };
+      subscribers.add(handler);
+      closeEventStreams.add(close);
+      stream.onAbort(cleanup);
+      try {
+        await stream.writeSSE({ event: "ping", data: "" });
+        const sessionId = c.req.query("sessionId");
+        if (sessionId) {
+          const task = await loadReconciledTaskSnapshot(sessionId);
+          if (task) await stream.writeSSE({ event: "task:snapshot", data: JSON.stringify(task) });
+        }
+        await closed;
+      } finally { cleanup(); }
     });
   });
 
@@ -4246,61 +4259,43 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 
   // --- Daemon control ---
 
-  let schedulerInstance: Scheduler | null = null;
-
-  app.get("/api/v1/daemon", (c) => {
-    return c.json({
-      running: schedulerInstance?.isRunning ?? false,
-    });
+  const daemon = new StudioDaemonController(async () => {
+    const currentConfig = await loadCurrentProjectConfig();
+    return {
+      ...(await buildPipelineConfig({ currentConfig })),
+      ...currentConfig.daemon,
+      radarCron: currentConfig.daemon.schedule.radarCron,
+      writeCron: currentConfig.daemon.schedule.writeCron,
+      onChapterComplete: (bookId, chapter) => broadcast("daemon:chapter", { bookId, chapter }),
+      onError: (bookId, error) => broadcast("daemon:error", { bookId, error: error.message }),
+    };
+  }, broadcast);
+  studioShutdowns.set(app, async () => {
+    studioClosing = true;
+    try { await daemon.shutdown(); }
+    finally { await Promise.all([...closeEventStreams].map(close => close())); }
   });
+
+  app.get("/api/v1/daemon", (c) => c.json(daemon.status()));
 
   app.post("/api/v1/daemon/start", async (c) => {
-    if (schedulerInstance?.isRunning) {
-      return c.json({ error: "Daemon already running" }, 400);
-    }
     try {
-      const currentConfig = await loadCurrentProjectConfig();
-      const scheduler = new Scheduler({
-        ...(await buildPipelineConfig()),
-        radarCron: currentConfig.daemon.schedule.radarCron,
-        writeCron: currentConfig.daemon.schedule.writeCron,
-        maxConcurrentBooks: currentConfig.daemon.maxConcurrentBooks,
-        chaptersPerCycle: currentConfig.daemon.chaptersPerCycle,
-        retryDelayMs: currentConfig.daemon.retryDelayMs,
-        cooldownAfterChapterMs: currentConfig.daemon.cooldownAfterChapterMs,
-        maxChaptersPerDay: currentConfig.daemon.maxChaptersPerDay,
-        onChapterComplete: (bookId, chapter) => {
-          broadcast("daemon:chapter", { bookId, chapter });
-        },
-        onError: (bookId, error) => {
-          broadcast("daemon:error", { bookId, error: error.message });
-        },
-      });
-      schedulerInstance = scheduler;
-      broadcast("daemon:started", {});
-      void scheduler.start().catch((e) => {
-        const error = e instanceof Error ? e : new Error(String(e));
-        if (schedulerInstance === scheduler) {
-          scheduler.stop();
-          schedulerInstance = null;
-          broadcast("daemon:stopped", {});
-        }
-        broadcast("daemon:error", { bookId: "scheduler", error: error.message });
-      });
-      return c.json({ ok: true, running: true });
-    } catch (e) {
-      return c.json({ error: String(e) }, 500);
+      await daemon.start();
+      return c.json({ ok: true, ...daemon.status() });
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      return c.json({ error: String(error), code },
+        ["DAEMON_BUSY", "DAEMON_START_CANCELLED", "STUDIO_SHUTTING_DOWN"].includes(code ?? "") ? 409 : 500);
     }
   });
 
-  app.post("/api/v1/daemon/stop", (c) => {
-    if (!schedulerInstance?.isRunning) {
-      return c.json({ error: "Daemon not running" }, 400);
+  app.post("/api/v1/daemon/stop", async (c) => {
+    try {
+      await daemon.stop();
+      return c.json({ ok: true, ...daemon.status() });
+    } catch (error) {
+      return c.json({ error: String(error), ...daemon.status() }, 500);
     }
-    schedulerInstance.stop();
-    schedulerInstance = null;
-    broadcast("daemon:stopped", {});
-    return c.json({ ok: true, running: false });
   });
 
   // --- Logs ---
@@ -6653,10 +6648,28 @@ export async function startStudioServer(
   const hostname = options?.hostname?.trim() || "127.0.0.1";
   console.log(`InkOS Studio running on http://${hostname}:${port}`);
   const server = serve({ fetch: app.fetch, port, hostname });
+  let shutdown: Promise<void> | undefined;
+  const close = () => shutdown ??= (async () => {
+    const draining = shutdownStudioServer(app);
+    const closed = new Promise<void>(resolve => server.close(() => resolve()));
+    try {
+      await draining;
+    } catch (error) {
+      console.error("[studio] Daemon drain failed:", String(error));
+      process.exitCode = 1;
+    } finally {
+      await closed;
+      await codexAccountService.dispose().catch(() => {
+        console.warn("[studio] Codex account connection did not close cleanly.");
+        process.exitCode = 1;
+      });
+      process.removeListener("SIGTERM", close);
+      process.removeListener("SIGINT", close);
+    }
+  })();
+  process.on("SIGTERM", close);
+  process.on("SIGINT", close);
   server.once("close", () => {
-    void codexAccountService.dispose().catch(() => {
-      // Auth-related errors must never include raw process output or credentials.
-      console.warn("[studio] Codex account connection did not close cleanly.");
-    });
+    void close();
   });
 }
