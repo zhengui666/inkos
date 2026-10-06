@@ -41,6 +41,13 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
   const key = (input: {packageId: string; chapterNumber: number}) => `${input.packageId}:${input.chapterNumber}`;
   const known = (number: number) => config.knownChapters.find(c => c.number === number);
 
+  async function beforeEditorEffect(page: Page, scope: MegaNovelScope, signal: AbortSignal) {
+    // A successful probe is not an authorization lease. The session can expire
+    // or switch accounts during navigation, input or a publish dialog.
+    await verifyVisibleAccount(page, scope, config.avatarSelector, config.uiTimeoutMs, signal);
+    await checkEditor(page, scope, signal);
+  }
+
   async function probe(page: Page, scope: MegaNovelScope, signal: AbortSignal): Promise<MegaNovelProbe> {
     signal.throwIfAborted();
     await verifyVisibleAccount(page, scope, config.avatarSelector, config.uiTimeoutMs, signal);
@@ -144,7 +151,7 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       const newChapter = page.locator('div.top div.side-bar-title').filter({hasText: /^New Chapter$/u});
       await requireOne(newChapter, 'New Chapter');
       const previousId = editorIdentity(page.url())?.chapterId;
-      signal.throwIfAborted();
+      await beforeEditorEffect(page, input.scope, signal);
       await newChapter.click();
       await page.waitForURL(url => editorIdentity(url.href)?.bookId === input.scope.remoteBookId
         && editorIdentity(url.href)?.chapterId !== previousId, {timeout: config.uiTimeoutMs});
@@ -154,11 +161,12 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       if (title.trim() && title !== 'Untitled Chapter' || (await body.innerText()).trim()) {
         throw publishingError('MEGANOVEL_NONEMPTY_DRAFT', 'New Chapter did not open an empty editor. Do not overwrite an existing draft.');
       }
-      signal.throwIfAborted();
+      await beforeEditorEffect(page, input.scope, signal);
       await page.locator(TITLE).click({trial: true});
       signal.throwIfAborted();
       await page.locator(TITLE).fill(input.title);
-      await checkEditor(page, input.scope, signal);
+      await beforeEditorEffect(page, input.scope, signal);
+      let identityCheckedAt = Date.now();
       await body.click({trial: true}); // Unlike fill, a trial click checks covering overlays in both frames.
       signal.throwIfAborted();
       // A multiline contenteditable fill creates Chromium block wrappers that
@@ -166,8 +174,16 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       // observed editor UI, then verify the resulting text before Save.
       const lines = input.content.replace(/\r\n?/gu, '\n').split('\n');
       await body.fill(lines[0]!);
-      for (const line of lines.slice(1)) {
-        signal.throwIfAborted();
+      for (let index = 1; index < lines.length; index++) {
+        const line = lines[index]!;
+        // Bound each typing batch without navigating /uc for every keystroke.
+        // Before the next line, recheck at an eight-line boundary or when the
+        // last check is two seconds old. Individual browser awaits may take longer.
+        // Every input still checks the live editor and cancellation.
+        if (index % 8 === 0 || Date.now() - identityCheckedAt >= 2000) {
+          await beforeEditorEffect(page, input.scope, signal);
+          identityCheckedAt = Date.now();
+        } else await checkEditor(page, input.scope, signal);
         await body.click({trial: true});
         signal.throwIfAborted();
         await body.press('Shift+Enter');
@@ -186,7 +202,7 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
         throw publishingError('MEGANOVEL_CONTENT_CONFLICT', 'Editor input changed the frozen body text. Preserve the unsaved editor; do not click Save or Publish.');
       }
       await requireOne(page.locator(SAVE), 'Save');
-      signal.throwIfAborted();
+      await beforeEditorEffect(page, input.scope, signal);
       await page.locator(SAVE).click();
       await page.waitForURL(url => editorIdentity(url.href)?.bookId === input.scope.remoteBookId
         && Boolean(editorIdentity(url.href)?.chapterId), {timeout: config.uiTimeoutMs});
@@ -202,7 +218,7 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       }
       if (await disclosureState(page) !== 'not_present') throw publishingError('MEGANOVEL_DISCLOSURE_UNVERIFIED', 'A new AI declaration UI needs truthful mapping before submission.');
       await requireOne(page.locator(PUBLISH), 'Publish');
-      signal.throwIfAborted();
+      await beforeEditorEffect(page, input.scope, signal);
       await page.locator(PUBLISH).click();
       const scheduleTitle = page.getByText('Publish Schedule', {exact: true}).filter({visible: true});
       await requireOne(scheduleTitle, 'Publish Schedule');
@@ -214,6 +230,7 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       const cancel = page.getByText('CANCEL', {exact: true}).filter({visible: true});
       await requireOne(later, 'Later');
       await requireOne(cancel, 'CANCEL');
+      await verifyVisibleAccount(page, input.scope, config.avatarSelector, config.uiTimeoutMs, signal);
       await verifyScheduleDialog(scheduleTitle, [now, later, confirm, cancel]);
       signal.throwIfAborted();
       await now.click();
@@ -221,7 +238,11 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       if (await selectedNow.count() !== 1 || !await selectedNow.isChecked()) {
         throw publishingError('MEGANOVEL_SCHEDULE_UNVERIFIED', 'The observed Now radio state could not be confirmed. Do not click Confirm.');
       }
-      if (editorIdentity(page.url())?.chapterId !== input.remoteChapterId) throw publishingError('MEGANOVEL_SCOPE_CHANGED', 'The publish dialog belongs to another chapter.');
+      await verifyVisibleAccount(page, input.scope, config.avatarSelector, config.uiTimeoutMs, signal);
+      const finalEditor = editorIdentity(page.url());
+      if (finalEditor?.bookId !== input.scope.remoteBookId || finalEditor.chapterId !== input.remoteChapterId) {
+        throw publishingError('MEGANOVEL_SCOPE_CHANGED', 'The publish dialog belongs to another book or chapter.');
+      }
       await verifyScheduleDialog(scheduleTitle, [now, later, confirm, cancel]);
       signal.throwIfAborted();
       await confirm.click(); // Exactly one final action. Readback is performed independently by the adapter.

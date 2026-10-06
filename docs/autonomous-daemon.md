@@ -4,7 +4,7 @@ This candidate connects calendar scheduling, saved market evidence, local origin
 
 ## What the daemon persists
 
-The existing `.inkos/harness.sqlite` retains calendar deadlines, daily chapter reservations, selected market concepts, foundation creation, chapter stages and events. `inkos up` acquires one live project owner. A dead process can be recovered without deleting retained jobs or resetting attempt budgets. `inkos down` requests cancellation through the project ledger without signalling a PID from a stale file, lets in-flight effects settle, and confirms exit before removing the PID file. It does not send a forced kill or infer successful shutdown from sending a signal.
+The existing `.inkos/harness.sqlite` retains calendar deadlines, daily chapter reservations, selected market concepts, foundation creation, chapter stages and events. `inkos up` acquires one live project owner. A dead process can be recovered without deleting retained jobs or resetting attempt budgets. New owners also hold an exclusive SQLite transaction in `.inkos/harness.sqlite.daemon-lock` for their lifetime. This separate local sidecar does not block ledger writes and is released by the operating system after a crash or reboot. A reused PID therefore cannot indefinitely block recovery or authorize taking over a live locked owner. The sidecar is resolved from the canonical ledger path, so directory aliases share the same lock. Never delete or replace it while a daemon is running. Use a local filesystem with working SQLite locks, as required by the existing ledger. Stop pre-upgrade daemons before upgrading: legacy owner records still use the conservative PID check because those processes do not hold the new lock. `inkos down` requests cancellation through the project ledger without signalling a PID from a stale file, lets in-flight effects settle, and confirms exit before removing the PID file. It does not send a forced kill or infer successful shutdown from sending a signal.
 
 Schedules use five-field numeric UTC cron (wildcards, lists, ranges and steps). Missed ticks coalesce; restarting does not reset an existing future deadline. A bounded worker pool processes active/outlining books with complete foundations. Paused/completed/dropped books remain untouched. Foundations still being created are excluded until ready. `--work` or `daemon.workIds` is a strict work allowlist, including previously auto-created works. New local foundation creation requires explicitly enabled automatic creation and no work allowlist or fixed publication bindings; otherwise the saved scan remains available with a visible selection blocker.
 
@@ -53,3 +53,22 @@ The native DOM implementation is included, but real deployment still needs a log
 `inkos up` is a foreground service process. An executor's PTY is not a durable deployment. `scripts/inkos-daemon.service.example` is an uninstalled user-service template for a host that already supports systemd user services. Fill its actual validated Node, CLI, project and private binding paths only after build and live prerequisites pass. Install/enable it through the authorized host's normal service workflow, and verify the user-service status and a genuine restart. The template does not change boot/login policy, enable lingering, create an account or start Chrome. A machine that sleeps or goes offline cannot supply continuous execution.
 
 Use `inkos down` for a requested stop. It targets the current ledger owner rather than sending a signal based only on a PID file; a new owner clears the previous stop request. Legacy processes without a ledger identity are reported as unconfirmed, not killed. Normal SIGTERM from an established host supervisor remains supported and drains before release.
+
+## Ownership recovery acceptance
+
+After applying this change to the exact reviewed source, run the official install and checks:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm build
+pnpm typecheck
+pnpm test
+pnpm --filter @actalk/inkos-core exec vitest run src/__tests__/scheduler-store.test.ts src/__tests__/scheduler-owner-recovery.test.ts src/__tests__/scheduler.test.ts
+pnpm verify:publish-manifests
+```
+
+The ownership regressions use temporary projects, real SQLite locks and disposable child processes. They cover a killed owner whose retained PID is reused by an unrelated live process, live-owner exclusion even with a stale ledger PID, unchanged Goal/quota/deadline recovery, ledger stop access, safe legacy upgrade, failed claims, failed cleanup and path aliases. They perform no model calls, browser login, book creation or publication.
+
+For host deployment, stop the existing supervisor through its established service workflow, confirm the old process has exited, then replace the validated source and restart that same service. On a host already using the supplied systemd user unit, the commands are `systemctl --user stop inkos-daemon.service`, `systemctl --user start inkos-daemon.service`, `systemctl --user status inkos-daemon.service`, and `journalctl --user -u inkos-daemon.service --since "10 minutes ago"`. Use the actual installed service name; these commands do not install a service or authorize starting writing/publication. Do not delete a retained owner row or sidecar to force recovery. A live legacy PID mismatch requires operator verification.
+
+A green temporary-process regression establishes the ownership mechanism only. A production supervisor restart, two natural source/writing periods and continuous 24-hour operation still require separate acceptance with the authorized work allowlist and live prerequisites. Do not use a crash test against an in-flight production submission.

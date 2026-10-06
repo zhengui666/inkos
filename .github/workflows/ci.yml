@@ -56,7 +56,7 @@ jobs:
       - name: Verify the isolated MegaNovel DOM workflow without real accounts
         env:
           INKOS_BROWSER_FIXTURES: '1'
-        run: pnpm --filter @actalk/inkos-core exec vitest run src/__tests__/meganovel-dom-binding.test.ts
+        run: pnpm --filter @actalk/inkos-core exec vitest run src/__tests__/meganovel-dom-binding.test.ts src/__tests__/meganovel-auth-boundary.test.ts
       - name: Initialize a ChatGPT-only project without legacy API keys
         run: |
           mkdir -p test-project
