@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 const fake=vi.hoisted(()=>({books:new Map<string,any>(),next:new Map<string,number>(),run:vi.fn(),radar:vi.fn(),init:vi.fn()}));
 vi.mock('../pipeline/runner.js',()=>({PipelineRunner:class {runWithAbortSignal(_signal:any,fn:any){return fn();}runWithAgentContext(_ctx:any,fn:any){return fn();}runRadar(){return fake.radar();}initBook(...args:any[]){return fake.init(...args);}}}));
-vi.mock('../state/manager.js',()=>({StateManager:class {bookDir(id:string){return id;}async isCompleteBookDirectory(){return true;}async listBooks(){return [...fake.books.keys()];}async loadBookConfig(id:string){return fake.books.get(id);}async getNextChapterNumber(id:string){return fake.next.get(id)??1;}}}));
+vi.mock('../state/manager.js',()=>({StateManager:class {bookDir(id:string){return id;}async isCompleteBookDirectory(){return true;}async listBooks(){return [...fake.books.keys()];}async loadBookConfig(id:string){if(fake.books.get(id)?.missingBookConfig)throw Object.assign(new Error('Interrupted before book.json'),{code:'ENOENT'});return fake.books.get(id);}async getNextChapterNumber(id:string){return fake.next.get(id)??1;}}}));
 vi.mock('../pipeline/autonomous-chapters.js',()=>({AutonomousChapterRunner:class {constructor(_root:any,_pipeline:any,readonly store:any){}run(job:any,signal:any){return fake.run(job,signal,this.store);}}}));
 vi.mock('../harness/builtin-profiles.js',()=>({createBuiltInWorkProfileRegistry:()=>({require:()=>({})})}));
 vi.mock('../skills/index.js',()=>({loadAvailableAgentSkills:async()=>({skills:[]}),resolveProfileSkillActivations:()=>[]}));
@@ -17,12 +17,52 @@ async function setup(extra:any={}){const root=await mkdtemp(join(tmpdir(),'inkos
 function book(id:string,status='active'){fake.books.set(id,{id,status,targetChapters:20});}
 async function idle(){for(let n=0;n<30;n++)await new Promise(resolve=>setImmediate(resolve));}
 describe('scheduler calendar and lifecycle',()=>{
+ it('does not let quota-exhausted calendar ticks starve another book on following days',async()=>{
+  vi.useFakeTimers({toFake:['Date']});vi.setSystemTime(new Date('2026-10-07T00:00:00Z'));
+  book('a');book('b');const {scheduler}=await setup({maxConcurrentBooks:1});
+  await scheduler.start();await idle();
+  for(let slot=1;slot<=96;slot++){
+   vi.setSystemTime(new Date(Date.parse('2026-10-07T00:00:00Z')+slot*15*60_000));
+   (scheduler as any).tick();await idle();
+  }
+  expect(fake.run).toHaveBeenCalledTimes(2);
+  expect(new Set(fake.run.mock.calls.map(c=>c[0].workId)).size).toBe(2);
+ });
+ it('retains fair admission after restart instead of always choosing the same work',async()=>{
+  vi.useFakeTimers({toFake:['Date']});vi.setSystemTime(new Date('2026-10-07T00:00:00Z'));
+  book('a');book('b');const {scheduler,config}=await setup({maxConcurrentBooks:1});
+  await scheduler.start();await idle();await scheduler.stop();
+  vi.setSystemTime(new Date('2026-10-08T00:00:00Z'));
+  const restarted=new Scheduler(config);schedulers.push(restarted);await restarted.start();await idle();
+  expect(fake.run).toHaveBeenCalledTimes(2);
+  expect(new Set(fake.run.mock.calls.map(c=>c[0].workId)).size).toBe(2);
+ });
  it('reserves one daily slot across two concurrent books',async()=>{book('a');book('b');const {scheduler}=await setup();await scheduler.start();await idle();expect(fake.run).toHaveBeenCalledTimes(1);});
  it('does not restart the daily allowance or next interval',async()=>{book('a');const {scheduler,config}=await setup();await scheduler.start();await idle();await scheduler.stop();const next=new Scheduler(config);schedulers.push(next);await next.start();await idle();expect(fake.run).toHaveBeenCalledTimes(1);});
  it('resumes a retained publication job without admitting another chapter',async()=>{book('a');const {root,scheduler}=await setup();const store=new SchedulerStore(join(root,'.inkos/harness.sqlite'));const job=store.reserve('a',1,Date.now(),1)!;store.save({...job,phase:'publishing'},'pending');store.schedule('write',Date.now()+3600000);store.close();await scheduler.start();await idle();expect(fake.run).toHaveBeenCalledTimes(1);expect(fake.run.mock.calls[0][0].phase).toBe('publishing');});
  it('skips paused works and honors the selected work list',async()=>{book('old-a','paused');book('old-b','paused');book('new');book('other');const {scheduler}=await setup({workIds:['old-a','old-b','new']});await scheduler.start();await idle();expect(fake.run.mock.calls.map(c=>c[0].workId)).toEqual(['new']);});
  it('never lets a completed auto-created foundation bypass the explicit work list',async()=>{book('new');book('previous-auto');const {root,scheduler}=await setup({workIds:['new'],maxChaptersPerDay:3});const store=new SchedulerStore(join(root,'.inkos/harness.sqlite'));store.reserveFoundation({scanId:'old-scan',concept:'Old automatic concept',book:{id:'previous-auto'} as any,instruction:'fixture',phase:'completed',attempts:1,nextAttemptAt:0});store.close();await scheduler.start();await idle();expect(fake.run.mock.calls.map(c=>c[0].workId)).toEqual(['new']);});
  it('keeps pending foundation creation paused while fixed publication bindings are enabled',async()=>{const {root,scheduler}=await setup({publisher:{ready:vi.fn(),publish:vi.fn()},market:{platform:'meganovel',language:'en',maxSourceAgeMs:86400000,autoCreate:{maxActiveBooks:1,targetChapters:24,chapterWordCount:2000}}});const store=new SchedulerStore(join(root,'.inkos/harness.sqlite'));store.reserveFoundation({scanId:'old-scan',concept:'Old pending concept',book:{id:'previous-auto'} as any,instruction:'fixture',phase:'pending',attempts:0,nextAttemptAt:0});store.close();await scheduler.start();await idle();await (scheduler as any).radarScanInFlight;expect(fake.init).not.toHaveBeenCalled();const read=new SchedulerStore(join(root,'.inkos/harness.sqlite'));expect(read.foundations()[0].attempts).toBe(0);expect(read.events().some(event=>event.type==='market-selection-blocked')).toBe(true);read.close();});
+ it('resumes an interrupted foundation that retained its manifest before book.json existed',async()=>{
+  book('incomplete-foundation');fake.books.get('incomplete-foundation').missingBookConfig=true;
+  const {root,scheduler}=await setup({market:{platform:'fixture-platform',language:'en',maxSourceAgeMs:86400000,autoCreate:{maxActiveBooks:1,targetChapters:24,chapterWordCount:2000}}});
+  const store=new SchedulerStore(join(root,'.inkos/harness.sqlite'));
+  store.reserveFoundation({scanId:'incomplete-scan',concept:'Another retained original concept',book:{id:'incomplete-foundation',status:'outlining',language:'en'} as any,instruction:'fixture',phase:'pending',attempts:1,nextAttemptAt:0});
+  store.close();fake.init.mockImplementation(async current=>fake.books.set(current.id,current));
+  await scheduler.start();await idle();await (scheduler as any).radarScanInFlight;
+  expect(fake.init).toHaveBeenCalledOnce();expect(fake.init.mock.calls[0][0].id).toBe('incomplete-foundation');
+ });
+ it('does not resume a retained automatic foundation after its work was paused',async()=>{
+  book('retained-foundation','paused');
+  const {root,scheduler}=await setup({market:{platform:'fixture-platform',language:'zh',maxSourceAgeMs:86400000,autoCreate:{maxActiveBooks:1,targetChapters:24,chapterWordCount:2000}}});
+  const store=new SchedulerStore(join(root,'.inkos/harness.sqlite'));
+  store.reserveFoundation({scanId:'retained-scan',concept:'A retained original concept',book:{id:'retained-foundation',status:'outlining'} as any,instruction:'fixture',phase:'pending',attempts:1,nextAttemptAt:0});
+  store.close();await scheduler.start();await idle();await (scheduler as any).radarScanInFlight;
+  expect(fake.init).not.toHaveBeenCalled();
+  const read=new SchedulerStore(join(root,'.inkos/harness.sqlite'));
+  expect(read.foundations()[0].attempts).toBe(1);read.close();
+  expect(fake.books.get('retained-foundation').status).toBe('paused');
+ });
  it('rechecks pause between chapters',async()=>{book('a');const base=fake.run.getMockImplementation()!;fake.run.mockImplementation(async(...args)=>{const result=await base(...args);fake.books.get('a').status='paused';return result;});const {scheduler}=await setup({chaptersPerCycle:2,maxChaptersPerDay:5});await scheduler.start();await idle();expect(fake.run).toHaveBeenCalledTimes(1);});
  it('stop aborts and drains the first operation without scheduling a late writer',async()=>{book('a');let finish!:()=>void;fake.run.mockImplementation(async(job,signal)=>{await new Promise<void>(resolve=>{finish=resolve;signal.addEventListener('abort',resolve,{once:true});});return job;});const {scheduler}=await setup();await scheduler.start();await idle();expect(fake.run).toHaveBeenCalledTimes(1);await scheduler.stop();finish();await idle();expect(scheduler.isRunning).toBe(false);expect(fake.run).toHaveBeenCalledTimes(1);});
  it('callback errors are contained and do not reject startup',async()=>{book('a');fake.run.mockRejectedValue(new Error('fixture-operation'));const {scheduler}=await setup({onError:()=>{throw new Error('notification');}});await expect(scheduler.start()).resolves.toBeUndefined();await idle();await expect(scheduler.stop()).resolves.toBeUndefined();});

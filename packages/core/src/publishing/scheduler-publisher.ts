@@ -106,8 +106,8 @@ export function createMegaNovelSchedulerPublisher(root: string, bindings: readon
           || pkg.manifest.target.remoteBookId !== binding.scope.remoteBookId) continue;
         if (pkg.chapters.some(chapter => {
           const run = store.getMegaNovelRun(pkg.manifest.id, chapter.number);
-          return run ? run.scope.accountId === binding.scope.accountId
-            : !['awaiting_submission', 'not_submitted_reported'].includes(chapter.status);
+          return store.hasUnverifiedManualOrigin(pkg.manifest.id, chapter.number) || (run ? run.scope.accountId === binding.scope.accountId
+            : !['awaiting_submission', 'not_submitted_reported'].includes(chapter.status));
         })) throw publishingError('PUBLISHING_RECONCILIATION_REQUIRED', 'A chapter attempt exists under another local target for this platform book. Reconcile its original mapping before new writing.');
       }
       await remote.ready(binding.scope, { signal });
@@ -198,7 +198,12 @@ function validateHistoricalBoundary(firstNewChapter: number, historicalChapterId
 
 /** Loads explicit local deployment configuration; never launches or signs in a browser. */
 export async function loadMegaNovelSchedulerPublisher(root: string, configurationPath: string) {
-  const configurations = z.array(MegaNovelSchedulerBindingConfigurationSchema).min(1).parse(JSON.parse(await readFile(configurationPath, 'utf8')));
+  return createMegaNovelSchedulerPublisherFromConfiguration(root, JSON.parse(await readFile(configurationPath, 'utf8')));
+}
+
+/** Shared by the legacy loader and the provider registry; preserves the same transport and driver. */
+export async function createMegaNovelSchedulerPublisherFromConfiguration(root: string, input: unknown) {
+  const configurations = z.array(MegaNovelSchedulerBindingConfigurationSchema).min(1).parse(input);
   const bindings: SchedulerPublishingBinding[] = [];
   try {
     for (const config of configurations) {

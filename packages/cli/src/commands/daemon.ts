@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { Scheduler, SchedulerStore, loadMegaNovelSchedulerPublisher, type SchedulerPublisher } from "@actalk/inkos-core";
+import { Scheduler, SchedulerStore, loadSchedulerPublisher, type SchedulerPublisher } from "@actalk/inkos-core";
 import { loadConfig, findProjectRoot, buildPipelineConfig, log, logError } from "../utils.js";
 import { createWriteStream, type WriteStream } from "node:fs";
 import { writeFile, readFile, unlink } from "node:fs/promises";
@@ -19,7 +19,7 @@ export const upCommand = new Command("up")
   .description("Start the persistent InkOS daemon (writing and configured publication)")
   .option("-q, --quiet", "Suppress console output")
   .option("--work <id...>", "Limit this daemon to selected works; paused works remain paused")
-  .option("--publish-config <path>", "Use explicitly configured MegaNovel CDP/DOM bindings; missing deployment fails before writing")
+  .option("--publish-config <path>", "Use explicit per-work publisher bindings (or legacy MegaNovel arrays); unknown/manual-only providers fail before writing")
   .action(async (opts) => {
     let logStream: WriteStream | undefined;
     let scheduler: Scheduler | undefined;
@@ -28,7 +28,7 @@ export const upCommand = new Command("up")
     const root = findProjectRoot(), pidPath = join(root, PID_FILE);
     try {
       const config = await loadConfig({ requireApiKey: false });
-      publisher = opts.publishConfig ? await loadMegaNovelSchedulerPublisher(root, opts.publishConfig) : undefined;
+      publisher = opts.publishConfig ? await loadSchedulerPublisher(root, opts.publishConfig) : undefined;
       logStream = createWriteStream(join(root, "inkos.log"), { flags: "a" });
       scheduler = new Scheduler({
         ...buildPipelineConfig(config, root, { logFile: logStream, quiet: opts.quiet }),

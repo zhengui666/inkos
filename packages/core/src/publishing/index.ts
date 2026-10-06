@@ -8,4 +8,5 @@ export * from './meganovel-contracts.js';
 export * from './meganovel-adapter.js';
 export * from './meganovel-cdp.js';
 export * from './scheduler-publisher.js';
+export * from './scheduler-publisher-registry.js';
 export * from './meganovel-dom-binding.js';

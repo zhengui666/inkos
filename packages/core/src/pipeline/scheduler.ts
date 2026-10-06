@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { PipelineRunner, type PipelineConfig } from "./runner.js";
@@ -11,7 +11,8 @@ import { nextCronTime } from "./schedule.js";
 import { MegaNovelRadarSource } from "../agents/meganovel-radar-source.js";
 import { persistRadarScan } from "../agents/radar-store.js";
 import { selectRadarRecommendation } from "../agents/radar-selection.js";
-import type { ScheduledFoundation } from "./scheduler-store.js";
+import type { ScheduledFoundation, ScheduledChapter } from "./scheduler-store.js";
+import { runInWorkMutationQueue } from "../utils/work-mutation-scope.js";
 import { createBuiltInWorkProfileRegistry } from "../harness/builtin-profiles.js";
 import { loadAvailableAgentSkills, resolveProfileSkillActivations } from "../skills/index.js";
 import { withExecutionEvidence } from "../harness/execution-evidence.js";
@@ -48,7 +49,6 @@ export class Scheduler {
   private radarScanInFlight: Promise<void> | null = null;
   private closed = false;
   private stopping: Promise<void> | undefined;
-  private rotation = 0;
 
   constructor(private readonly config: SchedulerConfig) {
     this.pipeline = new PipelineRunner({ ...config,
@@ -107,11 +107,10 @@ export class Scheduler {
       this.store.schedule("write", nextCronTime(this.config.writeCron, now));
       void this.triggerWriteCycle(false);
     }
-    const pendingFoundation = this.config.market?.autoCreate && !this.config.workIds && !this.config.publisher
-      ? this.store.foundations().find(item => item.phase === "pending" && item.nextAttemptAt <= now) : undefined;
-    if (!this.radarScanInFlight && (pendingFoundation || now >= this.store.nextAt("radar", now))) {
-      if (!pendingFoundation) this.store.schedule("radar", nextCronTime(this.config.radarCron, now));
-      const scan = (pendingFoundation ? this.createFoundation(pendingFoundation) : this.runRadarScan()).catch(error => this.report("radar", error)).finally(() => {
+    const pendingFoundations = this.config.market?.autoCreate && !this.config.workIds && !this.config.publisher
+      ? this.store.foundations().filter(item => item.phase === "pending" && item.nextAttemptAt <= now) : [];
+    if (!this.radarScanInFlight && (pendingFoundations.length || now >= this.store.nextAt("radar", now))) {
+      const scan = this.runRadarCycle(pendingFoundations).catch(error => this.report("radar", error)).finally(() => {
         if (this.radarScanInFlight === scan) this.radarScanInFlight = null;
       });
       this.radarScanInFlight = scan;
@@ -139,10 +138,11 @@ export class Scheduler {
       if (["active", "outlining"].includes(book.status) && await this.state.isCompleteBookDirectory(this.state.bookDir(id))) active.push(book);
     }
     if (!active.length) return;
-    const offset = this.rotation++ % active.length;
-    const books = [...active.slice(offset), ...active.slice(0, offset)];
+    const byId = new Map(active.map(book => [book.id, book]));
+    const books = this.store.orderForAdmission([...byId.keys()]).map(id => byId.get(id)!);
     // A bounded pool processes every eligible book; a long book cannot starve
-    // later books just because its ID sorts first.
+    // later books just because its ID sorts first. Persistent reservation order
+    // also prevents quota-exhausted ticks or restarts from resetting priority.
     let index = 0;
     await Promise.all(Array.from({ length: Math.min(books.length, this.config.maxConcurrentBooks) }, async () => {
       while (index < books.length && this.running) {
@@ -155,27 +155,35 @@ export class Scheduler {
 
   private async processBook(workId: string, resumeOnly: boolean): Promise<void> {
     for (let count = 0; count < this.config.chaptersPerCycle && this.running; count++) {
-      const book = await this.state.loadBookConfig(workId);
-      if (!["active", "outlining"].includes(book.status)) return;
-      let job = this.store.latest(workId);
-      if (job?.phase === "blocked") return;
-      if (!job || job.phase === "completed") {
-        if (resumeOnly) return;
-        const chapter = await this.state.getNextChapterNumber(workId);
-        if (chapter > book.targetChapters) return;
-        // Reservation is durable before readiness checks, so unavailable
-        // destinations share the same bounded backoff instead of retrying forever.
-        job = this.store.reserve(workId, chapter, Date.now(), this.config.maxChaptersPerDay);
-        if (!job) return;
-      }
-      if (job.nextAttemptAt > Date.now()) return;
-      if (job.phase === "writing" && !this.store.admitWriting(workId, job.chapter, Date.now(), this.config.maxChaptersPerDay)) return;
+      // Only metadata reads/admission are serialized; chapter/provider work stays parallel.
+      let job = await runInWorkMutationQueue(`scheduler-admission\0${resolve(this.config.projectRoot)}`,
+        () => this.prepareChapter(workId, resumeOnly));
+      if (!job) return;
       job = await this.chapters.run(job, this.controller.signal);
       if (job.error) this.report(workId, Object.assign(new Error(job.error.message), { code: job.error.code }));
       if (job.phase !== "completed" || resumeOnly || !this.running) return;
       if (this.config.detection?.enabled) await this.runDetection(workId, job.chapter);
       if (count + 1 < this.config.chaptersPerCycle) await this.wait(this.config.cooldownAfterChapterMs);
     }
+  }
+
+  private async prepareChapter(workId: string, resumeOnly: boolean): Promise<ScheduledChapter | undefined> {
+    if (!this.running) return;
+    const book = await this.state.loadBookConfig(workId);
+    if (!["active", "outlining"].includes(book.status)) return;
+    let job = this.store.latest(workId);
+    if (job?.phase === "blocked") return;
+    if (!job || job.phase === "completed") {
+      if (resumeOnly) return;
+      const chapter = await this.state.getNextChapterNumber(workId);
+      if (!this.running || chapter > book.targetChapters) return;
+      // Reserve before readiness checks so unavailable destinations have bounded retries.
+      job = this.store.reserve(workId, chapter, Date.now(), this.config.maxChaptersPerDay);
+      if (!job) return;
+    }
+    if (!this.running || job.nextAttemptAt > Date.now()) return;
+    if (job.phase === "writing" && !this.store.admitWriting(workId, job.chapter, Date.now(), this.config.maxChaptersPerDay)) return;
+    return job;
   }
 
   private async runDetection(workId: string, chapter: number): Promise<void> {
@@ -224,9 +232,29 @@ export class Scheduler {
     if (pending.phase === "pending") await this.createFoundation(pending);
   }
 
-  private async createFoundation(input: ScheduledFoundation): Promise<void> {
-    if (!this.running || input.phase !== "pending" || input.nextAttemptAt > Date.now()) return;
-    const pending = { ...input, attempts: input.attempts + 1 };
+  private async runRadarCycle(inputs: readonly ScheduledFoundation[]): Promise<void> {
+    for (const input of inputs) if (await this.createFoundation(input)) return;
+    // Paused retained work must not consume or suppress the independent radar slot.
+    const now = Date.now();
+    if (!this.running || now < this.store.nextAt("radar", now)) return;
+    this.store.schedule("radar", nextCronTime(this.config.radarCron, now));
+    await this.runRadarScan();
+  }
+
+  private async createFoundation(input: ScheduledFoundation): Promise<boolean> {
+    if (!this.running || input.phase !== "pending" || input.nextAttemptAt > Date.now()) return false;
+    // A retained foundation is a retry, not authority to undo a later user pause
+    // or overwrite the current book settings with the old reservation snapshot.
+    let current: BookConfig | undefined;
+    if ((await this.state.listBooks()).includes(input.book.id)) {
+      try { current = await this.state.loadBookConfig(input.book.id); }
+      catch (error) {
+        // initBook persists the manifest before book.json; retain crash recovery for that window.
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+    if (current && !["active", "outlining"].includes(current.status)) return false;
+    const pending = { ...input, book: current ?? input.book, attempts: input.attempts + 1 };
     this.store.saveFoundation(pending, "foundation-started");
     try {
       const profile = createBuiltInWorkProfileRegistry(this.config.projectRoot).require("longform-novel");
@@ -241,6 +269,7 @@ export class Scheduler {
       this.controller.signal.aborted ? "foundation-interrupted" : "foundation-failed");
       if (!this.controller.signal.aborted) this.report(pending.book.id, error);
     }
+    return true;
   }
 
   private report(workId: string, error: unknown): void {

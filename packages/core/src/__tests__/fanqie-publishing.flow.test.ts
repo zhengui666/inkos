@@ -199,6 +199,21 @@ describe('Fanqie single-chapter browser protocol (synthetic port, not live accep
     expect(store.getFanqieRun(intent.packageId, 1)?.phase).toBe('draft_unknown');
   });
 
+  it('isolates a second actual account even when remote book and chapter IDs coincide', async () => {
+    await adapter.saveDraft(intent);
+    const selected = store.getPackage(intent.packageId).manifest.chapters[0]!;
+    const target = await packages.mapBook({workId: 'book', platform: 'fanqie', accountLabel: 'other-account', remoteBookId: 'book-123'});
+    const next = await packages.prepare({targetId: target.id, formats: ['txt'],
+      chapters: [{artifactId: selected.artifactId, revisionId: selected.revisionId, number: 1, title: selected.title}]});
+    snapshot.scope = {...intent.scope, accountLabel: 'other-account', accountId: 'different-actual-account'};
+    snapshot.chapters = [row()];
+    const observed = await adapter.saveDraft({...intent, packageId: next.manifest.id, scope: snapshot.scope});
+    expect(observed.phase).toBe('draft');
+    expect(observed.scope.accountId).toBe('different-actual-account');
+    expect(store.getFanqieRun(intent.packageId, 1)?.scope.accountId).toBe('account-123');
+    expect(browser.createDraft).toHaveBeenCalledTimes(1);
+  });
+
   it('blocks renumbering the same artifact through a different local account label', async () => {
     await adapter.saveDraft(intent);
     const target = await packages.mapBook({workId: 'book', platform: 'fanqie', accountLabel: 'alias', remoteBookId: 'book-123'});

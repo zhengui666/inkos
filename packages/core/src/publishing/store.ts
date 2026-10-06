@@ -227,7 +227,7 @@ export class PublishingStore {
           if (!['awaiting_submission', 'not_submitted_reported'].includes(chapter.status)) {
             throw publishingError('PUBLISHING_RECONCILIATION_REQUIRED', 'A manual attempt exists; reconcile it before automation.');
           }
-          this.assertChapterAvailable(pkg, run.chapterNumber);
+          this.assertChapterAvailable(pkg, run.chapterNumber, run.scope.accountId);
           const reservations = this.db.prepare(`SELECT r.number, p.manifest_json FROM publishing_fanqie_runs r
             JOIN publishing_packages p ON p.id=r.package_id WHERE r.account_id=? AND r.remote_book_id=?`)
             .all(run.scope.accountId, run.scope.remoteBookId);
@@ -255,6 +255,14 @@ export class PublishingStore {
     const row = this.db.prepare('SELECT run_json FROM publishing_meganovel_runs WHERE package_id=? AND number=?')
       .get(HarnessIdSchema.parse(packageId), z.number().int().positive().parse(number));
     return row ? MegaNovelRunSchema.parse(JSON.parse(String(row.run_json))) : undefined;
+  }
+
+  /** A failed/negative migration read cannot identify the account of a historical manual attempt. */
+  hasUnverifiedManualOrigin(packageId: string, chapterNumber: number): boolean {
+    if (this.getMegaNovelRun(packageId, chapterNumber)?.evidence) return false;
+    return Boolean(this.db.prepare(`SELECT 1 FROM publishing_events WHERE package_id=?
+      AND json_extract(action_json,'$.chapterNumber')=? AND json_extract(action_json,'$.type')='begin' LIMIT 1`)
+      .get(packageId, chapterNumber));
   }
 
   writeMegaNovelRun(input: {expectedVersion: number; eventId: string; run: MegaNovelRun;
@@ -320,21 +328,24 @@ export class PublishingStore {
     if (this.getFanqieRun(packageId, number) || this.getMegaNovelRun(packageId, number)) throw publishingError('PUBLISHING_RECONCILIATION_REQUIRED',
       'A browser run owns this chapter. Manual receipts cannot clear or replace its reservation.');
   }
-  private assertChapterAvailable(pkg: PublishingPackage, number: number) {
+  private assertChapterAvailable(pkg: PublishingPackage, number: number, observedFanqieAccountId?: string) {
     const artifactId = pkg.manifest.chapters.find(chapter => chapter.number === number)!.artifactId;
     const reservations = this.db.prepare(`SELECT p.manifest_json, c.package_id, c.number, c.status
       FROM publishing_chapters c JOIN publishing_packages p ON p.id=c.package_id
       JOIN publishing_targets t ON t.id=p.target_id
-      WHERE (p.target_id=? OR (t.platform='fanqie' AND t.remote_book_id=? AND ?='fanqie')
-        OR (t.platform='meganovel' AND t.remote_book_id=? AND ?='meganovel'
-          AND NOT EXISTS (SELECT 1 FROM publishing_meganovel_runs r
-            WHERE r.package_id=c.package_id AND r.number=c.number)))
+      WHERE (p.target_id=? OR (t.platform='fanqie' AND t.remote_book_id=? AND ?='fanqie'
+          AND (? IS NULL OR NOT EXISTS (SELECT 1 FROM publishing_fanqie_runs r
+            WHERE r.package_id=c.package_id AND r.number=c.number AND r.account_id<>?)))
+        OR (t.platform='meganovel' AND t.remote_book_id=? AND ?='meganovel'))
         AND c.package_id<>? AND c.status NOT IN ('awaiting_submission','not_submitted_reported')`)
       .all(pkg.manifest.target.id, pkg.manifest.target.remoteBookId, pkg.manifest.target.platform,
-        pkg.manifest.target.remoteBookId, pkg.manifest.target.platform, pkg.manifest.id);
+        observedFanqieAccountId ?? null, observedFanqieAccountId ?? null, pkg.manifest.target.remoteBookId, pkg.manifest.target.platform, pkg.manifest.id);
     const existing = reservations.find(row => {
-      if (row.number === number) return true;
       const manifest = PublishingManifestSchema.parse(JSON.parse(String(row.manifest_json)));
+      if (manifest.target.id !== pkg.manifest.target.id && manifest.target.platform === 'meganovel'
+        && this.getMegaNovelRun(String(row.package_id), Number(row.number))
+        && !this.hasUnverifiedManualOrigin(String(row.package_id), Number(row.number))) return false;
+      if (row.number === number) return true;
       return manifest.chapters.some(chapter => chapter.number === row.number && chapter.artifactId === artifactId);
     });
     if (existing) throw publishingError('PUBLISHING_RECONCILIATION_REQUIRED', `This chapter number or artifact already has a submission in package ${existing.package_id} (${existing.status}). Do not resubmit or renumber a different revision.`);
