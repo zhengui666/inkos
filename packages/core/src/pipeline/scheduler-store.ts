@@ -119,6 +119,12 @@ export class SchedulerStore {
     const row = this.db.prepare("SELECT data_json FROM scheduler_chapters WHERE work_id=? ORDER BY chapter DESC LIMIT 1").get(workId);
     return row ? JSON.parse(String(row.data_json)) : undefined;
   }
+  /** Least recently admitted work first; empty ticks and restarts cannot reset fairness. */
+  orderForAdmission(workIds: readonly string[]): string[] {
+    const latest = new Map(this.db.prepare("SELECT work_id, MAX(rowid) AS sequence FROM scheduler_chapters GROUP BY work_id")
+      .all().map(row => [String(row.work_id), Number(row.sequence)]));
+    return [...workIds].sort((left, right) => (latest.get(left) ?? 0) - (latest.get(right) ?? 0));
+  }
   hasPendingDue(now: number): boolean {
     return Boolean(this.db.prepare("SELECT 1 FROM scheduler_chapters WHERE json_extract(data_json,'$.phase') NOT IN ('completed','blocked') AND json_extract(data_json,'$.nextAttemptAt') <= ? LIMIT 1").get(now));
   }
