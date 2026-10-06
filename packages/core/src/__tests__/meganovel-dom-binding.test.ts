@@ -44,12 +44,14 @@ async function fixture(context: BrowserContext) {
     {number: 2, id: '102', title: 'Second', body: 'Second chapter body.\n', published: true},
     {number: 3, id: '103', title: 'Third', body: 'Third chapter body.\n', published: true},
   ];
-  const state = {chapters, saveCount: 0, publishCount: 0, accountId: '700', overflow: false};
+  const state = {chapters, saveCount: 0, publishCount: 0, accountId: '700', overflow: false,
+    lastSavedEditor: undefined as {body: string; html: string} | undefined};
   const handler = async (route: Route) => {
     const url = new URL(route.request().url());
     if (url.origin !== origin) return route.abort();
     if (url.pathname === '/__fixture_save') {
-      const data = route.request().postDataJSON() as {id?: string; title: string; body: string};
+      const data = route.request().postDataJSON() as {id?: string; title: string; body: string; html: string};
+      state.lastSavedEditor = {body: data.body, html: data.html};
       let chapter = chapters.find(item => item.id === data.id);
       if (!chapter) { chapter = {number: chapters.length + 1, id: String(101 + chapters.length), title: data.title, body: data.body, published: false}; chapters.push(chapter); }
       else { chapter.title = data.title; chapter.body = data.body; }
@@ -92,7 +94,7 @@ function editor(chapters: Chapter[], chapter: Chapter | undefined, overflow: boo
     ${!chapter?.published ? '<div class="menu-publish menu_pub" onclick="document.querySelector(\'#dialog\').style.display=\'block\'">PUBLISH</div>' : ''}
     <div id="dialog" style="display:none"><div>Publish Schedule</div><label><input type="radio" name="schedule" value="now">Now</label><label><input type="radio" name="schedule" value="later">Later</label><button onclick="publish()">Confirm</button><button>CANCEL</button></div>
     <script>let id=${scriptJson(chapter?.id)};
-      async function save(){const r=await fetch('/__fixture_save',{method:'POST',body:JSON.stringify({id,title:document.querySelector('input[placeholder]').value,body:document.querySelector('iframe').contentDocument.body.innerText})});id=(await r.json()).id;location.href='/create_chapter/99?chapterId='+id;}
+      async function save(){const r=await fetch('/__fixture_save',{method:'POST',body:JSON.stringify({id,title:document.querySelector('input[placeholder]').value,body:document.querySelector('iframe').contentDocument.body.innerText,html:document.querySelector('iframe').contentDocument.body.innerHTML})});id=(await r.json()).id;location.href='/create_chapter/99?chapterId='+id;}
       async function publish(){await fetch('/__fixture_publish',{method:'POST',body:JSON.stringify({id})});location.reload();}
     </script>`;
 }
@@ -125,8 +127,11 @@ browserFixtures('MegaNovel observed DOM binding in an isolated network-blocked C
       title: 'Fourth', content: 'A new reviewed paragraph.\n\nFinal paragraph.\n', revisionId: 'fixture-revision'};
     expect((await binding.snapshot(page, {...input, expectedTitle: input.title}, signal)).candidates).toEqual([]);
     await binding.createDraft(page, input, signal);
+    expect(normalizeMegaNovelBodyText(state.lastSavedEditor!.body), JSON.stringify(state.lastSavedEditor)).toBe(normalizeMegaNovelBodyText(input.content));
     const draft = await binding.snapshot(page, {...input, expectedTitle: input.title}, signal);
     expect(draft.candidates[0]).toMatchObject({status: 'draft', remoteChapterId: '104', number: 4});
+    expect(draft.candidates[0]!.title).toBe(input.title);
+    expect(normalizeMegaNovelBodyText(draft.candidates[0]!.content)).toBe(normalizeMegaNovelBodyText(input.content));
     await binding.submit(page, {...input, remoteChapterId: '104'}, signal);
     const published = await binding.snapshot(page, {...input, expectedTitle: input.title, remoteChapterId: '104'}, signal);
     expect(published.candidates[0]!.status).toBe('published');
