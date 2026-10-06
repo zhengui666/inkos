@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import type { DatabaseSync } from "node:sqlite";
+import { DatabaseSync } from "node:sqlite";
+import { realpathSync } from "node:fs";
 import { openHarnessDatabase } from "../harness/sqlite.js";
 import type { BookConfig } from "../models/book.js";
 import type { Observation } from "../models/observation.js";
@@ -30,6 +31,10 @@ export interface ScheduledChapter {
 }
 
 const owners = new Set<string>();
+const LOCKED_OWNER_PREFIX = "sqlite-lock-v1:";
+function daemonBusy(): Error {
+  return Object.assign(new Error("A daemon already owns this project."), { code: "DAEMON_BUSY" });
+}
 function alive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
@@ -39,8 +44,11 @@ function alive(pid: number): boolean {
 export class SchedulerStore {
   private readonly db: DatabaseSync;
   private owner?: string;
+  private ownerLock?: DatabaseSync;
+  private readonly ownerLockPath: string;
   constructor(path: string) {
     this.db = openHarnessDatabase(path);
+    this.ownerLockPath = path === ":memory:" ? path : `${realpathSync(path)}.daemon-lock`;
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS scheduler_owner (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER NOT NULL, token TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS scheduler_control (id INTEGER PRIMARY KEY CHECK(id=1), stop_requested INTEGER NOT NULL);
@@ -51,17 +59,35 @@ export class SchedulerStore {
     `);
   }
   acquire(): void {
-    this.transaction(() => {
-      const previous = this.db.prepare("SELECT pid, token FROM scheduler_owner WHERE id=1").get();
-      if (previous && (Number(previous.pid) === process.pid ? owners.has(String(previous.token)) : alive(Number(previous.pid)))) {
-        throw Object.assign(new Error("A daemon already owns this project."), { code: "DAEMON_BUSY" });
-      }
-      const token = randomUUID();
-      this.db.prepare("INSERT OR REPLACE INTO scheduler_owner(id,pid,token) VALUES(1,?,?)").run(process.pid, token);
-      this.db.prepare("INSERT OR REPLACE INTO scheduler_control(id,stop_requested) VALUES(1,0)").run();
+    if (this.owner) throw daemonBusy();
+    // A separate SQLite transaction is held for the process lifetime. Kernel
+    // locks disappear on crash/reboot, unlike persisted PIDs which may be reused.
+    // Never hold this transaction on the shared writing/publication ledger.
+    const lock = new DatabaseSync(this.ownerLockPath);
+    try { lock.exec("PRAGMA busy_timeout = 0; BEGIN EXCLUSIVE"); }
+    catch (error) {
+      lock.close();
+      if ([5, 6].includes(Number((error as { errcode?: number }).errcode))) throw daemonBusy();
+      throw error;
+    }
+    try {
+      const token = this.transaction(() => {
+        const previous = this.db.prepare("SELECT pid, token FROM scheduler_owner WHERE id=1").get();
+        // Pre-upgrade daemons do not hold the new lock. Keep their conservative
+        // PID check until they have stopped; never take over a live legacy owner.
+        if (previous && !String(previous.token).startsWith(LOCKED_OWNER_PREFIX)
+          && (Number(previous.pid) === process.pid ? owners.has(String(previous.token)) : alive(Number(previous.pid)))) {
+          throw daemonBusy();
+        }
+        const next = `${LOCKED_OWNER_PREFIX}${randomUUID()}`;
+        this.db.prepare("INSERT OR REPLACE INTO scheduler_owner(id,pid,token) VALUES(1,?,?)").run(process.pid, next);
+        this.db.prepare("INSERT OR REPLACE INTO scheduler_control(id,stop_requested) VALUES(1,0)").run();
+        return next;
+      });
       this.owner = token;
       owners.add(token);
-    });
+      this.ownerLock = lock;
+    } catch (error) { lock.close(); throw error; }
   }
   runningOwner(): { pid: number; token: string } | undefined {
     const row = this.db.prepare("SELECT pid,token FROM scheduler_owner WHERE id=1").get();
@@ -155,12 +181,14 @@ export class SchedulerStore {
       .map(row => ({ at: Number(row.at), type: String(row.type), data: JSON.parse(String(row.data_json)) }));
   }
   close(): void {
-    if (this.owner) {
-      this.db.prepare("DELETE FROM scheduler_owner WHERE id=1 AND token=?").run(this.owner);
-      owners.delete(this.owner);
+    try {
+      if (this.owner) this.db.prepare("DELETE FROM scheduler_owner WHERE id=1 AND token=?").run(this.owner);
+    } finally {
+      if (this.owner) owners.delete(this.owner);
       this.owner = undefined;
+      try { this.db.close(); }
+      finally { this.ownerLock?.close(); this.ownerLock = undefined; }
     }
-    this.db.close();
   }
   private transaction<T>(operation: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");

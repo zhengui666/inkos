@@ -122,6 +122,29 @@ describe('MegaNovel durable browser protocol (synthetic port, not live publicati
     snapshot.candidates = [{...row(), status: 'published'}];
     expect((await adapter.reconcile(intent)).phase).toBe('published');
   });
+  it.each(['draft', 'submit'] as const)('retains %s uncertainty through session expiry, restart and repeated recovery', async effect => {
+    if (effect === 'submit') await adapter.saveDraft(intent);
+    const operation = vi.fn(async () => {
+      snapshot.blocker = 'login';
+      throw new Error('Synthetic session expired after the effect started');
+    });
+    if (effect === 'draft') browser.createDraft = operation;
+    else browser.submit = operation;
+    const invoke = () => effect === 'draft' ? adapter.saveDraft(intent) : adapter.submit(intent);
+    await expect(invoke()).rejects.toMatchObject({code: 'MEGANOVEL_BROWSER_BLOCKED'});
+    expect(store.getMegaNovelRun(intent.packageId, 1)?.phase).toBe(`${effect}_unknown`);
+    store.close(); store = new PublishingStore(join(root, '.inkos', 'harness.sqlite'));
+    packages = new ManualPublishingAdapter(root, store);
+    adapter = new MegaNovelPublishingAdapter(packages, store, browser);
+    await expect(invoke()).rejects.toMatchObject({code: 'MEGANOVEL_BROWSER_BLOCKED'});
+    snapshot.blocker = 'none';
+    snapshot.scope = {...intent.scope, accountId: 'wrong-after-relogin'};
+    await expect(invoke()).rejects.toMatchObject({code: 'MEGANOVEL_SCOPE_CHANGED'});
+    snapshot.scope = intent.scope;
+    expect((await invoke()).phase).toBe(`${effect}_unknown`);
+    expect((await invoke()).phase).toBe(`${effect}_unknown`);
+    expect(operation).toHaveBeenCalledTimes(1);
+  });
   it.each(['login', 'captcha', 'agreement', 'risk_control', 'quota', 'unrecognized_ui'] as const)('stops at %s', async blocker => {
     snapshot.blocker = blocker;
     await expect(adapter.ready(intent.scope)).rejects.toMatchObject({code: 'MEGANOVEL_BROWSER_BLOCKED'});
