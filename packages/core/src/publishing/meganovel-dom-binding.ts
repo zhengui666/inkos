@@ -161,8 +161,30 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       await checkEditor(page, input.scope, signal);
       await body.click({trial: true}); // Unlike fill, a trial click checks covering overlays in both frames.
       signal.throwIfAborted();
-      await body.fill(input.content);
+      // A multiline contenteditable fill creates Chromium block wrappers that
+      // can add internal blank lines. Enter explicit soft breaks through the
+      // observed editor UI, then verify the resulting text before Save.
+      const lines = input.content.replace(/\r\n?/gu, '\n').split('\n');
+      await body.fill(lines[0]!);
+      for (const line of lines.slice(1)) {
+        signal.throwIfAborted();
+        await body.click({trial: true});
+        signal.throwIfAborted();
+        await body.press('Shift+Enter');
+        await checkEditor(page, input.scope, signal);
+        if (line) {
+          if (!await body.evaluate(element => element.ownerDocument.activeElement === element)) {
+            throw publishingError('MEGANOVEL_EDITOR_FOCUS_CHANGED', 'The observed body no longer owns keyboard focus. Preserve it without further typing.');
+          }
+          signal.throwIfAborted();
+          await page.keyboard.insertText(line);
+        }
+      }
       await checkEditor(page, input.scope, signal);
+      if (await page.locator(TITLE).inputValue() !== input.title
+        || normalizeMegaNovelBodyText(await body.innerText()) !== normalizeMegaNovelBodyText(input.content)) {
+        throw publishingError('MEGANOVEL_CONTENT_CONFLICT', 'Editor input changed the frozen body text. Preserve the unsaved editor; do not click Save or Publish.');
+      }
       await requireOne(page.locator(SAVE), 'Save');
       signal.throwIfAborted();
       await page.locator(SAVE).click();
