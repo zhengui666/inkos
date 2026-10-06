@@ -3,8 +3,8 @@ import { chromium, type Browser, type Page } from 'playwright-core';
 import { z } from 'zod';
 import { publishingError } from './contracts.js';
 import { acquireMegaNovelCdpLock } from './meganovel-cdp-lock.js';
-import { MegaNovelProbeSchema, MegaNovelScopeSchema, type MegaNovelBrowserPort,
-  type MegaNovelProbe, type MegaNovelScope, type MegaNovelBrowserOptions } from './meganovel-contracts.js';
+import { MegaNovelProbeSchema, MegaNovelScopeSchema, MegaNovelSnapshotRequestSchema, type MegaNovelBrowserPort,
+  type MegaNovelProbe, type MegaNovelScope, type MegaNovelBrowserOptions, type MegaNovelSnapshotRequest, type MegaNovelSnapshot } from './meganovel-contracts.js';
 
 /** DOM functions must be implemented from an authorized observation of the current official UI.
  * This type is NOT a supplied MegaNovel DOM implementation. There is deliberately no guessed profile.
@@ -14,6 +14,8 @@ export interface MegaNovelDomBinding {
   readonly protocol: 'inkos-meganovel-dom-v1';
   readonly calibration: {observedAt: string; evidence: string};
   probe(page: Page, scope: MegaNovelScope, signal: AbortSignal): Promise<MegaNovelProbe>;
+  /** Optional additive capability; legacy dom-v1 modules keep their original snapshot contract. */
+  observeSnapshot?(page: Page, input: MegaNovelSnapshotRequest, signal: AbortSignal): Promise<MegaNovelSnapshot>;
   snapshot(page: Page, input: Parameters<MegaNovelBrowserPort['snapshot']>[0], signal: AbortSignal): ReturnType<MegaNovelBrowserPort['snapshot']>;
   createDraft(page: Page, input: Parameters<MegaNovelBrowserPort['createDraft']>[0], signal: AbortSignal): Promise<void>;
   submit(page: Page, input: Parameters<MegaNovelBrowserPort['submit']>[0], signal: AbortSignal): Promise<void>;
@@ -23,7 +25,7 @@ const AuthorizationEvidence = z.object({
   provenance: z.enum(['user_reported', 'platform_document']),
   reference: z.string().trim().min(1).max(8000),
 }).strict();
-const ConfigurationSchema = z.object({
+export const MegaNovelCdpConfigurationSchema = z.object({
   endpointURL: z.string(),
   scope: MegaNovelScopeSchema,
   // One shared path for every InkOS process that may access this browser. The SQLite lifetime lock is released by the OS on a crash.
@@ -33,7 +35,7 @@ const ConfigurationSchema = z.object({
   // Neither a logged-in tab nor an absent AI checkbox establishes these permissions.
   authorization: z.object({automation: AuthorizationEvidence, aiAssistedContent: AuthorizationEvidence}).strict(),
 }).strict();
-export type MegaNovelCdpConfiguration = z.input<typeof ConfigurationSchema>;
+export type MegaNovelCdpConfiguration = z.input<typeof MegaNovelCdpConfigurationSchema>;
 
 /** No launch flags, endpoint discovery, cookie extraction, new profile, authentication or security changes. */
 export function validateMegaNovelCdpEndpoint(value: string): string {
@@ -59,9 +61,9 @@ function assertBinding(binding: MegaNovelDomBinding | undefined): asserts bindin
 
 /** Concrete Playwright transport. Deploying this transport alone does not supply the missing DOM binding. */
 export async function connectMegaNovelCdpPort(configuration: MegaNovelCdpConfiguration,
-  binding?: MegaNovelDomBinding): Promise<MegaNovelBrowserPort & {close(): Promise<void>}> {
+  binding?: MegaNovelDomBinding): Promise<MegaNovelBrowserPort & {observeSnapshot(input: MegaNovelSnapshotRequest, options?: MegaNovelBrowserOptions): Promise<MegaNovelSnapshot>; close(): Promise<void>}> {
   assertBinding(binding); // Fail before any browser access when deployment is incomplete.
-  const config = ConfigurationSchema.parse(configuration);
+  const config = MegaNovelCdpConfigurationSchema.parse(configuration);
   const endpointURL = validateMegaNovelCdpEndpoint(config.endpointURL);
   if (!/^[A-Za-z0-9-]+$/u.test(config.scope.sessionId)) throw publishingError('MEGANOVEL_CDP_CONFIG', 'Use the actual CDP target ID.');
   const reservation = acquireMegaNovelCdpLock(config.lockDirectory, config.scope.sessionId);
@@ -154,6 +156,14 @@ class MegaNovelCdpPort implements MegaNovelBrowserPort {
   probe(scope: MegaNovelScope, options: MegaNovelBrowserOptions = {}) { return this.serial(signal => this.check(scope, signal), options.signal); }
   snapshot(input: Parameters<MegaNovelBrowserPort['snapshot']>[0], options: MegaNovelBrowserOptions = {}) {
     return this.serial(async signal => { await this.check(input.scope, signal); return this.binding.snapshot(this.page, input, signal); }, options.signal);
+  }
+  observeSnapshot(input: MegaNovelSnapshotRequest, options: MegaNovelBrowserOptions = {}) {
+    return this.serial(async signal => {
+      const request = MegaNovelSnapshotRequestSchema.parse(input);
+      if (!this.binding.observeSnapshot) throw publishingError('MEGANOVEL_OBSERVATION_UNSUPPORTED', 'This binding has no package-free observation capability.');
+      await this.check(request.scope, signal);
+      return this.binding.observeSnapshot(this.page, request, signal);
+    }, options.signal);
   }
   createDraft(input: Parameters<MegaNovelBrowserPort['createDraft']>[0], options: MegaNovelBrowserOptions = {}) {
     return this.serial(async signal => { await this.check(input.scope, signal); await this.binding.createDraft(this.page, input, signal); }, options.signal);

@@ -44,6 +44,15 @@ export const MegaNovelSnapshotSchema = MegaNovelProbeSchema.extend({
   }).strict()),
 }).strict();
 export type MegaNovelSnapshot = z.infer<typeof MegaNovelSnapshotSchema>;
+/** Read-only observations have no package reservation or submission declaration. */
+export const MegaNovelSnapshotRequestSchema = z.object({
+  scope: MegaNovelScopeSchema, chapterNumber: z.number().int().positive(), expectedTitle: Label.optional(), remoteChapterId: Label.optional(),
+}).strict();
+export type MegaNovelSnapshotRequest = z.infer<typeof MegaNovelSnapshotRequestSchema>;
+export interface MegaNovelObservationPort {
+  probe(scope: MegaNovelScope, options?: MegaNovelBrowserOptions): Promise<MegaNovelProbe>;
+  snapshot(input: MegaNovelSnapshotRequest, options?: MegaNovelBrowserOptions): Promise<MegaNovelSnapshot>;
+}
 export interface MegaNovelBrowserOptions { signal?: AbortSignal }
 
 /** Browser paragraph text may omit the document's final newline. No prose or internal spacing is changed. */

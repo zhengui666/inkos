@@ -10,3 +10,4 @@ export * from './meganovel-cdp.js';
 export * from './scheduler-publisher.js';
 export * from './scheduler-publisher-registry.js';
 export * from './meganovel-dom-binding.js';
+export * from './preflight.js';

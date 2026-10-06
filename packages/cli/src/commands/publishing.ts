@@ -1,4 +1,5 @@
 import { Command } from 'commander';
+import {createPublishingPreflightCommand} from './publishing-preflight.js';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
@@ -24,6 +25,7 @@ async function run(options: Options, task: (adapter: ManualPublishingAdapter, st
 
 export function createPublishingCommand(): Command {
   const command = new Command('publishing').description('Prepare immutable manual publishing packages and record user-reported receipts; never uploads');
+  command.addCommand(createPublishingPreflightCommand());
   command.command('capabilities').option('--json', 'Output JSON').action(() => log(JSON.stringify(listPublishingCapabilities(), null, 2)));
   command.command('map-book').argument('<platform>', PublishingPlatformSchema.options.join(', '))
     .argument('<remote-book-id>', 'Existing platform book ID, supplied by the author')
