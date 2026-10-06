@@ -1,8 +1,8 @@
-import { mkdir, open, unlink } from 'node:fs/promises';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute } from 'node:path';
 import { chromium, type Browser, type Page } from 'playwright-core';
 import { z } from 'zod';
 import { publishingError } from './contracts.js';
+import { acquireMegaNovelCdpLock } from './meganovel-cdp-lock.js';
 import { MegaNovelProbeSchema, MegaNovelScopeSchema, type MegaNovelBrowserPort,
   type MegaNovelProbe, type MegaNovelScope, type MegaNovelBrowserOptions } from './meganovel-contracts.js';
 
@@ -26,7 +26,7 @@ const AuthorizationEvidence = z.object({
 const ConfigurationSchema = z.object({
   endpointURL: z.string(),
   scope: MegaNovelScopeSchema,
-  // One shared path for every InkOS process that may access this browser. A crash leaves it locked.
+  // One shared path for every InkOS process that may access this browser. The SQLite lifetime lock is released by the OS on a crash.
   lockDirectory: z.string().refine(isAbsolute, 'Use an absolute browser-lock directory.'),
   timeoutMs: z.number().int().min(100).max(120000).default(15000),
   operationTimeoutMs: z.number().int().min(100).max(300000).default(30000),
@@ -64,18 +64,7 @@ export async function connectMegaNovelCdpPort(configuration: MegaNovelCdpConfigu
   const config = ConfigurationSchema.parse(configuration);
   const endpointURL = validateMegaNovelCdpEndpoint(config.endpointURL);
   if (!/^[A-Za-z0-9-]+$/u.test(config.scope.sessionId)) throw publishingError('MEGANOVEL_CDP_CONFIG', 'Use the actual CDP target ID.');
-  await mkdir(config.lockDirectory, {recursive: true});
-  const lockPath = join(config.lockDirectory, `${config.scope.sessionId}.lock`);
-  try {
-    const lock = await open(lockPath, 'wx', 0o600);
-    try { await lock.writeFile(JSON.stringify({pid: process.pid, createdAt: new Date().toISOString()})); }
-    finally { await lock.close(); }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      throw publishingError('MEGANOVEL_BROWSER_BUSY', 'This browser target is reserved. A stale lock needs explicit reconciliation; it is never stolen.');
-    }
-    throw error;
-  }
+  const reservation = acquireMegaNovelCdpLock(config.lockDirectory, config.scope.sessionId);
   let browser: Browser | undefined;
   try {
     browser = await chromium.connectOverCDP(endpointURL, {timeout: config.timeoutMs, noDefaults: true});
@@ -83,15 +72,43 @@ export async function connectMegaNovelCdpPort(configuration: MegaNovelCdpConfigu
     if (!page) throw publishingError('MEGANOVEL_BROWSER_TARGET_MISSING', 'The configured browser target is gone. Do not substitute another tab.');
     page.setDefaultTimeout(config.operationTimeoutMs);
     page.setDefaultNavigationTimeout(config.operationTimeoutMs);
-    const port = new MegaNovelCdpPort(browser, page, binding, config.scope, lockPath, config.operationTimeoutMs);
+    const port = new MegaNovelCdpPort(browser, page, binding, config.scope, reservation, config.operationTimeoutMs);
     await port.probe(config.scope);
     return port;
   } catch (error) {
     // Playwright disconnects a connectOverCDP client; it does not terminate the pre-existing Chrome.
-    if (browser) await browser.close().catch(() => undefined);
-    await unlink(lockPath);
+    try {
+      if (browser) await disconnectAndRelease(browser, reservation);
+      else reservation.release();
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], 'CDP startup failed; browser cleanup also failed.');
+    }
     throw error;
   }
+}
+
+type BrowserReservation = ReturnType<typeof acquireMegaNovelCdpLock>;
+// Keep ownership strongly reachable if Playwright cannot confirm disconnection.
+// Never let garbage collection turn a cleanup failure into a second live owner.
+const quarantined = new Set<BrowserReservation>();
+async function disconnectAndRelease(browser: Browser, reservation: BrowserReservation): Promise<void> {
+  try { await browser.close(); }
+  finally {
+    if (!browser.isConnected()) {
+      quarantined.delete(reservation);
+      reservation.release();
+    } else if (!quarantined.has(reservation)) {
+      quarantined.add(reservation);
+      browser.once('disconnected', () => {
+        quarantined.delete(reservation);
+        try { reservation.release(); }
+        catch { // The SQLite lock was released; a leftover marker is recoverable.
+          process.emitWarning('CDP disconnected but its ownership marker could not be removed.');
+        }
+      });
+    }
+  }
+  if (browser.isConnected()) throw publishingError('MEGANOVEL_BROWSER_BUSY', 'CDP disconnection is unconfirmed; browser ownership is retained.');
 }
 
 async function findTarget(browser: Browser, targetId: string): Promise<Page | undefined> {
@@ -128,10 +145,11 @@ async function findTargetBeforeDeadline(browser: Browser, targetId: string, time
 class MegaNovelCdpPort implements MegaNovelBrowserPort {
   private queue: Promise<unknown> = Promise.resolve();
   private closing = false;
+  private closePromise?: Promise<void>;
   private poisoned = false;
   constructor(private readonly browser: Browser, private readonly page: Page,
     private readonly binding: MegaNovelDomBinding, private readonly scope: MegaNovelScope,
-    private readonly lockPath: string, private readonly operationTimeoutMs: number) {}
+    private readonly reservation: BrowserReservation, private readonly operationTimeoutMs: number) {}
 
   probe(scope: MegaNovelScope, options: MegaNovelBrowserOptions = {}) { return this.serial(signal => this.check(scope, signal), options.signal); }
   snapshot(input: Parameters<MegaNovelBrowserPort['snapshot']>[0], options: MegaNovelBrowserOptions = {}) {
@@ -143,34 +161,47 @@ class MegaNovelCdpPort implements MegaNovelBrowserPort {
   submit(input: Parameters<MegaNovelBrowserPort['submit']>[0], options: MegaNovelBrowserOptions = {}) {
     return this.serial(async signal => { await this.check(input.scope, signal); await this.binding.submit(this.page, input, signal); }, options.signal);
   }
-  async close() {
-    if (this.closing) return;
+  close(): Promise<void> {
     this.closing = true;
-    await this.queue;
-    await this.browser.close(); // Disconnects this CDP client, not the user's Chrome process.
-    await unlink(this.lockPath);
+    return this.closePromise ??= (async () => {
+      await this.queue;
+      await disconnectAndRelease(this.browser, this.reservation);
+    })().catch(error => { this.closePromise = undefined; throw error; });
   }
   private serial<T>(fn: (signal: AbortSignal) => Promise<T>, parentSignal?: AbortSignal): Promise<T> {
     if (this.closing || this.poisoned) return Promise.reject(publishingError('MEGANOVEL_BROWSER_CLOSED', 'This browser transport is closed or requires reconnection.'));
     const operation = this.queue.then(async () => {
       parentSignal?.throwIfAborted();
-      if (this.poisoned) throw publishingError('MEGANOVEL_BROWSER_CLOSED', 'An earlier operation timed out. Reconnect for readback only.');
+      if (this.poisoned) throw publishingError('MEGANOVEL_BROWSER_CLOSED', 'An earlier operation was interrupted. Reconnect for readback only.');
       const controller = new AbortController();
+      let disconnecting: Promise<void> | undefined;
+      const stop = (reason: unknown) => {
+        this.poisoned = true;
+        controller.abort(reason);
+        return disconnecting ??= this.browser.close().then(() => {
+          if (this.browser.isConnected()) throw publishingError('MEGANOVEL_BROWSER_BUSY', 'CDP disconnection is unconfirmed; browser ownership is retained.');
+        });
+      };
       let timer: ReturnType<typeof setTimeout>;
-      const timeout = new Promise<never>((_resolve, reject) => {
+      let onAbort: (() => void) | undefined;
+      const interruption = new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => {
-          this.poisoned = true;
-          controller.abort();
-          // Do not return a timeout while the old Page can still issue browser commands.
-          void this.browser.close().then(() => reject(publishingError('MEGANOVEL_BROWSER_TIMEOUT',
-            'The CDP client disconnected after a timeout. Outcome remains unknown; reconnect for readback only.')), reject);
+          const error = publishingError('MEGANOVEL_BROWSER_TIMEOUT',
+            'The CDP client disconnected after a timeout. Outcome remains unknown; reconnect for readback only.');
+          void stop(error).then(() => reject(error), reject);
         }, this.operationTimeoutMs);
+        if (parentSignal) {
+          onAbort = () => { void stop(parentSignal.reason).then(() => reject(parentSignal.reason), reject); };
+          parentSignal.addEventListener('abort', onAbort, {once: true});
+        }
       });
-      const signal = parentSignal ? AbortSignal.any([controller.signal, parentSignal]) : controller.signal;
-      try { return await Promise.race([fn(signal), timeout]); }
+      try { return await Promise.race([fn(controller.signal), interruption]); }
       finally {
         clearTimeout(timer!);
-        if (this.poisoned) await this.browser.close();
+        if (onAbort) parentSignal!.removeEventListener('abort', onAbort);
+        // A cooperative binding may reject before close completes. Do not return
+        // cancellation/timeout while its old Page could still issue commands.
+        if (disconnecting) await disconnecting;
       }
     });
     this.queue = operation.catch(() => undefined);
