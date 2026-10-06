@@ -3,11 +3,20 @@ export interface RankingEntry {
   readonly author: string;
   readonly category: string;
   readonly extra: string;
+  readonly rank?: number;
+  readonly url?: string;
+  readonly sourceUrl?: string;
+  readonly fetchedAt?: string;
 }
 
 export interface PlatformRankings {
   readonly platform: string;
   readonly entries: ReadonlyArray<RankingEntry>;
+  /** Provenance supplied by the source, never inferred by the model. */
+  readonly sourceUrl?: string;
+  readonly fetchedAt?: string;
+  readonly language?: "zh" | "en";
+  readonly acquisition?: "live" | "snapshot";
 }
 
 /**
@@ -67,14 +76,18 @@ export class FanqieRadarSource implements RadarSource {
         const data = (await res.json()) as Record<string, unknown>;
         const list = (data as { data?: { result?: unknown[] } }).data?.result;
         if (!Array.isArray(list)) continue;
+        const fetchedAt = new Date().toISOString();
 
-        for (const item of list) {
+        for (const [index, item] of list.entries()) {
           const rec = item as Record<string, unknown>;
           entries.push({
             title: String(rec.book_name ?? ""),
             author: String(rec.author ?? ""),
             category: String(rec.category ?? ""),
             extra: `[${label}]`,
+            rank: index + 1,
+            sourceUrl: url,
+            fetchedAt,
           });
         }
       } catch {
@@ -83,7 +96,7 @@ export class FanqieRadarSource implements RadarSource {
       }
     }
 
-    return { platform: "番茄小说", entries };
+    return { platform: "番茄小说", language: "zh", acquisition: "live", entries };
   }
 }
 
@@ -92,9 +105,10 @@ export class QidianRadarSource implements RadarSource {
 
   async fetch(signal?: AbortSignal): Promise<PlatformRankings> {
     const entries: RankingEntry[] = [];
+    const url = "https://www.qidian.com/rank/";
+    let fetchedAt: string | undefined;
 
     try {
-      const url = "https://www.qidian.com/rank/";
       const res = await globalThis.fetch(url, {
           signal,
         headers: {
@@ -104,6 +118,7 @@ export class QidianRadarSource implements RadarSource {
       });
       if (!res.ok) return { platform: "起点中文网", entries };
       const html = await res.text();
+      fetchedAt = new Date().toISOString();
 
       const bookPattern =
         /<a[^>]*href="\/\/book\.qidian\.com\/info\/(\d+)"[^>]*>([^<]+)<\/a>/g;
@@ -113,7 +128,7 @@ export class QidianRadarSource implements RadarSource {
         const title = match[2].trim();
         if (title && !seen.has(title) && title.length > 1 && title.length < 30) {
           seen.add(title);
-          entries.push({ title, author: "", category: "", extra: "[起点热榜]" });
+          entries.push({ title, author: "", category: "", extra: "[起点热榜]", url: `https://book.qidian.com/info/${match[1]}` });
         }
         if (entries.length >= 20) break;
       }
@@ -122,6 +137,6 @@ export class QidianRadarSource implements RadarSource {
       // skip on network error
     }
 
-    return { platform: "起点中文网", entries };
+    return { platform: "起点中文网", entries, sourceUrl: url, fetchedAt, language: "zh", acquisition: "live" };
   }
 }

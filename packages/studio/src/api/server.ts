@@ -5561,6 +5561,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       });
     } catch (error) {
       if (error instanceof ChapterExportSourceError) return c.json({error:error.message,code:error.code,details:error.details},409);
+      if ((error as {code?: string}).code === "BOOK_BUSY") {
+        return c.json({error: error instanceof Error ? error.message : String(error), code: "BOOK_BUSY"}, 409);
+      }
       return c.json({ error: "Export failed" }, 500);
     }
   });
@@ -5599,6 +5602,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       });
     } catch (e) {
       if (e instanceof ChapterExportSourceError) return c.json({error:e.message,code:e.code,details:e.details},409);
+      if ((e as {code?: string}).code === "BOOK_BUSY") return c.json({error: String(e), code: "BOOK_BUSY"}, 409);
       return c.json({ error: String(e) }, 500);
     }
   });

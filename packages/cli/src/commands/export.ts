@@ -34,7 +34,8 @@ export const exportCommand = new Command("export")
       }
     } catch (e) {
       if (opts.json) {
-        log(JSON.stringify({ error: String(e), ...(e instanceof ChapterExportSourceError ? {code:e.code,details:e.details} : {}) }));
+        log(JSON.stringify({ error: String(e), ...(e instanceof ChapterExportSourceError ? {code:e.code,details:e.details}
+          : (e as {code?: string}).code === "BOOK_BUSY" ? {code: "BOOK_BUSY"} : {}) }));
       } else {
         logError(`Failed to export: ${e}`);
       }

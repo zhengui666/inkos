@@ -110,6 +110,19 @@ export const ProjectConfigSchema = z.object({
   researchSearch: ResearchSearchConfigSchema,
   modelOverrides: z.record(z.string(), ModelOverrideValueSchema).optional(),
   daemon: z.object({
+    workIds: z.array(z.string().min(1)).optional(),
+    publicationPollMs: z.number().int().min(60_000).optional(),
+    market: z.object({
+      platform: z.string().min(1),
+      language: z.enum(["zh", "en"]),
+      maxSourceAgeMs: z.number().int().positive().default(86_400_000),
+      liveMegaNovel: z.boolean().default(false),
+      autoCreate: z.object({
+        maxActiveBooks: z.number().int().positive().default(1),
+        targetChapters: z.number().int().positive(),
+        chapterWordCount: z.number().int().positive(),
+      }).strict().optional(),
+    }).strict().optional(),
     schedule: z.object({
       radarCron: z.string().default("0 */6 * * *"),
       writeCron: z.string().default("*/15 * * * *"),

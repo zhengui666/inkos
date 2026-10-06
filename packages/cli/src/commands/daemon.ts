@@ -1,116 +1,110 @@
 import { Command } from "commander";
-import { Scheduler } from "@actalk/inkos-core";
+import { Scheduler, SchedulerStore, loadMegaNovelSchedulerPublisher, type SchedulerPublisher } from "@actalk/inkos-core";
 import { loadConfig, findProjectRoot, buildPipelineConfig, log, logError } from "../utils.js";
 import { createWriteStream, type WriteStream } from "node:fs";
 import { writeFile, readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 
 const PID_FILE = "inkos.pid";
+function isAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; }
+}
+async function removeOwnedPid(path: string, pid: number): Promise<void> {
+  try { if ((await readFile(path, "utf8")).trim() === String(pid)) await unlink(path); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+}
 
 export const upCommand = new Command("up")
-  .description("Start the InkOS daemon (autonomous mode)")
+  .description("Start the persistent InkOS daemon (writing and configured publication)")
   .option("-q, --quiet", "Suppress console output")
+  .option("--work <id...>", "Limit this daemon to selected works; paused works remain paused")
+  .option("--publish-config <path>", "Use explicitly configured MegaNovel CDP/DOM bindings; missing deployment fails before writing")
   .action(async (opts) => {
     let logStream: WriteStream | undefined;
-    let pidPath: string | undefined;
+    let scheduler: Scheduler | undefined;
+    let publisher: SchedulerPublisher | undefined;
+    let ownsPid = false;
+    const root = findProjectRoot(), pidPath = join(root, PID_FILE);
     try {
       const config = await loadConfig({ requireApiKey: false });
-      const root = findProjectRoot();
-
-      // Check if already running
-      pidPath = join(root, PID_FILE);
-      try {
-        const existingPid = await readFile(pidPath, "utf-8");
-        logError(`Daemon already running (PID: ${existingPid.trim()}). Run 'inkos down' first.`);
-        process.exit(1);
-      } catch {
-        // No PID file, good
-      }
-
-      log("Starting InkOS daemon...");
-      log(`  Write cycle: ${config.daemon.schedule.writeCron}`);
-      log(`  Radar scan: ${config.daemon.schedule.radarCron}`);
-      log(`  Max concurrent books: ${config.daemon.maxConcurrentBooks}`);
-      log("");
-
-      // Write PID file
-      await writeFile(pidPath, String(process.pid), "utf-8");
-
-      // File logging for daemon
-      const logPath = join(root, "inkos.log");
-      logStream = createWriteStream(logPath, { flags: "a" });
-
-      const scheduler = new Scheduler({
+      publisher = opts.publishConfig ? await loadMegaNovelSchedulerPublisher(root, opts.publishConfig) : undefined;
+      logStream = createWriteStream(join(root, "inkos.log"), { flags: "a" });
+      scheduler = new Scheduler({
         ...buildPipelineConfig(config, root, { logFile: logStream, quiet: opts.quiet }),
+        ...config.daemon,
         radarCron: config.daemon.schedule.radarCron,
         writeCron: config.daemon.schedule.writeCron,
-        maxConcurrentBooks: config.daemon.maxConcurrentBooks,
-        chaptersPerCycle: config.daemon.chaptersPerCycle,
-        retryDelayMs: config.daemon.retryDelayMs,
-        cooldownAfterChapterMs: config.daemon.cooldownAfterChapterMs,
-        maxChaptersPerDay: config.daemon.maxChaptersPerDay,
-        onChapterComplete: (bookId, chapter) => {
-          log(`  [+] ${bookId} Ch.${chapter}`);
-        },
-        onError: (bookId, error) => {
-          logError(`${bookId}: ${error.message}`);
-        },
+        workIds: opts.work ?? config.daemon.workIds,
+        publisher,
+        onChapterComplete: (bookId, chapter) => log(`  [+] ${bookId} Ch.${chapter}`),
+        onError: (bookId, error) => logError(`${bookId}: ${error.message}`),
       });
-
-      // Handle shutdown
+      let stopping = false;
       const shutdown = async () => {
-        log("\nShutting down daemon...");
-        scheduler.stop();
-        logStream?.end();
-        const currentPidPath = pidPath;
-        if (currentPidPath !== undefined) {
-          try {
-            await unlink(currentPidPath);
-          } catch {
-            // ignore
-          }
-        }
-        process.exit(0);
+        if (stopping) return;
+        stopping = true;
+        log("Stopping daemon; waiting for in-flight operations to settle...");
+        try { await scheduler!.stop(); }
+        finally { if (ownsPid) await removeOwnedPid(pidPath, process.pid); logStream?.end(); }
+        process.exitCode = 0;
       };
-
-      process.on("SIGINT", shutdown);
-      process.on("SIGTERM", shutdown);
-
+      process.once("SIGINT", shutdown);
+      process.once("SIGTERM", shutdown);
+      // The durable SQLite owner, not a leftover PID file, arbitrates startup.
       await scheduler.start();
-      log("Daemon running. Press Ctrl+C to stop.");
-
-      // Keep process alive
-      await new Promise(() => {});
-    } catch (e) {
+      if (stopping) return;
+      await writeFile(pidPath, String(process.pid), "utf8");
+      ownsPid = true;
+      if (stopping) { await removeOwnedPid(pidPath, process.pid); return; }
+      log(`Daemon running (PID ${process.pid}); UTC write ${config.daemon.schedule.writeCron}, radar ${config.daemon.schedule.radarCron}.`);
+      log(publisher ? "Mode: reviewed writing and remote publication readback." : "Mode: reviewed chapter writing; automatic publication is not configured.");
+    } catch (error) {
+      if (scheduler) await scheduler.stop();
+      else await publisher?.close?.();
+      if (ownsPid) await removeOwnedPid(pidPath, process.pid);
       logStream?.end();
-      if (pidPath !== undefined) {
-        try {
-          await unlink(pidPath);
-        } catch {
-          // ignore
-        }
-      }
-      logError(`Failed to start daemon: ${e}`);
-      process.exit(1);
+      logError(`Failed to start daemon: ${error}`);
+      process.exitCode = 1;
     }
   });
 
 export const downCommand = new Command("down")
-  .description("Stop the InkOS daemon")
+  .description("Stop the InkOS daemon after its in-flight operations settle")
   .action(async () => {
-    const root = findProjectRoot();
-    const pidPath = join(root, PID_FILE);
-
+    const root = findProjectRoot(), pidPath = join(root, PID_FILE);
+    const store = new SchedulerStore(join(root, ".inkos", "harness.sqlite"));
     try {
-      const pid = (await readFile(pidPath, "utf-8")).trim();
-      try {
-        process.kill(parseInt(pid, 10), "SIGTERM");
-        log(`Daemon (PID: ${pid}) stopped.`);
-      } catch {
-        log(`Daemon (PID: ${pid}) not found. Cleaning up.`);
+      const owner = store.requestStop();
+      if (!owner) {
+        try {
+          await readFile(pidPath, "utf8");
+          log("A legacy PID file exists, but no current ledger owner can confirm that process. No signal was sent.");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          log("No daemon owns this project.");
+        }
+        return;
       }
-      try { await unlink(pidPath); } catch { /* already cleaned up by daemon */ }
-    } catch {
-      log("No daemon running.");
-    }
+      const deadline = Date.now() + 30_000;
+      while (store.runningOwner()?.token === owner.token && isAlive(owner.pid) && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      if (store.runningOwner()?.token === owner.token && isAlive(owner.pid)) {
+        log("Stop requested through the project ledger; the daemon is still draining. Its PID file was retained.");
+        return;
+      }
+      await removeOwnedPid(pidPath, owner.pid);
+      log(`Daemon (PID ${owner.pid}) stopped.`);
+    } catch (error) { logError(String(error)); process.exitCode = 1; }
+    finally { store.close(); }
+  });
+
+export const daemonStatusCommand = new Command("daemon-status")
+  .description("Read durable daemon progress and recent execution evidence")
+  .option("--json", "Output JSON")
+  .action(opts => {
+    const store = new SchedulerStore(join(findProjectRoot(), ".inkos", "harness.sqlite"));
+    try { const events = store.events(100); log(opts.json ? JSON.stringify({ events }, null, 2) : events.map(event => `${new Date(event.at).toISOString()} ${event.type} ${JSON.stringify(event.data)}`).join("\n")); }
+    finally { store.close(); }
   });

@@ -1,10 +1,12 @@
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { EPub } from "epub-gen-memory";
 import {renderChapterDocument} from '../utils/chapter-document.js';
 import {readChapterHeading} from '../utils/chapter-splitter.js';
 
 export interface ExportStateLike {
+  /** Live StateManager callers share the existing writer lock; frozen package readers need none. */
+  readonly acquireBookLock?: (bookId: string) => Promise<() => Promise<void>>;
   readonly bookDir: (bookId: string) => string;
   readonly loadBookConfig: (bookId: string) => Promise<{ readonly title: string; readonly language?: string }>;
   readonly loadChapterIndex: (bookId: string) => Promise<ReadonlyArray<{
@@ -87,6 +89,28 @@ function markdownToSimpleHtml(markdown: string): { title: string; html: string }
   return { title, html };
 }
 
+/** Freeze live prose only for the short filesystem read, before any export formatting or write. */
+async function readExportSnapshot(state: ExportStateLike, bookId: string) {
+  const bookDir = state.bookDir(bookId);
+  // A read of an unknown Work must not create the directory as a side effect of locking.
+  if (state.acquireBookLock) await access(bookDir);
+  const release = await state.acquireBookLock?.(bookId);
+  try {
+    const chapters = await state.loadChapterIndex(bookId);
+    const book = await state.loadBookConfig(bookId);
+    if (chapters.length === 0) throw new Error("No chapters to export.");
+    const chaptersDir = join(bookDir, "chapters");
+    const chapterFiles = buildChapterFileLookup(await readdir(chaptersDir), chapters);
+    const sources: Array<{chapter: typeof chapters[number]; file: string; raw: string}> = [];
+    for (const chapter of chapters) {
+      const file = chapterFiles.get(chapter.number)!;
+      const raw = await readFile(join(chaptersDir, file), 'utf-8');
+      sources.push({chapter, file, raw});
+    }
+    return { book, chapters, bookDir, sources };
+  } finally { await release?.(); }
+}
+
 export async function buildExportArtifact(
   state: ExportStateLike,
   bookId: string,
@@ -96,34 +120,19 @@ export async function buildExportArtifact(
   },
 ): Promise<ExportArtifact> {
   const format = options.format ?? "txt";
-  const index = await state.loadChapterIndex(bookId);
-  const book = await state.loadBookConfig(bookId);
-  const chapters = index;
-
-  if (chapters.length === 0) {
-    throw new Error("No chapters to export.");
-  }
-
-  const bookDir = state.bookDir(bookId);
-  const chaptersDir = join(bookDir, "chapters");
-  const outputPath = options.outputPath ?? join(bookDir, "exports", `${bookId}.${format}`);
-  const chapterFiles = buildChapterFileLookup(await readdir(chaptersDir), chapters);
-  const totalWords = chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0);
-  const readChapter = async (chapter: typeof chapters[number], file: string) => {
-    const raw = await readFile(join(chaptersDir, file), 'utf-8');
+  const { book, chapters, bookDir, sources } = await readExportSnapshot(state, bookId);
+  const documents = sources.map(({chapter, file, raw}) => {
     const heading = readChapterHeading(raw.trimStart().split(/\r?\n/u)[0] ?? '');
-    return renderChapterDocument(chapter.number, chapter.title ?? heading?.title ?? file.replace(/^\d+_/u,'').replace(/\.md$/u,''), raw,
+    return renderChapterDocument(chapter.number,
+      chapter.title ?? heading?.title ?? file.replace(/^\d+_/u, '').replace(/\.md$/u, ''), raw,
       book.language === 'en' || book.language === undefined && heading?.language === 'en' ? 'en' : 'zh');
-  };
+  });
+  const outputPath = options.outputPath ?? join(bookDir, "exports", `${bookId}.${format}`);
+  const totalWords = chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0);
 
   if (format === "epub") {
     const epubChapters: Array<{ title: string; content: string }> = [];
-    for (const chapter of chapters) {
-      const match = chapterFiles.get(chapter.number);
-      if (!match) {
-        continue;
-      }
-      const markdown = await readChapter(chapter, match);
+    for (const markdown of documents) {
       const { title, html } = markdownToSimpleHtml(markdown);
       epubChapters.push({ title, content: html });
     }
@@ -144,13 +153,7 @@ export async function buildExportArtifact(
 
   const parts: string[] = [];
   parts.push(format === "md" ? `# ${book.title}` : book.title);
-  for (const chapter of chapters) {
-    const match = chapterFiles.get(chapter.number);
-    if (!match) {
-      continue;
-    }
-    parts.push(await readChapter(chapter, match));
-  }
+  parts.push(...documents);
 
   return {
     outputPath,

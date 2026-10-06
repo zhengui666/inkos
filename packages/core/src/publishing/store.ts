@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { z } from 'zod';
 import { FanqieRunSchema, type FanqieRun } from './fanqie-contracts.js';
+import { MegaNovelRunSchema, type MegaNovelRun } from './meganovel-contracts.js';
 import { HarnessIdSchema } from '../harness/contracts.js';
 import {
   PublishingTargetInputSchema, PublishingTargetSchema, PublishingManifestSchema,
@@ -18,6 +19,14 @@ const fanqieTransitions: Record<FanqieRun['phase'], FanqieRun['phase'][]> = {
   reviewing: ['reviewing', 'scheduled', 'published', 'rejected'],
   scheduled: ['scheduled', 'reviewing', 'published', 'rejected'],
   published: ['published'], rejected: ['rejected', 'reviewing', 'scheduled', 'published'],
+};
+const megaNovelTransitions: Record<MegaNovelRun['phase'], MegaNovelRun['phase'][]> = {
+  draft_unknown: ['draft_unknown', 'draft', 'submitted', 'reviewing', 'published', 'rejected'],
+  draft: ['draft', 'submit_unknown', 'submitted', 'reviewing', 'published', 'rejected'],
+  submit_unknown: ['submit_unknown', 'submitted', 'reviewing', 'published', 'rejected'],
+  submitted: ['submitted', 'reviewing', 'published', 'rejected'],
+  reviewing: ['reviewing', 'published', 'rejected'],
+  published: ['published'], rejected: ['rejected', 'submitted', 'reviewing', 'published'],
 };
 
 export interface PublishingPreparation {
@@ -59,6 +68,11 @@ export class PublishingStore {
         package_id TEXT NOT NULL REFERENCES publishing_packages(id), event_id TEXT NOT NULL,
         action_json TEXT NOT NULL, created_at TEXT NOT NULL,
         PRIMARY KEY(package_id, event_id)
+      );
+      CREATE TABLE IF NOT EXISTS publishing_meganovel_runs (
+        package_id TEXT NOT NULL REFERENCES publishing_packages(id), number INTEGER NOT NULL,
+        account_id TEXT NOT NULL, remote_book_id TEXT NOT NULL, run_json TEXT NOT NULL,
+        PRIMARY KEY(package_id, number), UNIQUE(account_id, remote_book_id, number)
       );
     `);
   }
@@ -237,18 +251,87 @@ export class PublishingStore {
       });
   }
 
+  getMegaNovelRun(packageId: string, number: number): MegaNovelRun | undefined {
+    const row = this.db.prepare('SELECT run_json FROM publishing_meganovel_runs WHERE package_id=? AND number=?')
+      .get(HarnessIdSchema.parse(packageId), z.number().int().positive().parse(number));
+    return row ? MegaNovelRunSchema.parse(JSON.parse(String(row.run_json))) : undefined;
+  }
+
+  writeMegaNovelRun(input: {expectedVersion: number; eventId: string; run: MegaNovelRun;
+    reconcileExistingManual?: boolean; readOnlyRebind?: boolean}): PublishingPackage {
+    const run = MegaNovelRunSchema.parse(input.run);
+    return this.change({...input, packageId: run.packageId, chapterNumber: run.chapterNumber},
+      {type: 'meganovel', run, reconcileExistingManual: input.reconcileExistingManual === true,
+        readOnlyRebind: input.readOnlyRebind === true}, (pkg, chapter) => {
+        const selected = pkg.manifest.chapters.find(c => c.number === run.chapterNumber)!;
+        const target = pkg.manifest.target;
+        if (target.platform !== 'meganovel' || target.accountLabel !== run.scope.accountLabel
+          || target.remoteBookId !== run.scope.remoteBookId || selected.revisionId !== run.revisionId) {
+          throw publishingError('MEGANOVEL_TARGET_CONFLICT', 'Browser run differs from the frozen target or chapter.');
+        }
+        const existing = this.getMegaNovelRun(run.packageId, run.chapterNumber);
+        if (!existing) {
+          if (!['awaiting_submission', 'not_submitted_reported'].includes(chapter.status)
+            && !(input.reconcileExistingManual === true && run.phase === 'submit_unknown'
+              && (chapter.remoteChapterId === null || run.remoteChapterId === chapter.remoteChapterId))) {
+            throw publishingError('PUBLISHING_RECONCILIATION_REQUIRED', 'A manual attempt exists; reconcile it before automation.');
+          }
+          this.assertChapterAvailable(pkg, run.chapterNumber);
+          const reservations = this.db.prepare(`SELECT r.number, p.manifest_json FROM publishing_meganovel_runs r
+            JOIN publishing_packages p ON p.id=r.package_id WHERE r.account_id=? AND r.remote_book_id=?`)
+            .all(run.scope.accountId, run.scope.remoteBookId);
+          const other = reservations.find(row => row.number === run.chapterNumber
+            || PublishingManifestSchema.parse(JSON.parse(String(row.manifest_json))).chapters
+              .some(c => c.number === row.number && c.artifactId === selected.artifactId));
+          if (other) throw publishingError('PUBLISHING_RECONCILIATION_REQUIRED', 'This account/book/chapter or artifact already has a browser reservation.');
+        } else {
+          const previousScope = input.readOnlyRebind ? {...existing.scope, sessionId: ''} : existing.scope;
+          const nextScope = input.readOnlyRebind ? {...run.scope, sessionId: ''} : run.scope;
+          if (JSON.stringify(previousScope) !== JSON.stringify(nextScope) || existing.aiAssisted !== run.aiAssisted
+            || existing.revisionId !== run.revisionId || existing.remoteChapterId && existing.remoteChapterId !== run.remoteChapterId) {
+            throw publishingError('MEGANOVEL_RUN_CONFLICT', 'Cannot change the browser target, declaration, revision or remote identity of this attempt.');
+          }
+          if (!megaNovelTransitions[existing.phase].includes(run.phase)) throw publishingError('MEGANOVEL_RUN_CONFLICT', 'Cannot reset a possibly submitted chapter to allow another write.');
+        }
+        if (run.remoteChapterId) {
+          const otherRuns = this.db.prepare(`SELECT run_json FROM publishing_meganovel_runs
+            WHERE account_id=? AND remote_book_id=? AND NOT (package_id=? AND number=?)`)
+            .all(run.scope.accountId, run.scope.remoteBookId, run.packageId, run.chapterNumber);
+          const browserConflict = otherRuns.some(row =>
+            MegaNovelRunSchema.parse(JSON.parse(String(row.run_json))).remoteChapterId === run.remoteChapterId);
+          const manualConflict = this.db.prepare(`SELECT c.package_id FROM publishing_chapters c
+            JOIN publishing_packages p ON p.id=c.package_id
+            WHERE p.target_id=? AND c.remote_chapter_id=?
+              AND NOT (c.package_id=? AND c.number=?)`)
+            .get(target.id, run.remoteChapterId, run.packageId, run.chapterNumber);
+          if (browserConflict || manualConflict) throw publishingError('PUBLISHING_CHAPTER_MAPPING_CONFLICT', 'This remote chapter ID already belongs to another local chapter.');
+        }
+        this.db.prepare('INSERT INTO publishing_meganovel_runs VALUES (?,?,?,?,?) ON CONFLICT(package_id,number) DO UPDATE SET run_json=excluded.run_json')
+          .run(run.packageId, run.chapterNumber, run.scope.accountId, run.scope.remoteBookId, JSON.stringify(run));
+        // Do not counterfeit manual provenance or promote remoteVerified on the original package.
+        this.db.prepare(`UPDATE publishing_chapters SET status=CASE
+          WHEN provenance='user_reported' AND status NOT IN ('awaiting_submission','not_submitted_reported')
+          THEN status ELSE 'awaiting_receipt' END WHERE package_id=? AND number=?`)
+          .run(run.packageId, run.chapterNumber);
+      });
+  }
+
   private assertNoBrowserRun(packageId: string, number: number) {
-    if (this.getFanqieRun(packageId, number)) throw publishingError('PUBLISHING_RECONCILIATION_REQUIRED',
-      'A Fanqie browser run owns this chapter. Manual receipts cannot clear or replace its reservation.');
+    if (this.getFanqieRun(packageId, number) || this.getMegaNovelRun(packageId, number)) throw publishingError('PUBLISHING_RECONCILIATION_REQUIRED',
+      'A browser run owns this chapter. Manual receipts cannot clear or replace its reservation.');
   }
   private assertChapterAvailable(pkg: PublishingPackage, number: number) {
     const artifactId = pkg.manifest.chapters.find(chapter => chapter.number === number)!.artifactId;
     const reservations = this.db.prepare(`SELECT p.manifest_json, c.package_id, c.number, c.status
       FROM publishing_chapters c JOIN publishing_packages p ON p.id=c.package_id
       JOIN publishing_targets t ON t.id=p.target_id
-      WHERE (p.target_id=? OR (t.platform='fanqie' AND t.remote_book_id=? AND ?='fanqie'))
+      WHERE (p.target_id=? OR (t.platform='fanqie' AND t.remote_book_id=? AND ?='fanqie')
+        OR (t.platform='meganovel' AND t.remote_book_id=? AND ?='meganovel'
+          AND NOT EXISTS (SELECT 1 FROM publishing_meganovel_runs r
+            WHERE r.package_id=c.package_id AND r.number=c.number)))
         AND c.package_id<>? AND c.status NOT IN ('awaiting_submission','not_submitted_reported')`)
-      .all(pkg.manifest.target.id, pkg.manifest.target.remoteBookId, pkg.manifest.target.platform, pkg.manifest.id);
+      .all(pkg.manifest.target.id, pkg.manifest.target.remoteBookId, pkg.manifest.target.platform,
+        pkg.manifest.target.remoteBookId, pkg.manifest.target.platform, pkg.manifest.id);
     const existing = reservations.find(row => {
       if (row.number === number) return true;
       const manifest = PublishingManifestSchema.parse(JSON.parse(String(row.manifest_json)));

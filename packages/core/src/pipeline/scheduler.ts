@@ -1,10 +1,22 @@
-import { PipelineRunner } from "./runner.js";
-import type { PipelineConfig } from "./runner.js";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { readFile, readdir } from "node:fs/promises";
+import { PipelineRunner, type PipelineConfig } from "./runner.js";
 import { StateManager } from "../state/manager.js";
+import type { DetectionConfig, ProjectConfig } from "../models/project.js";
 import type { BookConfig } from "../models/book.js";
-import type { DetectionConfig } from "../models/project.js";
+import { SchedulerStore } from "./scheduler-store.js";
+import { AutonomousChapterRunner, type SchedulerPublisher } from "./autonomous-chapters.js";
+import { nextCronTime } from "./schedule.js";
+import { MegaNovelRadarSource } from "../agents/meganovel-radar-source.js";
+import { persistRadarScan } from "../agents/radar-store.js";
+import { selectRadarRecommendation } from "../agents/radar-selection.js";
+import type { ScheduledFoundation } from "./scheduler-store.js";
+import { createBuiltInWorkProfileRegistry } from "../harness/builtin-profiles.js";
+import { loadAvailableAgentSkills, resolveProfileSkillActivations } from "../skills/index.js";
+import { withExecutionEvidence } from "../harness/execution-evidence.js";
 import { detectChapter } from "./detection-runner.js";
-import type { Logger } from "../utils/logger.js";
+import { chapterDocumentBody } from "../utils/chapter-document.js";
 
 export interface SchedulerConfig extends PipelineConfig {
   readonly radarCron: string;
@@ -15,264 +27,237 @@ export interface SchedulerConfig extends PipelineConfig {
   readonly cooldownAfterChapterMs: number;
   readonly maxChaptersPerDay: number;
   readonly detection?: DetectionConfig;
+  readonly workIds?: readonly string[];
+  readonly market?: ProjectConfig["daemon"]["market"];
+  readonly publisher?: SchedulerPublisher;
+  readonly publicationPollMs?: number;
   readonly onChapterComplete?: (bookId: string, chapter: number) => void;
   readonly onError?: (bookId: string, error: Error) => void;
 }
 
-interface ScheduledTask {
-  readonly name: string;
-  readonly intervalMs: number;
-  timer?: ReturnType<typeof setInterval>;
-}
-
+/** Calendar scheduling; durable chapter goals retain progress across ticks and restarts. */
 export class Scheduler {
   private readonly pipeline: PipelineRunner;
   private readonly state: StateManager;
-  private readonly config: SchedulerConfig;
-  private tasks: ScheduledTask[] = [];
+  private readonly store: SchedulerStore;
+  private readonly chapters: AutonomousChapterRunner;
   private running = false;
+  private controller = new AbortController();
+  private timer?: ReturnType<typeof setInterval>;
   private writeCycleInFlight: Promise<void> | null = null;
   private radarScanInFlight: Promise<void> | null = null;
+  private closed = false;
+  private stopping: Promise<void> | undefined;
+  private rotation = 0;
 
-  // Daily chapter counter: "YYYY-MM-DD" → count
-  private dailyChapterCount = new Map<string, number>();
-
-  private readonly log?: Logger;
-
-  constructor(config: SchedulerConfig) {
-    this.config = config;
-    this.pipeline = new PipelineRunner(config);
+  constructor(private readonly config: SchedulerConfig) {
+    this.pipeline = new PipelineRunner({ ...config,
+      ...(config.market?.liveMegaNovel ? { radarSources: [new MegaNovelRadarSource()] } : {}),
+    });
     this.state = new StateManager(config.projectRoot);
-    this.log = config.logger?.child("scheduler");
+    this.store = new SchedulerStore(join(config.projectRoot, ".inkos", "harness.sqlite"));
+    this.chapters = new AutonomousChapterRunner(config.projectRoot, this.pipeline, this.store, {
+      publisher: config.publisher, retryDelayMs: config.retryDelayMs, onComplete: config.onChapterComplete,
+      publicationPollMs: config.publicationPollMs,
+    });
   }
 
   async start(): Promise<void> {
     if (this.running) return;
+    if (this.closed) throw new Error("Create a new Scheduler after it has stopped.");
+    // Validate before changing lifecycle state or dispatching a model.
+    nextCronTime(this.config.writeCron, Date.now());
+    nextCronTime(this.config.radarCron, Date.now());
+    this.store.acquire();
     this.running = true;
-
-    // Run write cycle immediately on start, then schedule
-    await this.triggerWriteCycle();
-
-    // Schedule recurring write cycle
-    const writeCycleMs = this.cronToMs(this.config.writeCron);
-    const writeTask: ScheduledTask = {
-      name: "write-cycle",
-      intervalMs: writeCycleMs,
-    };
-    writeTask.timer = setInterval(() => {
-      this.triggerWriteCycle().catch((e) => {
-        this.config.onError?.("scheduler", e as Error);
-      });
-    }, writeCycleMs);
-    this.tasks.push(writeTask);
-
-    // Schedule radar scan
-    const radarMs = this.cronToMs(this.config.radarCron);
-    const radarTask: ScheduledTask = {
-      name: "radar-scan",
-      intervalMs: radarMs,
-    };
-    radarTask.timer = setInterval(() => {
-      this.triggerRadarScan().catch((e) => {
-        this.config.onError?.("radar", e as Error);
-      });
-    }, radarMs);
-    this.tasks.push(radarTask);
+    this.store.event("daemon-started", { pid: process.pid });
+    this.store.nextAt("write", Date.now());
+    this.store.nextAt("radar", Date.now());
+    this.timer = setInterval(() => { this.tick(); }, 1000);
+    // Resume retained unfinished work immediately, without admitting a new chapter
+    // before its stored calendar tick. New projects have an immediate first tick.
+    void this.triggerWriteCycle(true).finally(() => this.tick());
   }
 
-  stop(): void {
+  stop(): Promise<void> {
+    return this.stopping ??= this.drainAndStop();
+  }
+  private async drainAndStop(): Promise<void> {
     this.running = false;
-    for (const task of this.tasks) {
-      if (task.timer) clearInterval(task.timer);
-    }
-    this.tasks = [];
-  }
-
-  get isRunning(): boolean {
-    return this.running;
-  }
-
-  private async triggerWriteCycle(): Promise<void> {
-    if (this.writeCycleInFlight) {
-      this.log?.warn("Write cycle still running, skipping overlapping tick");
-      return;
-    }
-
-    const cycle = this.runWriteCycle().finally(() => {
-      if (this.writeCycleInFlight === cycle) {
-        this.writeCycleInFlight = null;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+    this.controller.abort(new Error("Daemon stopped."));
+    await Promise.allSettled([this.writeCycleInFlight, this.radarScanInFlight]);
+    if (!this.closed) {
+      try { await this.config.publisher?.close?.(); }
+      finally {
+        this.store.event("daemon-stopped", { pid: process.pid });
+        this.store.close();
+        this.closed = true;
       }
+    }
+  }
+  get isRunning(): boolean { return this.running; }
+
+  private tick(): void {
+    if (!this.running) return;
+    if (this.store.stopRequested()) { void this.stop().catch(error => this.config.onError?.("shutdown", error)); return; }
+    const now = Date.now();
+    if (!this.writeCycleInFlight && now >= this.store.nextAt("write", now)) {
+      this.store.schedule("write", nextCronTime(this.config.writeCron, now));
+      void this.triggerWriteCycle(false);
+    }
+    const pendingFoundation = this.config.market?.autoCreate && !this.config.workIds && !this.config.publisher
+      ? this.store.foundations().find(item => item.phase === "pending" && item.nextAttemptAt <= now) : undefined;
+    if (!this.radarScanInFlight && (pendingFoundation || now >= this.store.nextAt("radar", now))) {
+      if (!pendingFoundation) this.store.schedule("radar", nextCronTime(this.config.radarCron, now));
+      const scan = (pendingFoundation ? this.createFoundation(pendingFoundation) : this.runRadarScan()).catch(error => this.report("radar", error)).finally(() => {
+        if (this.radarScanInFlight === scan) this.radarScanInFlight = null;
+      });
+      this.radarScanInFlight = scan;
+    }
+    // Backoff/readback work resumes independently of the next writing slot.
+    if (!this.writeCycleInFlight && this.store.hasPendingDue(now)) void this.triggerWriteCycle(true);
+  }
+
+  private async triggerWriteCycle(resumeOnly: boolean): Promise<void> {
+    if (!this.running || this.writeCycleInFlight) return;
+    const cycle = this.runWriteCycle(resumeOnly).catch(error => this.report("scheduler", error)).finally(() => {
+      if (this.writeCycleInFlight === cycle) this.writeCycleInFlight = null;
     });
     this.writeCycleInFlight = cycle;
     await cycle;
   }
 
-  private async triggerRadarScan(): Promise<void> {
-    if (this.radarScanInFlight) {
-      this.log?.warn("Radar scan still running, skipping overlapping tick");
-      return;
+  private async runWriteCycle(resumeOnly: boolean): Promise<void> {
+    const active: BookConfig[] = [];
+    const foundations = this.store.foundations();
+    for (const id of await this.state.listBooks()) {
+      if (this.config.workIds && !this.config.workIds.includes(id)) continue;
+      if (foundations.some(item => item.book.id === id && item.phase !== "completed")) continue;
+      const book = await this.state.loadBookConfig(id);
+      if (["active", "outlining"].includes(book.status) && await this.state.isCompleteBookDirectory(this.state.bookDir(id))) active.push(book);
     }
-
-    const scan = this.runRadarScan().finally(() => {
-      if (this.radarScanInFlight === scan) {
-        this.radarScanInFlight = null;
+    if (!active.length) return;
+    const offset = this.rotation++ % active.length;
+    const books = [...active.slice(offset), ...active.slice(0, offset)];
+    // A bounded pool processes every eligible book; a long book cannot starve
+    // later books just because its ID sorts first.
+    let index = 0;
+    await Promise.all(Array.from({ length: Math.min(books.length, this.config.maxConcurrentBooks) }, async () => {
+      while (index < books.length && this.running) {
+        const book = books[index++]!;
+        try { await this.processBook(book.id, resumeOnly); }
+        catch (error) { this.report(book.id, error); }
       }
-    });
-    this.radarScanInFlight = scan;
-    await scan;
+    }));
   }
 
-  /** Check if daily cap is reached across all books. */
-  private isDailyCapReached(): boolean {
-    const today = new Date().toISOString().slice(0, 10);
-    const count = this.dailyChapterCount.get(today) ?? 0;
-    return count >= this.config.maxChaptersPerDay;
-  }
-
-  /** Increment daily chapter counter. */
-  private recordChapterWritten(): void {
-    const today = new Date().toISOString().slice(0, 10);
-    const count = this.dailyChapterCount.get(today) ?? 0;
-    this.dailyChapterCount.set(today, count + 1);
-
-    // Clean up old dates (keep only today)
-    for (const key of this.dailyChapterCount.keys()) {
-      if (key !== today) this.dailyChapterCount.delete(key);
-    }
-  }
-
-  private async runWriteCycle(): Promise<void> {
-    if (this.isDailyCapReached()) {
-      this.log?.info(`Daily cap reached (${this.config.maxChaptersPerDay}), skipping cycle`);
-      return;
-    }
-
-    const bookIds = await this.state.listBooks();
-
-    const activeBooks: Array<{ readonly id: string; readonly config: BookConfig }> = [];
-    for (const id of bookIds) {
-      const config = await this.state.loadBookConfig(id);
-      if (config.status === "active" || config.status === "outlining") {
-        activeBooks.push({ id, config });
+  private async processBook(workId: string, resumeOnly: boolean): Promise<void> {
+    for (let count = 0; count < this.config.chaptersPerCycle && this.running; count++) {
+      const book = await this.state.loadBookConfig(workId);
+      if (!["active", "outlining"].includes(book.status)) return;
+      let job = this.store.latest(workId);
+      if (job?.phase === "blocked") return;
+      if (!job || job.phase === "completed") {
+        if (resumeOnly) return;
+        const chapter = await this.state.getNextChapterNumber(workId);
+        if (chapter > book.targetChapters) return;
+        // Reservation is durable before readiness checks, so unavailable
+        // destinations share the same bounded backoff instead of retrying forever.
+        job = this.store.reserve(workId, chapter, Date.now(), this.config.maxChaptersPerDay);
+        if (!job) return;
       }
-    }
-
-    const booksToWrite = activeBooks.slice(0, this.config.maxConcurrentBooks);
-
-    // Parallel book processing
-    await Promise.all(
-      booksToWrite.map((book) => this.processBook(book.id, book.config)),
-    );
-  }
-
-  /** Process a single book: write chaptersPerCycle chapters with retry + cooldown. */
-  private async processBook(bookId: string, bookConfig: BookConfig): Promise<void> {
-    for (let i = 0; i < this.config.chaptersPerCycle; i++) {
-      if (!this.running) return;
-      if (this.isDailyCapReached()) return;
-
-      // Cooldown between chapters (skip for the first one)
-      if (i > 0 && this.config.cooldownAfterChapterMs > 0) {
-        await this.sleep(this.config.cooldownAfterChapterMs);
-      }
-
-      const success = await this.writeOneChapter(bookId, bookConfig);
-      if (!success) {
-        if (this.config.retryDelayMs > 0) {
-          this.log?.warn(`${bookId} retrying in ${this.config.retryDelayMs}ms`);
-          await this.sleep(this.config.retryDelayMs);
-          const retrySuccess = await this.writeOneChapter(bookId, bookConfig);
-          if (!retrySuccess) break;
-        } else {
-          break;
-        }
-      }
+      if (job.nextAttemptAt > Date.now()) return;
+      if (job.phase === "writing" && !this.store.admitWriting(workId, job.chapter, Date.now(), this.config.maxChaptersPerDay)) return;
+      job = await this.chapters.run(job, this.controller.signal);
+      if (job.error) this.report(workId, Object.assign(new Error(job.error.message), { code: job.error.code }));
+      if (job.phase !== "completed" || resumeOnly || !this.running) return;
+      if (this.config.detection?.enabled) await this.runDetection(workId, job.chapter);
+      if (count + 1 < this.config.chaptersPerCycle) await this.wait(this.config.cooldownAfterChapterMs);
     }
   }
 
-  /** Write one chapter for a book. Semantic review findings do not fail the write. */
-  private async writeOneChapter(bookId: string, bookConfig: BookConfig): Promise<boolean> {
+  private async runDetection(workId: string, chapter: number): Promise<void> {
     try {
-      const result = await this.pipeline.writeNextChapter(bookId);
-      this.recordChapterWritten();
-      if (this.config.detection?.enabled) {
-        await this.runDetection(bookId, result.chapterNumber);
-      }
-      this.config.onChapterComplete?.(bookId, result.chapterNumber);
-      return true;
-    } catch (e) {
-      this.config.onError?.(bookId, e as Error);
-      return false;
-    }
-  }
-
-  private async runDetection(
-    bookId: string,
-    chapterNumber: number,
-  ): Promise<void> {
-    if (!this.config.detection) return;
-    try {
-      const bookDir = this.state.bookDir(bookId);
-      const chapterContent = await this.readChapterContent(bookDir, chapterNumber);
-      await detectChapter(
-        this.config.detection,
-        chapterContent,
-        chapterNumber,
-        bookDir,
-      );
-    } catch (e) {
-      this.config.onError?.(bookId, e as Error);
-    }
+      const book = await this.state.loadBookConfig(workId), directory = this.state.bookDir(workId);
+      const meta = (await this.state.loadChapterIndex(workId)).find(item => item.number === chapter);
+      const files = (await readdir(join(directory, "chapters"))).filter(name => name.startsWith(`${String(chapter).padStart(4, "0")}_`) && name.endsWith(".md"));
+      if (!meta || files.length !== 1) throw new Error("Detection needs one retained chapter document.");
+      const content = chapterDocumentBody(await readFile(join(directory, "chapters", files[0]!), "utf8"), chapter, meta.title, book.language);
+      await detectChapter(this.config.detection!, content, chapter, directory);
+    } catch (error) { this.report(workId, error); } // Observation failure never restarts writing.
   }
 
   private async runRadarScan(): Promise<void> {
+    const market = this.config.market;
+    const result = await this.pipeline.runWithAbortSignal(this.controller.signal, () => this.pipeline.runRadar(market ? {
+      targetPlatform: market.platform, language: market.language, maxSourceAgeMs: market.maxSourceAgeMs,
+    } : {}));
+    this.controller.signal.throwIfAborted();
+    const saved = await persistRadarScan(this.config.projectRoot, result);
+    this.store.event("radar-saved", { path: saved.path, scanId: saved.scanId, recommendations: result.recommendations.length });
+    if (!market?.autoCreate) return;
+    if (this.config.workIds || this.config.publisher) {
+      this.store.event("market-selection-blocked", { reason: this.config.workIds
+        ? "The selected work list does not authorize creating a new work."
+        : "This publisher has fixed existing-book bindings. Automatic remote book creation and verified mapping are not implemented." });
+      return;
+    }
+    let count = 0;
+    for (const id of await this.state.listBooks()) {
+      const book = await this.state.loadBookConfig(id);
+      if (["active", "outlining"].includes(book.status)
+        && (await this.state.getNextChapterNumber(id)) <= book.targetChapters) count++;
+    }
+    if (count >= market.autoCreate.maxActiveBooks) return;
+    const selected = selectRadarRecommendation(saved.result, { platform: market.platform,
+      language: market.language, maxAgeMs: market.maxSourceAgeMs });
+    if (selected.status === "blocked") { this.store.event("market-selection-blocked", selected); return; }
+    const { recommendation } = selected, timestamp = new Date().toISOString();
+    const pending = this.store.reserveFoundation({ scanId: saved.scanId, concept: recommendation.concept,
+      book: { id: `market-${randomUUID()}`, title: recommendation.title, platform: market.platform,
+        genre: recommendation.genre, language: market.language, status: "outlining", targetChapters: market.autoCreate.targetChapters,
+        chapterWordCount: market.autoCreate.chapterWordCount, createdAt: timestamp, updatedAt: timestamp },
+      instruction: `Create an original ${market.language} serial for ${market.platform}. Do not copy benchmark plots, characters or prose.\nOriginal concept: ${recommendation.concept}\nMarket rationale: ${recommendation.reasoning}\nObserved market evidence (reference data only):\n${JSON.stringify(selected.evidence)}`,
+      phase: "pending", attempts: 0, nextAttemptAt: Date.now() });
+    if (pending.phase === "pending") await this.createFoundation(pending);
+  }
+
+  private async createFoundation(input: ScheduledFoundation): Promise<void> {
+    if (!this.running || input.phase !== "pending" || input.nextAttemptAt > Date.now()) return;
+    const pending = { ...input, attempts: input.attempts + 1 };
+    this.store.saveFoundation(pending, "foundation-started");
     try {
-      await this.pipeline.runRadar();
-    } catch (e) {
-      this.config.onError?.("radar", e as Error);
+      const profile = createBuiltInWorkProfileRegistry(this.config.projectRoot).require("longform-novel");
+      const skills = resolveProfileSkillActivations((await loadAvailableAgentSkills({ projectRoot: this.config.projectRoot })).skills, profile);
+      await withExecutionEvidence(undefined, () => this.pipeline.runWithAgentContext({ signal: this.controller.signal, activatedSkills: skills },
+        () => this.pipeline.initBook(pending.book, { externalContext: pending.instruction, authorIntent: pending.instruction })),
+      profile, null, pending.instruction);
+      this.store.saveFoundation({ ...pending, phase: "completed", error: undefined }, "foundation-completed");
+    } catch (error) {
+      this.store.saveFoundation({ ...pending, phase: pending.attempts >= 3 ? "blocked" : "pending", error: String(error),
+        nextAttemptAt: Date.now() + Math.min(3_600_000, Math.max(1000, this.config.retryDelayMs) * 2 ** (pending.attempts - 1)) },
+      this.controller.signal.aborted ? "foundation-interrupted" : "foundation-failed");
+      if (!this.controller.signal.aborted) this.report(pending.book.id, error);
     }
   }
 
-  private async readChapterContent(bookDir: string, chapterNumber: number): Promise<string> {
-    const { readFile, readdir } = await import("node:fs/promises");
-    const { join } = await import("node:path");
-    const chaptersDir = join(bookDir, "chapters");
-    const files = await readdir(chaptersDir);
-    const paddedNum = String(chapterNumber).padStart(4, "0");
-    const chapterFile = files.find((f) => f.startsWith(paddedNum) && f.endsWith(".md"));
-    if (!chapterFile) {
-      throw new Error(`Chapter ${chapterNumber} file not found in ${chaptersDir}`);
-    }
-    const raw = await readFile(join(chaptersDir, chapterFile), "utf-8");
-    const lines = raw.split("\n");
-    const contentStart = lines.findIndex((l, i) => i > 0 && l.trim().length > 0);
-    return contentStart >= 0 ? lines.slice(contentStart).join("\n") : raw;
+  private report(workId: string, error: unknown): void {
+    if (this.closed) return;
+    this.store.event("daemon-error", { workId, message: String(error) });
+    try { this.config.logger?.child("scheduler").error(`${workId}: ${String(error)}`); }
+    catch (logError) { this.store.event("log-sink-failed", { message: String(logError) }); }
+    try { this.config.onError?.(workId, error instanceof Error ? error : new Error(String(error))); }
+    catch (callbackError) { this.store.event("error-callback-failed", { workId, message: String(callbackError) }); }
   }
-
-  private cronToMs(cron: string): number {
-    const parts = cron.split(" ");
-    if (parts.length < 5) return 24 * 60 * 60 * 1000;
-
-    const minute = parts[0]!;
-    const hour = parts[1]!;
-
-    // "*/N * * * *" → every N minutes
-    if (minute.startsWith("*/")) {
-      const interval = parseInt(minute.slice(2), 10);
-      return interval * 60 * 1000;
-    }
-
-    // "0 */N * * *" → every N hours
-    if (hour.startsWith("*/")) {
-      const interval = parseInt(hour.slice(2), 10);
-      return interval * 60 * 60 * 1000;
-    }
-
-    // Fixed time → treat as daily
-    return 24 * 60 * 60 * 1000;
-  }
-
-  private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  private async wait(ms: number): Promise<void> {
+    const signal = this.controller.signal;
+    if (signal.aborted) return;
+    await new Promise<void>(resolve => {
+      const finish = () => { clearTimeout(timer); signal.removeEventListener("abort", finish); resolve(); };
+      const timer = setTimeout(finish, ms);
+      signal.addEventListener("abort", finish, { once: true });
+    });
   }
 }

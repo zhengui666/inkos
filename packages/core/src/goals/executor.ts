@@ -72,7 +72,7 @@ export class GoalExecutor {
       const context: GoalStepContext = { goal, step, signal };
       const retry = await adapter.withScope(context, () => this.advance(lease, context, adapter, verifyOnly));
       if (!retry) return;
-      await wait(this.retryDelayMs, signal);
+      await wait(Math.min(60_000, this.retryDelayMs * 2 ** Math.min(step.attempts, 6)), signal);
     }
   }
 

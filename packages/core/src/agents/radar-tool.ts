@@ -1,15 +1,11 @@
 import { Type } from "@sinclair/typebox";
 
-const PlatformSchema = Type.Union([
-  Type.Literal("tomato"),
-  Type.Literal("feilu"),
-  Type.Literal("qidian"),
-  Type.Literal("other"),
-]);
-
 export const RadarResultToolSchema = Type.Object({
   recommendations: Type.Array(Type.Object({
-    platform: PlatformSchema,
+    platform: Type.String({ minLength: 1 }),
+    title: Type.Optional(Type.String({ minLength: 1 })),
+    language: Type.Optional(Type.Union([Type.Literal("zh"), Type.Literal("en")])),
+    evidenceIds: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
     genre: Type.String(),
     concept: Type.String(),
     reasoning: Type.String(),
