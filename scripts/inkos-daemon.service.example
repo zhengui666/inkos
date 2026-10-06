@@ -1,0 +1,17 @@
+# Template only. Replace each absolute path/BOOK_ID after successful isolated
+# build and live binding validation. Installing this unit is a separate action.
+[Unit]
+Description=InkOS reviewed serial workflow
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/ABSOLUTE/INKOS_PROJECT
+ExecStart=/ABSOLUTE/NODE24/bin/node /ABSOLUTE/VALIDATED_INKOS/packages/cli/dist/index.js up --work BOOK_ID --publish-config /ABSOLUTE/PRIVATE/publishing.json
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGTERM
+TimeoutStopSec=300
+
+[Install]
+WantedBy=default.target

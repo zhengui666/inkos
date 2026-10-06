@@ -53,6 +53,10 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @actalk/inkos-studio exec playwright install --with-deps chromium
       - run: pnpm build
+      - name: Verify the isolated MegaNovel DOM workflow without real accounts
+        env:
+          INKOS_BROWSER_FIXTURES: '1'
+        run: pnpm --filter @actalk/inkos-core exec vitest run src/__tests__/meganovel-dom-binding.test.ts
       - name: Initialize a ChatGPT-only project without legacy API keys
         run: |
           mkdir -p test-project

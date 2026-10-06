@@ -59,7 +59,7 @@ export function createChapterGoalAdapter(options: {
       }));
     },
     // Only transient provider failures with positively confirmed absence retry.
-    isRetryable: error => ["MODEL_UNAVAILABLE", "ECONNRESET", "ETIMEDOUT", "RATE_LIMITED"].includes(goalFailure(error).code),
+    isRetryable: error => ["MODEL_UNAVAILABLE", "WORKER_TIMEOUT", "ECONNRESET", "ETIMEDOUT", "RATE_LIMITED"].includes(goalFailure(error).code),
   };
 }
 

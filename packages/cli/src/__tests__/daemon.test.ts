@@ -1,93 +1,17 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+const f=vi.hoisted(()=>({read:vi.fn(),write:vi.fn(),unlink:vi.fn(),end:vi.fn(),start:vi.fn(),stop:vi.fn(),log:vi.fn(),error:vi.fn(),requestStop:vi.fn(),owner:vi.fn()}));
+vi.mock('node:fs/promises',()=>({readFile:f.read,writeFile:f.write,unlink:f.unlink}));
+vi.mock('node:fs',()=>({createWriteStream:()=>({end:f.end})}));
+vi.mock('@actalk/inkos-core',()=>({Scheduler:class {start=f.start;stop=f.stop;},SchedulerStore:class {events(){return [];}requestStop=f.requestStop;runningOwner=f.owner;close(){}}}));
+vi.mock('../utils.js',()=>({loadConfig:async()=>({daemon:{schedule:{radarCron:'0 */6 * * *',writeCron:'*/15 * * * *'},maxConcurrentBooks:1,chaptersPerCycle:1,retryDelayMs:0,cooldownAfterChapterMs:0,maxChaptersPerDay:10}}),findProjectRoot:()=>'/project',buildPipelineConfig:()=>({projectRoot:'/project',model:'fixture',client:{}}),log:f.log,logError:f.error}));
+let beforeInt:Function[],beforeTerm:Function[];
+beforeEach(()=>{vi.resetModules();vi.resetAllMocks();process.exitCode=0;beforeInt=process.listeners('SIGINT');beforeTerm=process.listeners('SIGTERM');f.stop.mockResolvedValue(undefined);f.start.mockResolvedValue(undefined);f.write.mockResolvedValue(undefined);f.unlink.mockResolvedValue(undefined);});
+afterEach(()=>{for(const x of process.listeners('SIGINT'))if(!beforeInt.includes(x))process.removeListener('SIGINT',x as any);for(const x of process.listeners('SIGTERM'))if(!beforeTerm.includes(x))process.removeListener('SIGTERM',x as any);process.exitCode=0;vi.restoreAllMocks();});
+describe('daemon CLI lifecycle',()=>{
+ it('does not remove another daemon PID when the owner claim fails',async()=>{f.start.mockRejectedValue(Object.assign(new Error('busy'),{code:'DAEMON_BUSY'}));const {upCommand}=await import('../commands/daemon.js');await upCommand.parseAsync(['node','up']);expect(f.write).not.toHaveBeenCalled();expect(f.unlink).not.toHaveBeenCalled();expect(f.stop).toHaveBeenCalledOnce();expect(process.exitCode).toBe(1);});
+ it('drains the claimed scheduler if the PID write fails',async()=>{f.write.mockRejectedValue(new Error('disk full'));const {upCommand}=await import('../commands/daemon.js');await upCommand.parseAsync(['node','up']);expect(f.stop).toHaveBeenCalledOnce();expect(f.unlink).not.toHaveBeenCalled();expect(process.exitCode).toBe(1);});
+ it('registers shutdown before start and removes only its own PID after draining',async()=>{let registered=false;f.start.mockImplementation(async()=>{registered=process.listeners('SIGTERM').length>beforeTerm.length;});f.read.mockResolvedValue(String(process.pid));const {upCommand}=await import('../commands/daemon.js');await upCommand.parseAsync(['node','up']);expect(registered).toBe(true);const handler=process.listeners('SIGTERM').find(x=>!beforeTerm.includes(x))!;await handler('SIGTERM');expect(f.stop).toHaveBeenCalledOnce();expect(f.unlink).toHaveBeenCalledWith('/project/inkos.pid');});
+ it('cleans a dead ledger owner without sending a signal',async()=>{f.read.mockResolvedValue('98765');f.requestStop.mockReturnValue({pid:98765,token:'old'});f.owner.mockReturnValue({pid:98765,token:'old'});const kill=vi.spyOn(process,'kill').mockImplementation(()=>{throw Object.assign(new Error('dead'),{code:'ESRCH'});});const {downCommand}=await import('../commands/daemon.js');await downCommand.parseAsync(['node','down']);expect(kill).toHaveBeenCalledWith(98765,0);expect(kill).not.toHaveBeenCalledWith(98765,'SIGTERM');expect(f.unlink).toHaveBeenCalledWith('/project/inkos.pid');});
+ it('does not signal or claim absence from an unverified legacy PID file',async()=>{f.read.mockResolvedValue('98765');f.requestStop.mockReturnValue(undefined);const kill=vi.spyOn(process,'kill');const {downCommand}=await import('../commands/daemon.js');await downCommand.parseAsync(['node','down']);expect(kill).not.toHaveBeenCalled();expect(f.log).toHaveBeenCalledWith(expect.stringContaining('legacy PID'));});
 
-const readFileMock = vi.fn();
-const writeFileMock = vi.fn();
-const unlinkMock = vi.fn();
-const endMock = vi.fn();
-const createWriteStreamMock = vi.fn(() => ({ end: endMock }));
-const schedulerStartMock = vi.fn();
-const schedulerStopMock = vi.fn();
-const logMock = vi.fn();
-const logErrorMock = vi.fn();
-
-vi.mock("node:fs/promises", () => ({
-  readFile: readFileMock,
-  writeFile: writeFileMock,
-  unlink: unlinkMock,
-}));
-
-vi.mock("node:fs", () => ({
-  createWriteStream: createWriteStreamMock,
-}));
-
-vi.mock("@actalk/inkos-core", () => ({
-  Scheduler: class {
-    start = schedulerStartMock;
-    stop = schedulerStopMock;
-  },
-}));
-
-vi.mock("../utils.js", () => ({
-  loadConfig: vi.fn(async () => ({
-    daemon: {
-      schedule: {
-        radarCron: "0 */6 * * *",
-        writeCron: "*/15 * * * *",
-      },
-      maxConcurrentBooks: 1,
-      chaptersPerCycle: 1,
-      retryDelayMs: 0,
-      cooldownAfterChapterMs: 0,
-      maxChaptersPerDay: 10,
-    },
-  })),
-  findProjectRoot: vi.fn(() => "/project"),
-  buildPipelineConfig: vi.fn(() => ({
-    client: {
-      provider: "openai",
-      apiFormat: "chat",
-      stream: false,
-      defaults: {
-        temperature: 0.7,
-        maxTokens: 1024,
-        thinkingBudget: 0,
-      },
-    },
-    model: "test-model",
-    projectRoot: "/project",
-  })),
-  log: logMock,
-  logError: logErrorMock,
-}));
-
-describe("daemon command", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.resetModules();
-  });
-
-  it("removes the pid file when startup fails after writing it", async () => {
-    readFileMock.mockRejectedValueOnce(new Error("missing pid"));
-    writeFileMock.mockResolvedValue(undefined);
-    unlinkMock.mockResolvedValue(undefined);
-    schedulerStartMock.mockRejectedValueOnce(new Error("scheduler boot failed"));
-
-    const exitError = new Error("process.exit");
-    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
-      throw Object.assign(exitError, { code });
-    }) as never);
-
-    const { upCommand } = await import("../commands/daemon.js");
-
-    await expect(
-      upCommand.parseAsync(["node", "up", "--quiet"]),
-    ).rejects.toMatchObject({ code: 1 });
-
-    const pidPath = join("/project", "inkos.pid");
-    expect(writeFileMock).toHaveBeenCalledWith(pidPath, expect.any(String), "utf-8");
-    expect(unlinkMock).toHaveBeenCalledWith(pidPath);
-
-    exitSpy.mockRestore();
-  });
 });

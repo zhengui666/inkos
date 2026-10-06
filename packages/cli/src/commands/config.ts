@@ -30,6 +30,9 @@ configCommand
         "daemon.maxConcurrentBooks", "daemon.chaptersPerCycle",
         "daemon.retryDelayMs", "daemon.cooldownAfterChapterMs",
         "daemon.maxChaptersPerDay",
+        "daemon.workIds", "daemon.publicationPollMs",
+        "daemon.market.platform", "daemon.market.language", "daemon.market.maxSourceAgeMs", "daemon.market.liveMegaNovel",
+        "daemon.market.autoCreate.maxActiveBooks", "daemon.market.autoCreate.targetChapters", "daemon.market.autoCreate.chapterWordCount",
       ]);
       // Allow any key under llm.extra.* (passthrough to API)
       if (!KNOWN_KEYS.has(key) && !key.startsWith("llm.extra.")) {
@@ -67,7 +70,11 @@ configCommand
       }
       const finalKey = keys[keys.length - 1]!;
       // Auto-coerce types: numbers and booleans shouldn't be stored as strings
-      if (/^\d+(\.\d+)?$/.test(value)) {
+      if (key === "daemon.workIds") {
+        const ids: unknown = JSON.parse(value);
+        if (!Array.isArray(ids) || ids.some(id => typeof id !== "string" || !id.trim())) throw new Error("daemon.workIds requires a JSON array of nonempty work IDs.");
+        target[finalKey] = ids;
+      } else if (/^\d+(\.\d+)?$/.test(value)) {
         target[finalKey] = parseFloat(value);
       } else if (value === "true") {
         target[finalKey] = true;

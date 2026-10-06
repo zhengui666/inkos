@@ -15,6 +15,7 @@ export type GoalPipeline = Pick<PipelineRunner, 'writeChapters' | 'runWithAbortS
 export type ChapterGoalCreateInput = Parameters<typeof chapterGoalInput>[0];
 export interface ChapterGoalServiceOptions {
   readonly projectRoot: string;
+  readonly retryDelayMs?: number;
   /** Called only by a runnable writing request, never create/status/recover. */
   readonly createPipeline?: () => Promise<GoalPipeline> | GoalPipeline;
 }
@@ -93,7 +94,7 @@ export class ChapterGoalService {
     options.signal?.throwIfAborted();
     // requestRun performs the atomic CAS after all non-writing preparation.
     this.store.requestRun(id, expectedVersion);
-    const executor = new GoalExecutor(this.store, [createChapterGoalAdapter({ projectRoot: this.root, pipeline })]);
+    const executor = new GoalExecutor(this.store, [createChapterGoalAdapter({ projectRoot: this.root, pipeline })], this.options.retryDelayMs);
     return withExecutionEvidence(undefined, () => pipeline.runWithAgentContext({ activatedSkills: skills },
       () => executor.run(id, options.signal)), profile, work, goal.intent);
   }

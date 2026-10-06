@@ -12,10 +12,18 @@ vi.mock("../../../core/src/codex/client.js", () => ({ createCodexClient }));
 const roots: string[] = [];
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
 beforeEach(() => {
-  vi.spyOn(FanqieRadarSource.prototype, "fetch").mockResolvedValue({ platform: "tomato", entries: [{ title: "Fixture ranking", category: "fantasy", extra: "Rank 1" }], fetchedAt: "2026-01-01" } as never);
-  vi.spyOn(QidianRadarSource.prototype, "fetch").mockResolvedValue({ platform: "qidian", entries: [], fetchedAt: "2026-01-01" } as never);
+  // Synthetic source snapshots remain fresh at acquisition time and carry host
+  // provenance. They do not bypass the real source-evidence gate or use a network.
+  vi.spyOn(FanqieRadarSource.prototype, "fetch").mockImplementation(async () => ({
+    platform: "fanqie", language: "zh", acquisition: "snapshot", entries: [], fetchedAt: new Date().toISOString(),
+  }));
+  vi.spyOn(QidianRadarSource.prototype, "fetch").mockImplementation(async () => ({
+    platform: "qidian", language: "zh", acquisition: "snapshot", sourceUrl: "https://www.qidian.com/rank/",
+    fetchedAt: new Date().toISOString(),
+    entries: [{ title: "Fixture ranking", author: "Fixture author", category: "fantasy", extra: "Synthetic rank 1", rank: 1 }],
+  }));
 });
-const radar = { recommendations: [{ platform: "qidian", genre: "fantasy", concept: "A clockmaker's city", reasoning: "Based on Fixture ranking", benchmarkTitles: ["Fixture ranking"] }], marketSummary: "Evidence-backed fixture market" };
+const radar = { recommendations: [{ platform: "qidian", language: "zh", evidenceIds: ["S2E1"], genre: "fantasy", concept: "A clockmaker's city", reasoning: "Based on Fixture ranking", benchmarkTitles: ["Fixture ranking"] }], marketSummary: "Evidence-backed fixture market" };
 const post = (body: unknown = {}) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 async function project(legacy = false) {
   const root = await mkdtemp(join(tmpdir(), "inkos-codex-production-")); roots.push(root);
@@ -34,7 +42,12 @@ describe("Studio Codex-only production routes", () => {
       const app = createStudioServer({} as never, root);
       const response = await app.request("/api/v1/radar/scan", post());
       expect(response.status, await response.clone().text()).toBe(200);
-      expect(await response.json()).toMatchObject(radar);
+      const result = await response.json();
+      expect(result).toMatchObject(radar);
+      expect(result.evidence).toEqual([expect.objectContaining({
+        id: "S2E1", platform: "qidian", language: "zh", title: "Fixture ranking",
+        sourceUrl: "https://www.qidian.com/rank/", acquisition: "snapshot", fetchedAt: expect.any(String),
+      })]);
       const history = await (await app.request("/api/v1/radar/history")).json();
       expect(history.items.length).toBeGreaterThan(0);
     }
