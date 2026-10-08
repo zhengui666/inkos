@@ -13,7 +13,11 @@ vi.mock('../pipeline/runner.js', () => ({ PipelineRunner: class {
 vi.mock('../state/manager.js', () => ({ StateManager: class {
   bookDir(id: string) { return id; }
   async listBooks() { return [...fake.books.keys()]; }
-  async loadBookConfig(id: string) { return fake.books.get(id); }
+  async loadBookConfig(id: string) {
+    const book = fake.books.get(id);
+    if (!book) throw Object.assign(new Error('Book config not yet persisted'), { code: 'ENOENT' });
+    return book;
+  }
   async isCompleteBookDirectory() { return true; }
   async getNextChapterNumber(id: string) { return fake.next.get(id) ?? 1; }
   async acquireBookLock() { return async () => undefined; }

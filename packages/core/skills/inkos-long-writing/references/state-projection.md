@@ -19,4 +19,4 @@ Update the supplied runtime state instead of rebuilding it from scratch. Preserv
 
 ## Numeric and cast state
 
-When a resource system exists, every explicit delta must reconcile opening value plus change to closing value. When full-cast tracking is enabled, record present characters, mentioned absent characters, relationship changes, and information boundaries.
+Separate received advances from new payments, total price from amount due, and cash from earned income. Reconcile totals only from unambiguous openings, transactions and story-defined recognition; otherwise keep unknowns. Promises are not receipts. Full-cast tracking: present or mentioned cast, relationship changes and knowledge boundaries.
