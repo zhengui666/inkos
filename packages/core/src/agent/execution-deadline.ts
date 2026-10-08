@@ -1,3 +1,5 @@
+import { isUnboundedWorkerExecution } from "./worker-execution-policy.js";
+
 /** Host limits survive correction turns; timeouts never authorize a retry. */
 export function executionTimeoutMs(value: number | undefined, env: string, fallback: number): number {
   const configured = process.env[env]?.trim();
@@ -9,6 +11,11 @@ export function executionTimeoutMs(value: number | undefined, env: string, fallb
 }
 
 export async function withAgentRequestDeadline<T>(signal: AbortSignal | undefined, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  if (isUnboundedWorkerExecution()) {
+    const active = signal ?? new AbortController().signal;
+    active.throwIfAborted();
+    return run(active);
+  }
   const timeoutMs = executionTimeoutMs(undefined, "INKOS_AGENT_TIMEOUT_MS", 24 * 60 * 60_000);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(Object.assign(new Error(

@@ -13,7 +13,8 @@ class StepStopped extends Error {
 export class GoalExecutor {
   private readonly adapters: Map<string, GoalStepAdapter>;
   constructor(readonly store: GoalStore, adapters: readonly GoalStepAdapter[],
-    private readonly retryDelayMs = 1000) {
+    private readonly retryDelayMs = 1000,
+    private readonly options: { compensateInterruptedAttempts?: boolean } = {}) {
     this.adapters = new Map(adapters.map(adapter => [adapter.kind, adapter]));
     if (this.adapters.size !== adapters.length) throw new Error("Duplicate goal adapter kind.");
     if (!Number.isInteger(retryDelayMs) || retryDelayMs < 0 || retryDelayMs > 60000) throw new Error("Retry delay must be 0–60000 milliseconds.");
@@ -96,6 +97,11 @@ export class GoalExecutor {
       return this.stop(lease, context, "GOAL_RECONCILIATION_REQUIRED", "This adapter cannot safely repeat an attempted operation.");
     }
     this.check(lease, context.signal);
+    if (this.options.compensateInterruptedAttempts && context.goal.budget.expiresAt === null
+      && context.step.interruptedAttempt === context.step.attempts && context.step.status === "running"
+      && before.baselineState !== undefined) {
+      this.store.compensateInterruptedAttempt(lease, context.step.id, context.step.attempts, before.baselineState);
+    }
     if (context.step.status === "running") this.store.recordStep(lease, context.step.id,
       { status: "pending", error: { code: "GOAL_ATTEMPT_INTERRUPTED", message: "Reconciliation confirmed no persisted output." } });
     const started = this.store.beginAttempt(lease, context.step.id, before.baselineState);

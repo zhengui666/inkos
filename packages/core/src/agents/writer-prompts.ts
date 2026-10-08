@@ -21,6 +21,7 @@ export function buildWriterSystemPrompt(
         lengthContract(resolvedLength, "en"),
         narrativePersonContract(bookRules, "en"),
         protagonistContract(bookRules, "en"),
+        authorityBlock("Reader contract", bookRules?.readerContract ? JSON.stringify(bookRules.readerContract) : undefined),
         authorityBlock("Book rules", bookRulesBody),
         authorityBlock("Style guide", styleGuide),
       ]
@@ -30,6 +31,7 @@ export function buildWriterSystemPrompt(
         lengthContract(resolvedLength, "zh"),
         narrativePersonContract(bookRules, "zh"),
         protagonistContract(bookRules, "zh"),
+        authorityBlock("读者承诺", bookRules?.readerContract ? JSON.stringify(bookRules.readerContract) : undefined),
         authorityBlock("本书规则", bookRulesBody),
         authorityBlock("文风指南", styleGuide),
       ];

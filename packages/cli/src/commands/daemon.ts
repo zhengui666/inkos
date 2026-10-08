@@ -28,7 +28,8 @@ export const upCommand = new Command("up")
     const root = findProjectRoot(), pidPath = join(root, PID_FILE);
     try {
       const config = await loadConfig({ requireApiKey: false });
-      publisher = opts.publishConfig ? await loadSchedulerPublisher(root, opts.publishConfig) : undefined;
+      const publisherConfig = opts.publishConfig ?? config.daemon.publisherConfig;
+      publisher = publisherConfig ? await loadSchedulerPublisher(root, publisherConfig) : undefined;
       logStream = createWriteStream(join(root, "inkos.log"), { flags: "a" });
       scheduler = new Scheduler({
         ...buildPipelineConfig(config, root, { logFile: logStream, quiet: opts.quiet }),

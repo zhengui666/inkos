@@ -20,7 +20,11 @@ export const FanqieRunSchema = z.object({
   phase: z.enum(['draft_unknown', 'draft', 'schedule_unknown', 'scheduled', 'reviewing', 'published', 'rejected']),
   remoteChapterId: Label.nullable(), scheduledFor: FanqieInstantSchema.nullable(),
   evidence: z.string().max(8000).nullable(),
-}).strict();
+}).strict().superRefine((run, ctx) => {
+  if (!['draft_unknown', 'schedule_unknown'].includes(run.phase) && (!run.remoteChapterId || !run.evidence?.trim())) {
+    ctx.addIssue({code: z.ZodIssueCode.custom, message: 'An observed state needs the actual remote chapter ID and readback evidence.'});
+  }
+});
 export type FanqieRun = z.infer<typeof FanqieRunSchema>;
 export const FanqieSnapshotSchema = z.object({
   scope: FanqieScopeSchema,

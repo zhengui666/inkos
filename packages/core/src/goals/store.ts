@@ -8,6 +8,7 @@ import {
 
 const activeOwners = new Set<string>();
 const terminal = new Set<GoalStatus>(["completed", "cancelled", "failed"]);
+const transientFailures = new Set(["MODEL_UNAVAILABLE", "WORKER_TIMEOUT", "ECONNRESET", "ETIMEDOUT", "RATE_LIMITED"]);
 function processAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
@@ -41,7 +42,7 @@ export class GoalStore {
 
   create(input: GoalInput): Goal {
     const parsed = GoalInputSchema.parse(input), now = this.now();
-    if (parsed.budget.expiresAt <= now) throw goalError("GOAL_BUDGET_EXHAUSTED", "Goal deadline has already elapsed.");
+    if (parsed.budget.expiresAt !== null && parsed.budget.expiresAt <= now) throw goalError("GOAL_BUDGET_EXHAUSTED", "Goal deadline has already elapsed.");
     if (new Set(parsed.steps.map(step => step.id)).size !== parsed.steps.length) {
       throw goalError("GOAL_STEP_ID_REUSED", "Goal step IDs must be unique.");
     }
@@ -96,6 +97,27 @@ export class GoalStore {
     });
   }
 
+  /** Scoped transient retry grant; never resets prior attempts or authorizes blind replay. */
+  retryTransientFailure(id: string, expectedVersion: number, additionalAttempts = 3): Goal {
+    if (!Number.isInteger(additionalAttempts) || additionalAttempts < 1 || additionalAttempts > 3) {
+      throw goalError("GOAL_RETRY_GRANT_INVALID", "A transient retry grant must add between one and three attempts.");
+    }
+    return this.change(id, "goal-transient-retry-granted", { additionalAttempts }, goal => {
+      this.checkVersion(goal, expectedVersion);
+      const unfinished = goal.steps.filter(step => step.status !== "completed");
+      if (goal.owner || goal.status !== "failed" || goal.desiredState === "cancelled"
+        || goal.budget.expiresAt !== null || goal.error?.code !== "GOAL_BUDGET_EXHAUSTED"
+        || !unfinished.length || unfinished.some(step => step.status !== "pending" || step.receipt !== null
+          || !step.error || !transientFailures.has(step.error.code))
+        || (goal.attempts < goal.budget.maxAttempts && !unfinished.some(step => step.attempts >= step.maxAttempts))) {
+        throw goalError("GOAL_RETRY_NOT_ALLOWED", "Only an unowned, non-expiring goal exhausted by confirmed transient failures can receive an explicit retry grant.");
+      }
+      return { ...goal, status: "ready", desiredState: "run", error: null,
+        budget: { ...goal.budget, maxAttempts: goal.budget.maxAttempts + additionalAttempts },
+        steps: goal.steps.map(step => step.status === "completed" ? step : { ...step, maxAttempts: step.maxAttempts + additionalAttempts }) };
+    });
+  }
+
   requestStop(id: string, desiredState: "paused" | "cancelled", expectedVersion: number): Goal {
     return this.change(id, `goal-${desiredState}-requested`, {}, goal => {
       this.checkVersion(goal, expectedVersion);
@@ -138,7 +160,7 @@ export class GoalStore {
     const goal = this.get(lease.goalId);
     this.checkOwner(goal, lease);
     if (goal.desiredState !== "run") throw goalError("GOAL_STOP_REQUESTED", `Goal is ${goal.desiredState}.`);
-    if (this.now() >= goal.budget.expiresAt) throw goalError("GOAL_BUDGET_EXHAUSTED", "Goal deadline exhausted.");
+    if (goal.budget.expiresAt !== null && this.now() >= goal.budget.expiresAt) throw goalError("GOAL_BUDGET_EXHAUSTED", "Goal deadline exhausted.");
     return goal;
   }
 
@@ -156,6 +178,25 @@ export class GoalStore {
       }
       return { ...goal, attempts: goal.attempts + 1, steps: goal.steps.map(item => item.id === stepId
         ? { ...item, status: "running", attempts: item.attempts + 1, baselineState: baselineState ?? null, error: null } : item) };
+    });
+  }
+
+  /** Caller holds the adapter scope and has just verified absent output and the same baseline. */
+  compensateInterruptedAttempt(lease: GoalLease, stepId: string, attempt: number, baselineState: string): Goal {
+    return this.change(lease.goalId, "step-interruption-compensated", { stepId, attempt }, goal => {
+      this.checkOwner(goal, lease);
+      this.assertRunnable(lease);
+      const step = this.requireStep(goal, stepId);
+      if (step.compensatedInterruptedAttempt === attempt) return goal;
+      if (goal.budget.expiresAt !== null || step.status !== "running" || step.receipt !== null
+        || step.attempts !== attempt || step.interruptedAttempt !== attempt
+        || step.baselineState == null || step.baselineState !== baselineState) {
+        throw goalError("GOAL_INTERRUPTION_NOT_RETRYABLE", "The interrupted attempt has no matching, safely reconciled baseline.");
+      }
+      return { ...goal, budget: { ...goal.budget, maxAttempts: goal.budget.maxAttempts + 1 },
+        steps: goal.steps.map(item => item.id !== stepId ? item : { ...item,
+          status: "pending", maxAttempts: item.maxAttempts + 1, compensatedInterruptedAttempt: attempt,
+          error: { code: "GOAL_ATTEMPT_INTERRUPTED", message: "Interrupted work settled without output on the same baseline." } }) };
     });
   }
 
@@ -188,14 +229,15 @@ export class GoalStore {
         let failure = error;
         // BEGIN IMMEDIATE can wait for another process and block JS timers.
         // Recheck after acquiring the write transaction, at the durable decision.
-        if (selected === "completed" && this.now() >= goal.budget.expiresAt) {
+        if (selected === "completed" && goal.budget.expiresAt !== null && this.now() >= goal.budget.expiresAt) {
           selected = "failed";
           failure = { code: "GOAL_BUDGET_EXHAUSTED", message: "Goal deadline exhausted before completion committed." };
         }
         if (selected === "completed" && !goal.steps.every(step => step.status === "completed")) {
           throw goalError("GOAL_ACCEPTANCE_INCOMPLETE", "Every step must be verified before completion.");
         }
-        const next = this.next(goal, { status: selected, owner: null, error: failure });
+        const next = this.next(goal, { status: selected, owner: null, error: failure,
+          steps: ["interrupted", "paused"].includes(selected) ? interruptedSteps(goal) : goal.steps });
         this.persist(next, "goal-released", { status: selected, error: failure });
         return next;
       });
@@ -207,7 +249,7 @@ export class GoalStore {
     return this.change(id, "goal-owner-recovered", {}, goal => {
       if (expectedVersion !== undefined) this.checkVersion(goal, expectedVersion);
       if (!goal.owner || this.ownerAlive(goal.owner)) return goal;
-      return { ...goal, owner: null,
+      return { ...goal, owner: null, steps: interruptedSteps(goal),
         status: goal.desiredState === "cancelled" ? "cancelled" : goal.desiredState === "paused" ? "paused" : "interrupted",
         error: { code: "GOAL_INTERRUPTED", message: "Executor exited. Reconcile persisted effects before an explicit resume." } };
     });
@@ -261,4 +303,10 @@ export class GoalStore {
     try { const result = task(); this.db.exec("COMMIT"); return result; }
     catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
+}
+
+/** Record interruption only after executor cleanup, or after a positively dead owner is recovered. */
+function interruptedSteps(goal: Goal): Goal["steps"] {
+  return goal.steps.map(step => step.status === "running" && step.attempts > 0 && step.receipt === null
+    ? { ...step, interruptedAttempt: step.attempts } : step);
 }

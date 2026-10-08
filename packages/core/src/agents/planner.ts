@@ -18,6 +18,7 @@ import {
   buildPlannerUserMessage,
   getPlannerMemoSystemPrompt,
 } from "./planner-prompts.js";
+import { contractFromContext } from "./reader-contract-context.js";
 import { ComposerAgent } from "./composer.js";
 
 export interface PlanChapterInput {
@@ -127,6 +128,7 @@ export class PlannerAgent extends BaseAgent {
   }): Promise<ChapterMemo> {
     const language = input.language ?? "zh";
 
+    const commercial = contractFromContext(input.contextPackage)?.mode === "commercial-underdog";
     const systemPrompt = getPlannerMemoSystemPrompt(language);
     const render = (contextPackage: ContextPackage) => [{ role: "system" as const, content: systemPrompt },
       { role: "user" as const, content: buildPlannerUserMessage({
@@ -150,6 +152,10 @@ export class PlannerAgent extends BaseAgent {
         label: "Submit chapter memo",
         description: "Submit the complete semantic chapter plan for host persistence.",
         parameters: ChapterMemoToolSchema,
+        validate: result => {
+          if (commercial && !result.readerDelivery) throw new Error("A commercial chapter memo requires readerDelivery: causal progress or a justified setup/aftermath, not just a goal.");
+          return result;
+        },
       },
       { temperature: 0.7, maxTokens },
     );
@@ -158,6 +164,7 @@ export class PlannerAgent extends BaseAgent {
       goal: result.goal,
       body: result.body,
       threadRefs: result.threadRefs,
+      ...(result.readerDelivery ? { readerDelivery: result.readerDelivery } : {}),
     });
   }
 
@@ -182,6 +189,7 @@ export class PlannerAgent extends BaseAgent {
       "",
       "### Body",
       memoBody,
+      ...(memo.readerDelivery ? ["", "### Reader Delivery", JSON.stringify(memo.readerDelivery)] : []),
     ].join("\n");
   }
 }

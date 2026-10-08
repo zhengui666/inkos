@@ -1,3 +1,4 @@
+import { reviewIssueCount } from "../../lib/review-status";
 import { useEffect, useState } from "react";
 import { fetchJson } from "../../hooks/use-api";
 import { useChatStore } from "../../store/chat";
@@ -35,7 +36,7 @@ export function ChaptersSection({ bookId, isZh }: ChaptersSectionProps) {
       ) : (
         <ul className="space-y-1 max-h-52 overflow-y-auto overflow-x-hidden">
           {chapters.map((ch) => {
-            const ind = ch.observations.length > 0
+            const ind = reviewIssueCount(ch.observations) > 0
               ? { symbol: "◆", color: "text-amber-500" }
               : { symbol: "●", color: "text-emerald-500" };
             return (

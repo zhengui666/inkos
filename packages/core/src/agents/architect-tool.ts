@@ -1,11 +1,14 @@
 import { Type } from "@sinclair/typebox";
+import { ReaderContractToolSchema } from "./reader-contract-tool.js";
 
 export const FoundationOutlineToolSchema = Type.Object({
+  readerContract: ReaderContractToolSchema,
   storyFrame: Type.String({ minLength: 1, description: "Concise readable foundation: premise, central conflict, motives, constraints and causal resolution. Keep detailed character cards and chapter prose for their own documents." }),
   volumeMap: Type.String({ minLength: 1, description: "Readable volume and chapter-direction Markdown covering the requested story, with brief causal beats for each chapter rather than drafted scenes." }),
 });
 
 export const BookRulesDataToolSchema = Type.Object({
+  readerContract: Type.Optional(ReaderContractToolSchema),
   protagonist: Type.Optional(Type.Object({
     name: Type.String(),
     personalityLock: Type.Array(Type.String()),

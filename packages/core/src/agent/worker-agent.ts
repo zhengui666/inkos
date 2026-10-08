@@ -14,15 +14,16 @@ import { recordExecutionEvidence } from "../harness/execution-evidence.js";
 import { decodeWorkerOutput, workerOutputSchema } from "./worker-output.js";
 import { decodeStructuredFields } from "./structured-arguments.js";
 import { preserveToolArgumentTypes, toolArgumentIssues } from "./tool-arguments.js";
+import { isUnboundedWorkerExecution } from "./worker-execution-policy.js";
 
 export interface WorkerAgentOptions {
   /** Resolve the same persisted Codex account/model settings as the parent workflow. */
   readonly projectRoot?: string;
-  /** Total worker deadline, including correction turns; overrides INKOS_WORKER_TIMEOUT_MS (default: one hour). */
+  /** Outside unbounded creation scopes: total deadline including corrections; overrides INKOS_WORKER_TIMEOUT_MS (default: one hour). */
   readonly timeoutMs?: number;
   /** @deprecated Codex controls sampling; retained for source compatibility and not sent. */
   readonly temperature?: number;
-  /** Estimated visible output/tool-argument limit enforced by InkOS before acceptance. */
+  /** Outside unbounded creation scopes: estimated visible output/tool-argument limit enforced before acceptance. */
   readonly maxTokens?: number;
   /** @deprecated Worker native web tools are disabled; use the host research capability. */
   readonly webSearch?: boolean;
@@ -121,7 +122,7 @@ async function runTextWorker(
   const agent = new Agent({
     projectRoot: options.projectRoot ?? client._codex?.projectRoot ?? process.cwd(),
     signal: options.signal,
-    maxOutputTokens: options.maxTokens ?? client.defaults?.maxTokens ?? 32_768,
+    ...(isUnboundedWorkerExecution() ? {} : { maxOutputTokens: options.maxTokens ?? client.defaults?.maxTokens ?? 32_768 }),
     ...(client._codex?.settings ? { settings: client._codex.settings } : {}),
     initialState: {
       model,
@@ -217,7 +218,7 @@ async function runStructuredWorker<TParameters extends TSchema>(
   const agent = new Agent({
     projectRoot: options.projectRoot ?? client._codex?.projectRoot ?? process.cwd(),
     signal: options.signal,
-    maxOutputTokens: options.maxTokens ?? client.defaults?.maxTokens ?? 32_768,
+    ...(isUnboundedWorkerExecution() ? {} : { maxOutputTokens: options.maxTokens ?? client.defaults?.maxTokens ?? 32_768 }),
     ...(client._codex?.settings ? { settings: client._codex.settings } : {}),
     initialState: {
       model,
@@ -288,6 +289,9 @@ async function runStructuredWorker<TParameters extends TSchema>(
 }
 
 async function withWorkerDeadline<T>(options: WorkerAgentOptions, run: (bounded: WorkerAgentOptions) => Promise<T>): Promise<T> {
+  // Creation tasks opt out of application budgets while retaining their caller's
+  // AbortSignal. Async-local policy never changes concurrently running workers.
+  if (isUnboundedWorkerExecution()) return run(options);
   // Resolve in the host, not the sanitized Codex child environment. Keep one
   // budget across correction turns rather than resetting it for every request.
   const configured = process.env.INKOS_WORKER_TIMEOUT_MS?.trim();

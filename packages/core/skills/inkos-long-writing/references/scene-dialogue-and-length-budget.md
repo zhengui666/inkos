@@ -10,7 +10,7 @@ For a new Chinese chapter with no different agreed target, plan roughly 2000–2
 
 In a confrontation, each meaningful reply changes leverage, reveals a constraint, creates a debt, or forces a choice. Before cutting an exchange that restates a known position, check whether its recurrence changes emotion, perception, relationship, voice, or rhythm. Preserve meaningful repetition; compress it only when none of these functions is served. Let subtext arise from what a character risks by speaking, withholding, or changing the subject.
 
-Use naturally varied paragraphs, generally around 20–80 characters in Chinese prose, with an occasional shorter or longer beat when useful. Avoid habitual tiny standalone fragments and long bare question-answer chains. Integrate relevant action, expression, environment and narration without assigning a gesture to every line or confusing who speaks. English follows natural paragraphing in its own syntax, without a converted Chinese paragraph quota.
+Use naturally varied paragraphs in the actual language. If the author requested a Chinese paragraph range, treat it as a preference with meaningful exceptions, not a quality score. Avoid habitual tiny standalone fragments and long bare question-answer chains. Integrate relevant action, expression, environment and narration without assigning a gesture to every line or confusing who speaks. English follows natural paragraphing in its own syntax, without a converted Chinese paragraph quota.
 
 ## Repair measured drift
 

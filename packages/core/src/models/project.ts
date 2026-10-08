@@ -110,6 +110,7 @@ export const ProjectConfigSchema = z.object({
   researchSearch: ResearchSearchConfigSchema,
   modelOverrides: z.record(z.string(), ModelOverrideValueSchema).optional(),
   daemon: z.object({
+    publisherConfig: z.string().trim().min(1).optional(),
     workIds: z.array(z.string().min(1)).optional(),
     publicationPollMs: z.number().int().min(60_000).optional(),
     market: z.object({

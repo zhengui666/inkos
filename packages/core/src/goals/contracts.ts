@@ -27,6 +27,9 @@ export const GoalStepSchema = GoalStepInputSchema.extend({
   baselineHash: z.string().nullable().optional(), baselineState: z.string().nullable().optional(),
   status: z.enum(["pending", "running", "completed", "reconciliation_required", "waiting_user", "failed"]),
   attempts: z.number().int().nonnegative(),
+  /** Durable interrupted-attempt identity; compensation never resets cumulative attempts. */
+  interruptedAttempt: z.number().int().positive().optional(),
+  compensatedInterruptedAttempt: z.number().int().positive().optional(),
   receipt: GoalReceiptSchema.nullable(), error: GoalErrorSchema.nullable(),
 });
 export type GoalStep = z.infer<typeof GoalStepSchema>;
@@ -37,7 +40,7 @@ export type GoalStatus = z.infer<typeof GoalStatusSchema>;
 export const GoalInputSchema = z.object({
   id: Id, workId: WorkResourceIdSchema, intent: z.string().min(1),
   steps: z.array(GoalStepInputSchema).min(1),
-  budget: z.object({ maxAttempts: z.number().int().min(1), expiresAt: Timestamp }).strict(),
+  budget: z.object({ maxAttempts: z.number().int().min(1), expiresAt: Timestamp.nullable() }).strict(),
 }).strict();
 export type GoalInput = z.input<typeof GoalInputSchema>;
 export const GoalSchema = GoalInputSchema.extend({

@@ -27,6 +27,7 @@ export const SourcedReviewIndexToolSchema=Type.Object({
     code:Type.String({minLength:1}),
     summary:Type.String({minLength:1,description:"Explain this finding concisely using the selected evidence and its effect on the story. The explanation and assessment must describe the same finding."}),
     assessment:SourcedReviewToolSchema.properties.observations.items.properties.assessment,
+    repairScope:Type.Optional(Type.Union([Type.Literal("local"),Type.Literal("structural"),Type.Literal("foundation"),Type.Literal("unknown")],{description:"Smallest causal repair layer. A missing premise cannot be fixed by polishing or louder insults."})),
     category:Type.Optional(Type.Union([Type.Literal("quality"),Type.Literal("execution"),Type.Literal("scope")])),
     sourceRefs:Type.Array(Type.Object({sourceId:Type.String(),startLine:Type.Integer({minimum:1}),endLine:Type.Integer({minimum:1})},{additionalProperties:false}),{description:"Select nonempty source line ranges. May be empty only for an unavailable assessment."}),
   },{additionalProperties:false})),

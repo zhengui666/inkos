@@ -1,3 +1,4 @@
+import { readerContractContext } from "./reader-contract-context.js";
 import { readFile, mkdir, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { BaseAgent, prepareWorkerInput } from "./base.js";
@@ -658,6 +659,7 @@ async function collectSelectedContext(
           excerpt: [
             `goal=${plan.memo.goal}`,
             memoBodyExcerpt,
+            ...(plan.memo.readerDelivery ? [`readerDelivery=${JSON.stringify(plan.memo.readerDelivery)}`] : []),
           ].filter(Boolean).join(" | "),
           protection: "protected" as const,
         }]
@@ -773,6 +775,7 @@ async function collectSelectedContext(
     return {
       entries: [
         ...chapterMemoEntry,
+        ...await readerContractContext(storyDir),
         ...entries.filter((entry): entry is NonNullable<typeof entry> => entry !== null),
         ...currentStateEntries,
         ...outlineEntries,

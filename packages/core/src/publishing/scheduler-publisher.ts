@@ -14,6 +14,7 @@ import { publishingError, type PublishingPackage } from './contracts.js';
 import { MegaNovelScopeSchema, type MegaNovelBrowserPort, type MegaNovelScope, type MegaNovelRun } from './meganovel-contracts.js';
 import type { MegaNovelCdpConfiguration, MegaNovelDomBinding } from './meganovel-cdp.js';
 import { createMegaNovelDomBinding, MegaNovelDomConfigurationSchema } from './meganovel-dom-binding.js';
+import { createPublisherCleanup, PublisherStartupCleanupError } from './publisher-cleanup.js';
 
 export interface SchedulerPublishingBinding {
   workId: string; targetId: string; scope: MegaNovelScope; aiAssisted: boolean;
@@ -33,11 +34,13 @@ export function createMegaNovelSchedulerPublisher(root: string, bindings: readon
     if (binding.requiredStateReplay) z.object({chapterNumber: z.number().int().positive(), planId: z.string().min(1)})
       .parse(binding.requiredStateReplay);
   }
+  const byWork = new Map(bindings.map(binding => [binding.workId, binding]));
+  if (byWork.size !== bindings.length) throw new Error('Select one publication destination per work.');
   const store = new PublishingStore(join(root, '.inkos', 'harness.sqlite'));
   const packages = new ManualPublishingAdapter(root, store), state = new StateManager(root);
-  const byWork = new Map(bindings.map(binding => [binding.workId, binding]));
-  if (byWork.size !== bindings.length) { store.close(); throw new Error('Select one publication destination per work.'); }
+  const cleanup = createPublisherCleanup(() => [bindings.map(binding => binding.browser), [store]]);
   const requireBinding = (workId: string) => {
+    if (cleanup.requested) throw publishingError('PUBLISHING_CLOSED', 'The configured publisher has closed.');
     const binding = byWork.get(workId);
     if (!binding) throw publishingError('PUBLISHING_BINDING_MISSING', `No configured publication destination for ${workId}.`);
     const target = store.getTarget(binding.targetId);
@@ -155,10 +158,7 @@ export function createMegaNovelSchedulerPublisher(root: string, bindings: readon
       if (run.phase === 'draft' && input.chapterNumber >= binding.firstNewChapter) run = await remote.submit(request, { signal: input.signal });
       return view(run);
     },
-    async close() {
-      try { await Promise.all(bindings.map(binding => binding.browser.close?.())); }
-      finally { store.close(); }
-    },
+    close: () => cleanup.close(),
   };
 }
 
@@ -205,6 +205,8 @@ export async function loadMegaNovelSchedulerPublisher(root: string, configuratio
 export async function createMegaNovelSchedulerPublisherFromConfiguration(root: string, input: unknown) {
   const configurations = z.array(MegaNovelSchedulerBindingConfigurationSchema).min(1).parse(input);
   const bindings: SchedulerPublishingBinding[] = [];
+  const unfinishedLoaders = new Set<{ close(): Promise<void> }>();
+  const cleanup = createPublisherCleanup(() => [[...bindings.map(binding => binding.browser), ...unfinishedLoaders]]);
   try {
     for (const config of configurations) {
       const { domBindingModule, dom, workId, targetId, firstNewChapter, historicalChapterIds, requiredStateReplay, aiAssisted, ...transport } = config;
@@ -218,7 +220,11 @@ export async function createMegaNovelSchedulerPublisherFromConfiguration(root: s
     }
     return createMegaNovelSchedulerPublisher(root, bindings);
   } catch (error) {
-    await Promise.all(bindings.map(binding => binding.browser.close?.()));
+    try { await cleanup.close(); }
+    catch (cleanupError) {
+      if (error instanceof PublisherStartupCleanupError) unfinishedLoaders.add(error.cleanup);
+      throw new PublisherStartupCleanupError(error, cleanupError, cleanup);
+    }
     throw error;
   }
 }

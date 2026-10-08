@@ -1,0 +1,8 @@
+{
+  "id": "intake-correction-zh-to-en",
+  "kind": "long",
+  "brief": "不要用中文写，也不是十章：请用英文写成三章，每章约900词。主角是一名丢了执照的灯塔修理工，她靠判断声响争回一次救援机会；保留爽感，但不要把她改成隐藏富豪。",
+  "provisionalLanguage": "zh",
+  "expectedPlan": {"language":"en","targetChapters":3,"chapterWordCount":900},
+  "semanticChecks": ["Keep the lighthouse-repair occupation and lost license", "Preserve the useful sound-based judgment and an active rescue choice", "Do not replace the protagonist with a hidden billionaire", "Make an English first chapter understandable and inviting", "First-chapter progress need not close the planned three-chapter story"]
+}

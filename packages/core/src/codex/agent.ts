@@ -2,6 +2,7 @@ import type { Api, AssistantMessage, ImageContent, Model, ToolCall, ToolResultMe
 import { Value } from "@sinclair/typebox/value";
 import { estimateTextTokens } from "../llm/provider.js";
 import { executionTimeoutMs } from "../agent/execution-deadline.js";
+import { isUnboundedWorkerExecution } from "../agent/worker-execution-policy.js";
 import { createCodexClient, type CodexClient } from "./client.js";
 import { readCodexSettings, type CodexSettings } from "./settings.js";
 import { CodexConfigurationError, readCodexModels, selectCodexModel } from "./account.js";
@@ -171,7 +172,8 @@ export class Agent {
         rejectDone(error);
         if (!controller.signal.aborted) controller.abort(error);
       };
-      const idleTimeoutMs = executionTimeoutMs(this.options.idleTimeoutMs, "INKOS_AGENT_IDLE_TIMEOUT_MS", 60 * 60_000);
+      const idleTimeoutMs = isUnboundedWorkerExecution() ? undefined
+        : executionTimeoutMs(this.options.idleTimeoutMs, "INKOS_AGENT_IDLE_TIMEOUT_MS", 60 * 60_000);
       let lastActivityAt = Date.now();
       let lastEvent = "turn/start";
       let failedToolCalls = 0;
@@ -320,7 +322,7 @@ export class Agent {
       cleanupAbort = () => signal.removeEventListener("abort", onAbort);
       signal.throwIfAborted();
       this.options.onModelTurn?.();
-      idleTimer = setInterval(() => {
+      if (idleTimeoutMs !== undefined) idleTimer = setInterval(() => {
         if (signal.aborted || turnFinished || activeToolWork.size > 0 || Date.now() - lastActivityAt < idleTimeoutMs) return;
         fail(Object.assign(new Error(`Codex stopped reporting progress while awaiting the model (${idleTimeoutMs}ms; last event: ${lastEvent}; failed tools: ${failedToolCalls}). Saved results are retained.`),
           { code: "AGENT_MODEL_STALLED", idleTimeoutMs, lastEvent, failedToolCalls }));

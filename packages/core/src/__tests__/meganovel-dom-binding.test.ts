@@ -102,6 +102,26 @@ function editor(chapters: Chapter[], chapter: Chapter | undefined, overflow: boo
 }
 
 browserFixtures('MegaNovel observed DOM binding in an isolated network-blocked Chromium fixture', () => {
+  it('cannot bootstrap the first chapter of an empty remote book', async () => {
+    browser = await chromium.launch({headless: true, ...(process.env.INKOS_FIXTURE_CHROMIUM ? {executablePath: process.env.INKOS_FIXTURE_CHROMIUM} : {})});
+    const context = await browser.newContext();
+    const state = await fixture(context);
+    state.chapters.splice(0);
+    const page = await context.newPage();
+    page.setDefaultTimeout(3000);
+    await page.goto(`${origin}/create_chapter/99`);
+    const binding = createMegaNovelDomBinding({uiTimeoutMs: 3000});
+    const input = {packageId: 'fixture-first', chapterNumber: 1, scope, aiAssisted: true,
+      title: 'First', content: 'Reviewed first chapter.', revisionId: 'fixture-revision'};
+    const signal = new AbortController().signal;
+    await expect(binding.probe(page, scope, signal)).rejects.toMatchObject({code: 'MEGANOVEL_EDITOR_REQUIRED'});
+    await expect(binding.createDraft(page, input, signal)).rejects.toMatchObject({code: 'MEGANOVEL_EDITOR_REQUIRED'});
+    expect(state.saveCount).toBe(0);
+    expect(state.publishCount).toBe(0);
+    expect(state.chapters).toEqual([]);
+    expect(await page.locator('input[placeholder="Chapter title"]').inputValue()).toBe('');
+  });
+
   it.each([
     ['paragraph gap', 'A new reviewed paragraph.\n\nFinal paragraph.\n'],
     ['single line break', 'First line.\nSecond line.'],

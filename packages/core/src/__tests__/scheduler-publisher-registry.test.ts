@@ -7,6 +7,8 @@ import type { SchedulerPublisher } from '../pipeline/autonomous-chapters.js';
 import type { PublishingPlatform, PublishingTarget } from '../publishing/contracts.js';
 import type { MegaNovelBrowserPort } from '../publishing/meganovel-contracts.js';
 import { PublishingStore } from '../publishing/store.js';
+import { RemoteWorkStore } from '../publishing/work-creation-store.js';
+import { createPublisherCleanup, PublisherStartupCleanupError } from '../publishing/publisher-cleanup.js';
 import { SchedulerPublisherRegistry, createDefaultSchedulerPublisherRegistry, loadSchedulerPublisher,
   type SchedulerPublisherBinding } from '../publishing/scheduler-publisher-registry.js';
 
@@ -147,16 +149,53 @@ describe('typed publisher registry with synthetic providers and real local targe
     expect(fixture.drivers[0]!.publish).not.toHaveBeenCalled();
   });
 
-  it('closes every created provider on startup failure even if one close fails', async () => {
+  it('retains failed loader cleanup and retries only unfinished providers without reopening factories or stores', async () => {
     const registry = new SchedulerPublisherRegistry(), fixture = synthetic(registry, 'alpha', 'qidian');
-    const closeA = vi.fn(async () => {throw new Error('close failed');}), closeB = vi.fn(async () => {});
+    const startupError = new Error('startup failed'), cleanupError = new Error('close failed');
+    const closeA = vi.fn().mockRejectedValueOnce(cleanupError).mockResolvedValue(undefined), closeB = vi.fn(async () => {});
+    const closeStore = vi.spyOn(PublishingStore.prototype, 'close'), closeCreations = vi.spyOn(RemoteWorkStore.prototype, 'close');
     fixture.create.mockReturnValueOnce({binding: {} as SchedulerPublisherBinding, configuration: {accountLabel: '', remoteBookId: ''},
       ready: vi.fn(), publish: vi.fn(), close: closeA}).mockReturnValueOnce({binding: {} as SchedulerPublisherBinding,
       configuration: {accountLabel: '', remoteBookId: ''}, ready: vi.fn(), publish: vi.fn(), close: closeB})
-      .mockImplementationOnce(() => {throw new Error('startup failed');});
-    await expect(registry.create(root, configuration(['a', 'b', 'c'].map(id => binding('alpha', target(`work-${id}`, 'qidian'))))))
-      .rejects.toThrow('Publisher startup and cleanup failed');
+      .mockImplementationOnce(() => { throw startupError; });
+    const path = join(root, 'failed-publish.json');
+    await writeFile(path, JSON.stringify(configuration(['a', 'b', 'c'].map(id => binding('alpha', target(`work-${id}`, 'qidian'))))));
+    const failure = await loadSchedulerPublisher(root, path, registry).catch(error => error) as PublisherStartupCleanupError;
+    expect(failure).toBeInstanceOf(PublisherStartupCleanupError);
+    expect(failure.errors[0]).toBe(startupError);
+    expect(failure.errors[1].errors).toEqual([cleanupError]);
     expect(closeA).toHaveBeenCalledOnce(); expect(closeB).toHaveBeenCalledOnce();
+    // RemoteWorkStore initializes publishing tables through a separate short-lived store.
+    expect(closeStore).toHaveBeenCalledTimes(2);
+    expect(new Set(closeStore.mock.contexts).size).toBe(2);
+    const closedStores = [...closeStore.mock.contexts];
+    const retry = failure.cleanup.close();
+    expect(failure.cleanup.close()).toBe(retry);
+    await retry; await failure.cleanup.close();
+    expect(closeA).toHaveBeenCalledTimes(2); expect(closeB).toHaveBeenCalledOnce();
+    expect(closeStore.mock.contexts).toEqual(closedStores); expect(closeCreations).toHaveBeenCalledOnce();
+    expect(fixture.create).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([false, true])('preserves nested loader cleanup without automatically retrying it (outer failure=%s)', async outerFails => {
+    const registry = new SchedulerPublisherRegistry(), fixture = synthetic(registry, 'alpha', 'qidian');
+    const nestedClose = vi.fn().mockRejectedValueOnce(new Error('nested close failed')).mockResolvedValue(undefined);
+    const nestedCleanup = createPublisherCleanup(() => [[{ close: nestedClose }]]);
+    const nestedCleanupError = await nestedCleanup.close().catch(error => error);
+    const nestedFailure = new PublisherStartupCleanupError(new Error('nested startup failed'), nestedCleanupError, nestedCleanup);
+    const outerClose = vi.fn(async () => {});
+    if (outerFails) outerClose.mockRejectedValueOnce(new Error('outer close failed'));
+    fixture.create.mockReturnValueOnce({ binding: {} as SchedulerPublisherBinding, configuration: { accountLabel: '', remoteBookId: '' },
+      ready: vi.fn(), publish: vi.fn(), close: outerClose }).mockImplementationOnce(() => { throw nestedFailure; });
+    const failure = await registry.create(root, configuration(['a', 'b'].map(id => binding('alpha', target(`work-${id}`, 'qidian')))))
+      .catch(error => error) as PublisherStartupCleanupError;
+    expect(failure).toBeInstanceOf(PublisherStartupCleanupError);
+    if (!outerFails) expect(failure).toBe(nestedFailure);
+    expect(nestedClose).toHaveBeenCalledOnce(); expect(outerClose).toHaveBeenCalledOnce();
+    await failure.cleanup.close(); await failure.cleanup.close();
+    expect(nestedClose).toHaveBeenCalledTimes(2);
+    expect(outerClose).toHaveBeenCalledTimes(outerFails ? 2 : 1);
+    expect(fixture.create).toHaveBeenCalledTimes(2);
   });
 
   it('deduplicates shared publisher cleanup and closes only once', async () => {

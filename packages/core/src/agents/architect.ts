@@ -1,3 +1,4 @@
+import type { ReaderContract } from "../models/reader-contract.js";
 import { BaseAgent } from "./base.js";
 import type { BookConfig, FanficMode } from "../models/book.js";
 import { join } from "node:path";
@@ -43,6 +44,7 @@ export class ArchitectAgent extends BaseAgent {
         storyFrame: string;
         volumeMap: string;
         bookRules: string;
+        readerContract?: ReaderContract;
         roles: string;
         userFeedback: string;
       };
@@ -82,6 +84,7 @@ export class ArchitectAgent extends BaseAgent {
     storyFrame: string;
     volumeMap: string;
     bookRules: string;
+    readerContract?: ReaderContract;
     roles: string;
     userFeedback: string;
   }): string {
@@ -96,6 +99,9 @@ ${reviseFrom.volumeMap}
 
 【book_rules 全文】
 ${reviseFrom.bookRules}
+
+【既有 readerContract：保留未被最新用户要求改变的承诺，不把计划当已发生事实】
+${JSON.stringify(reviseFrom.readerContract ?? null)}
 
 【roles 全文】
 ${reviseFrom.roles}
@@ -286,8 +292,8 @@ ${reviseFrom.userFeedback || "（无）"}
       volumeMap: outline.volumeMap.trim(),
     });
     const detailsPrompt = input.language === "en"
-      ? `${input.userMessage}\n\n<story_frame>\n${outline.storyFrame}\n</story_frame>\n\n<volume_map>\n${outline.volumeMap}\n</volume_map>\n\nComplete the readable book rules, structured rule data, and initial unresolved hooks.`
-      : `${input.userMessage}\n\n<story_frame>\n${outline.storyFrame}\n</story_frame>\n\n<volume_map>\n${outline.volumeMap}\n</volume_map>\n\n继续完成可读本书规则、结构化规则数据和初始未解伏笔。`;
+      ? `${input.userMessage}\n\n<story_frame>\n${outline.storyFrame}\n</story_frame>\n\n<volume_map>\n${outline.volumeMap}\n</volume_map>\n\n<reader_contract>\n${JSON.stringify(outline.readerContract)}\n</reader_contract>\n\nComplete the readable book rules, structured rule data, and initial unresolved hooks.`
+      : `${input.userMessage}\n\n<story_frame>\n${outline.storyFrame}\n</story_frame>\n\n<volume_map>\n${outline.volumeMap}\n</volume_map>\n\n<reader_contract>\n${JSON.stringify(outline.readerContract)}\n</reader_contract>\n\n继续完成可读本书规则、结构化规则数据和初始未解伏笔。`;
     const { result: details } = await this.submitStructured(
       [
         { role: "system", content: input.systemPrompt },
@@ -303,7 +309,7 @@ ${reviseFrom.userFeedback || "（无）"}
       },
       { temperature: input.temperature },
     );
-    const bookRulesData = BookRulesSchema.parse({ version: "2", ...details.bookRulesData });
+    const bookRulesData = BookRulesSchema.parse({ version: "2", ...details.bookRulesData, readerContract: outline.readerContract });
     const initialHooks: HookRecord[] = details.pendingHooks.map((hook) => ({
       hookId: hook.hookId.trim(),
       startChapter: 0,
@@ -315,7 +321,7 @@ ${reviseFrom.userFeedback || "（无）"}
     }));
     const pendingHooks = renderHooksProjection({ hooks: initialHooks }, input.language);
 
-    const castContext=`${input.userMessage}\n\n${outline.storyFrame}\n\n${outline.volumeMap}\n\n${details.bookRules}`;
+    const castContext=`${input.userMessage}\n\n${outline.storyFrame}\n\n${outline.volumeMap}\n\n${details.bookRules}\n\nReader contract: ${JSON.stringify(outline.readerContract)}`;
     const {result:cast} = await this.submitStructured([
       {role:"system",content:input.language==="en"
         ? "List the named people who shape the opening conflict. Submit only their names and major/minor roles. Do not expand unnamed occupational groups into invented biographies."

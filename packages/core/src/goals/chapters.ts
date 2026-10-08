@@ -23,7 +23,7 @@ const unknown = (code: string, message: string): GoalReconciliation => ({ status
 export function chapterGoalInput(input: {
   readonly id: string; readonly workId: string; readonly intent: string;
   readonly startChapter: number; readonly endChapter: number; readonly wordCount?: number;
-  readonly expiresAt: number; readonly maxAttemptsPerChapter?: number;
+  readonly expiresAt: number | null; readonly maxAttemptsPerChapter?: number;
 }): GoalInput {
   const start = z.number().int().positive().parse(input.startChapter);
   const end = z.number().int().min(start).parse(input.endChapter);

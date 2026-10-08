@@ -27,6 +27,8 @@ import {createBookFoundationTool} from '../harness/tools/longform-production.js'
 import {WriterAgent} from '../agents/writer.js';
 import {ContinuityAuditor} from '../agents/continuity.js';
 
+const fixtureReaderContract = {mode:'author-directed',familiarPromise:'A quiet evidentiary mystery',distinctiveHook:'A receipt preserves a disputed signature',readingPleasure:'Understanding the handover',openingQuestion:'Who signed?',proseApproach:'Plain English',authorDirection:'The fixture explicitly requests a quiet receipt mystery'};
+
 const fetchWithProxyMock = vi.hoisted(() => vi.fn());
 const codexClientMock = vi.hoisted(() => vi.fn());
 vi.mock("../codex/client.js", () => ({ createCodexClient: codexClientMock }));
@@ -78,7 +80,7 @@ describe("guardedPiNonStreaming", () => {
       fetchWithProxyMock.mockImplementation(async(_url:string,init:RequestInit)=>{
         const body=JSON.parse(String(init.body)),worker=body.tools?.[0]?.function?.name;
         let name:string,args:unknown;
-        if(worker==='submit_foundation_outline'){name=worker;args={storyFrame:'One receipt, one unresolved signature.',volumeMap:'Two chapters: arrival and return.'};}
+        if(worker==='submit_foundation_outline'){name=worker;args={storyFrame:'One receipt, one unresolved signature.',volumeMap:'Two chapters: arrival and return.',readerContract:fixtureReaderContract};}
         else if(worker==='submit_foundation_details'){name=worker;args={bookRules:'Receipts are physical objects.',bookRulesData:{prohibitions:[],enableFullCastTracking:false,allowedDeviations:[]},pendingHooks:[]};}
         else if(worker==='submit_foundation_cast_index'){name=worker;args={roles:[{tier:'major',name:'Mara'}]};}
         else if(worker==='submit_foundation_cast_documents'){name=worker;args={role_1_content:'Mara returns a borrowed receipt.'};}
@@ -353,7 +355,7 @@ describe("guardedPiNonStreaming", () => {
     const called:string[]=[];
     fetchWithProxyMock.mockImplementation(async(_url:string,init:RequestInit)=>{
       const body=JSON.parse(String(init.body)),name=body.tools[0].function.name;called.push(name);
-      const args=name==='submit_foundation_outline'?{storyFrame:'Evidence conflict',volumeMap:'One resolved chapter'}:
+      const args=name==='submit_foundation_outline'?{storyFrame:'Evidence conflict',volumeMap:'One resolved chapter',readerContract:fixtureReaderContract}:
         name==='submit_foundation_details'?{bookRules:'Keep the receipt',bookRulesData:{prohibitions:[],enableFullCastTracking:false,allowedDeviations:[]},pendingHooks:[]}:
         name==='submit_foundation_cast_index'?{roles:[{tier:'major',name:'Mara'},{tier:'minor',name:'Witness'}]}:
         {role_1_content:card,role_2_content:'Knows who signed the receipt.'};

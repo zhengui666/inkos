@@ -1,3 +1,4 @@
+import { registerCreationTaskRoutes } from './creation-tasks.js';
 import { Hono } from "hono";
 import { StudioDaemonController } from "./daemon-controller.js";
 import { cors } from "hono/cors";
@@ -17,6 +18,7 @@ import {
   recoverAtomicFileSets,
   commitAtomicFileSet,
   PipelineRunner,
+  loadSchedulerPublisher,
   createLLMClient,
   createLogger,
   computeAnalytics,
@@ -149,6 +151,7 @@ import {
   defaultNodeImageDeps,
   type NodeImageDeps,
   type PipelineConfig,
+  type SchedulerConfig,
   type PlayMode,
   type ProjectConfig,
   type LogSink,
@@ -4259,28 +4262,67 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 
   // --- Daemon control ---
 
-  const daemon = new StudioDaemonController(async () => {
+  let creationTasksOnly = false;
+  let daemonStopRevision = 0;
+  let creationStarting: Promise<void> | undefined;
+  const loadDaemonConfig = async (creationOnly: boolean): Promise<SchedulerConfig> => {
     const currentConfig = await loadCurrentProjectConfig();
     return {
       ...(await buildPipelineConfig({ currentConfig })),
       ...currentConfig.daemon,
+      creationTasksOnly: creationOnly,
+      publisher: currentConfig.daemon.publisherConfig ? await loadSchedulerPublisher(root, resolve(root, currentConfig.daemon.publisherConfig)) : undefined,
       radarCron: currentConfig.daemon.schedule.radarCron,
       writeCron: currentConfig.daemon.schedule.writeCron,
       onChapterComplete: (bookId, chapter) => broadcast("daemon:chapter", { bookId, chapter }),
       onError: (bookId, error) => broadcast("daemon:error", { bookId, error: error.message }),
     };
-  }, broadcast);
+  };
+  const daemon = new StudioDaemonController(() => loadDaemonConfig(false), broadcast);
+  const startDaemon = async (creationOnly: boolean) => {
+    // This request owns its mode, including a deferred stale-runner restart.
+    await daemon.start(() => loadDaemonConfig(creationOnly));
+    // Only a successful start commits the running mode used for safe reloads.
+    creationTasksOnly = creationOnly;
+  };
+  const creationTasks = registerCreationTaskRoutes(app, { root, loadConfig: loadCurrentProjectConfig,
+    status: () => ({ ...daemon.status(), creationTasksOnly }),
+    start: (refreshPublisher) => {
+      // Repeated Resume/start requests share the complete drain/load/start outcome.
+      if (creationStarting) return creationStarting;
+      const revision = daemonStopRevision;
+      const starting = (async () => {
+        const current = daemon.status();
+        if (refreshPublisher && current.running && current.phase === 'running') {
+          if (!creationTasksOnly) throw new Error('Reload the publication configuration in the active general daemon before resuming this task.');
+          await daemon.stop();
+        }
+        // A later explicit stop must cancel a reload waiting on the old runtime.
+        if (studioClosing || revision !== daemonStopRevision) {
+          throw Object.assign(new Error('Daemon start was cancelled.'), { code: 'DAEMON_START_CANCELLED' });
+        }
+        const next = daemon.status();
+        if (next.running && next.phase === 'running') return;
+        await startDaemon(true);
+      })().finally(() => { if (creationStarting === starting) creationStarting = undefined; });
+      creationStarting = starting;
+      return starting;
+    },
+  });
+  // Resume only durable explicitly created tasks; this does not start library books.
+  setImmediate(() => { if (!studioClosing) void creationTasks.recover().catch(error => broadcast('daemon:error', { error: String(error) })); });
   studioShutdowns.set(app, async () => {
     studioClosing = true;
+    daemonStopRevision++;
     try { await daemon.shutdown(); }
-    finally { await Promise.all([...closeEventStreams].map(close => close())); }
+    finally { creationTasks.close(); await Promise.all([...closeEventStreams].map(close => close())); }
   });
 
   app.get("/api/v1/daemon", (c) => c.json(daemon.status()));
 
   app.post("/api/v1/daemon/start", async (c) => {
     try {
-      await daemon.start();
+      await startDaemon(false);
       return c.json({ ok: true, ...daemon.status() });
     } catch (error) {
       const code = (error as { code?: string }).code;
@@ -4291,6 +4333,8 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 
   app.post("/api/v1/daemon/stop", async (c) => {
     try {
+      daemonStopRevision++;
+      creationTasks.pauseAll();
       await daemon.stop();
       return c.json({ ok: true, ...daemon.status() });
     } catch (error) {

@@ -3,6 +3,7 @@ import { chromium, type Browser, type Page } from 'playwright-core';
 import { z } from 'zod';
 import { publishingError } from './contracts.js';
 import { acquireMegaNovelCdpLock } from './meganovel-cdp-lock.js';
+import { createPublisherCleanup, PublisherStartupCleanupError } from './publisher-cleanup.js';
 import { MegaNovelProbeSchema, MegaNovelScopeSchema, MegaNovelSnapshotRequestSchema, type MegaNovelBrowserPort,
   type MegaNovelProbe, type MegaNovelScope, type MegaNovelBrowserOptions, type MegaNovelSnapshotRequest, type MegaNovelSnapshot } from './meganovel-contracts.js';
 
@@ -68,6 +69,11 @@ export async function connectMegaNovelCdpPort(configuration: MegaNovelCdpConfigu
   if (!/^[A-Za-z0-9-]+$/u.test(config.scope.sessionId)) throw publishingError('MEGANOVEL_CDP_CONFIG', 'Use the actual CDP target ID.');
   const reservation = acquireMegaNovelCdpLock(config.lockDirectory, config.scope.sessionId);
   let browser: Browser | undefined;
+  const startupResource = { close: async () => {
+    if (browser?.isConnected()) await disconnectAndRelease(browser, reservation);
+    else reservation.release();
+  } };
+  const cleanup = createPublisherCleanup(() => [[startupResource]]);
   try {
     browser = await chromium.connectOverCDP(endpointURL, {timeout: config.timeoutMs, noDefaults: true});
     const page = await findTargetBeforeDeadline(browser, config.scope.sessionId, config.operationTimeoutMs);
@@ -80,10 +86,9 @@ export async function connectMegaNovelCdpPort(configuration: MegaNovelCdpConfigu
   } catch (error) {
     // Playwright disconnects a connectOverCDP client; it does not terminate the pre-existing Chrome.
     try {
-      if (browser) await disconnectAndRelease(browser, reservation);
-      else reservation.release();
+      await cleanup.close();
     } catch (cleanupError) {
-      throw new AggregateError([error, cleanupError], 'CDP startup failed; browser cleanup also failed.');
+      throw new PublisherStartupCleanupError(error, cleanupError, cleanup, 'CDP startup failed; browser cleanup also failed.');
     }
     throw error;
   }

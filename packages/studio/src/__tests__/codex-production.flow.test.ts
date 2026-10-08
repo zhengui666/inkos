@@ -23,7 +23,17 @@ beforeEach(() => {
     entries: [{ title: "Fixture ranking", author: "Fixture author", category: "fantasy", extra: "Synthetic rank 1", rank: 1 }],
   }));
 });
-const radar = { recommendations: [{ platform: "qidian", language: "zh", evidenceIds: ["S2E1"], genre: "fantasy", concept: "A clockmaker's city", reasoning: "Based on Fixture ranking", benchmarkTitles: ["Fixture ranking"] }], marketSummary: "Evidence-backed fixture market" };
+const readerContract = {
+  mode: "commercial-underdog", familiarPromise: "An overlooked clockmaker earns bargaining power through skill",
+  distinctiveHook: "Broken clocks reveal faults in the city's time network", readingPleasure: "Earned practical gains and recognition",
+  openingQuestion: "Can the apprentice save the workshop before its debt comes due?", proseApproach: "Clear Chinese scenes and concrete dialogue",
+  riseRoute: { startingDisadvantage: "An indebted apprentice has no workshop access", desiredChange: "Keep the workshop open",
+    opportunity: "A damaged clock reveals a repairable network fault", opportunityLimits: "Reading the fault consumes scarce repair parts",
+    opposition: { force: "The workshop creditor", interest: "Seize the workshop", leverage: "Controls its tools and deadline" },
+    protagonistContribution: "The apprentice tests the fault and negotiates using the proof", firstPayoff: "A paid repair secures one week's access",
+    payoffMeaning: "The apprentice can work and bargain from evidence", escalation: "The repair reveals who profits from the faulty network" },
+};
+const radar = { recommendations: [{ platform: "qidian", language: "zh", evidenceIds: ["S2E1"], genre: "fantasy", concept: "A clockmaker's city", readerContract, reasoning: "Based on Fixture ranking", benchmarkTitles: ["Fixture ranking"] }], marketSummary: "Evidence-backed fixture market" };
 const post = (body: unknown = {}) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 async function project(legacy = false) {
   const root = await mkdtemp(join(tmpdir(), "inkos-codex-production-")); roots.push(root);

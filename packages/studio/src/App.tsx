@@ -1,3 +1,4 @@
+import { CreationTaskBoard } from "./pages/CreationTaskBoard";
 import { useState, useEffect, lazy, Suspense } from "react";
 import { useHashRoute } from "./hooks/use-hash-route";
 import type { HashRoute } from "./hooks/use-hash-route";
@@ -230,6 +231,7 @@ export function App() {
         <main className="flex-1 relative overflow-y-auto scroll-smooth">
           {route.page === "dashboard" && (
             <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
+              <CreationTaskBoard onOpenWork={nav.toBook} />
               <Dashboard nav={nav} sse={sse} theme={theme} t={t} />
             </div>
           )}
