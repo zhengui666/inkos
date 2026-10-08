@@ -47,6 +47,16 @@ export class CreationTaskCoordinator {
           }
         }
       },
+      ...(configured?.reconcile ? { reconcile: async (input: Parameters<NonNullable<SchedulerPublisher['reconcile']>>[0]) => {
+        try { return await configured.reconcile!(input); }
+        catch (error) {
+          // An uncreated remote work cannot have a chapter attempt. Do not create it here.
+          if ((error as {code?: string}).code === 'PUBLISHING_BINDING_MISSING') return undefined;
+          if ((error as {code?: string}).code?.startsWith('REMOTE_WORK_')) throw creationError('CREATION_PUBLISHER_REQUIRED',
+            `${(error as {code: string}).code}: ${(error as Error).message}`);
+          throw error;
+        }
+      } } : {}),
       publish: async input => {
         input.signal.throwIfAborted();
         if (!this.runnable(input.workId)) throw creationError('CREATION_PAUSED', 'The creation task is paused or blocked.');
@@ -61,7 +71,7 @@ export class CreationTaskCoordinator {
               'This retained task has no public-facing book metadata or platform for automatic new-book creation. Configure an existing remote binding; the raw author brief will not be published as a blurb.');
             await configured.ensureWork({workId: input.workId, platform: task.plan.platform, signal: input.signal,
               metadata: {title: task.plan.title, blurb: task.plan.blurb, genre: task.plan.genre, language: task.plan.language, aiAssisted: true},
-              beforeMutation: () => { if (!this.runnable(input.workId)) throw creationError('CREATION_PAUSED', 'Creation was paused before remote mutation.'); } });
+              beforeMutation: async () => { await input.beforeMutation?.(); if (!this.runnable(input.workId)) throw creationError('CREATION_PAUSED', 'Creation was paused before remote mutation.'); } });
             input.signal.throwIfAborted();
             if (!this.runnable(input.workId)) throw creationError('CREATION_PAUSED', 'Creation was paused before chapter publication.');
             await configured.ready(input.workId, input.signal, input.chapterNumber);

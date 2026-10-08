@@ -210,6 +210,20 @@ export class SchedulerPublisherRegistry {
         signal.throwIfAborted();
         await requirePublisher(workId).ready(workId, signal, continuingChapter);
       },
+      async reconcile(input) {
+        input.signal.throwIfAborted();
+        // A restart may have an existing remote-book attempt but no chapter
+        // binding yet. Recover that original outcome before reading edited prose.
+        const creation = !byWork.has(input.workId) ? creations.forWork(input.workId) : undefined;
+        if (creation && creation.attempts > 0) {
+          await ensureWork({ workId: input.workId, platform: creation.input.destination.platform,
+            metadata: creation.input.metadata, signal: input.signal,
+            beforeMutation: () => { throw publishingError('REMOTE_WORK_RECONCILIATION_REQUIRED', 'Read-only recovery cannot create another remote work.'); } });
+        }
+        const publisher = requirePublisher(input.workId);
+        if (!publisher.reconcile) return { status: 'unsupported' }; 
+        return publisher.reconcile(input);
+      },
       async publish(input) {
         input.signal.throwIfAborted();
         return requirePublisher(input.workId).publish(input);

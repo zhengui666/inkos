@@ -1,3 +1,5 @@
+import { readChapterReviewInputs, type ChapterReviewInputs } from "./review-inputs.js";
+import { captureDraftSources, sameDraftPlanningSources, assertPreparedDraftInputs, saveUnsettledDraft, loadUnsettledDraft, assertDraftSourcesCurrent, clearUnsettledDraft } from "./unsettled-draft.js";
 import { prepareStateReplay, commitStateReplay } from "../state/state-replay.js";
 import { withWorkMutationScope } from "../utils/work-mutation-scope.js";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -58,7 +60,7 @@ import { WorkManifestSchema, type WorkManifest } from "../harness/contracts.js";
 import { syncWorkSourceArtifacts, captureWorkSourceState, changedWorkSourcePaths } from "../harness/source-sync.js";
 import { reviewChapterDraft } from "./chapter-review.js";
 import { validateChapterTruthPersistence } from "./chapter-truth-validation.js";
-import { loadPersistedPlan, relativeToBookDir, savePersistedPlan } from "./persisted-governed-plan.js";
+import { loadPersistedPlan, parsePersistedPlan, relativeToBookDir, savePersistedPlan } from "./persisted-governed-plan.js";
 import { selectBookReferenceContext } from "../references/reference-context.js";
 import type { ActivatedSkillGuidance } from "../agent/skill-tool.js";
 import { loadAvailableAgentSkills, mergeActivatedSkillGuidance } from "../skills/index.js";
@@ -836,7 +838,7 @@ export class PipelineRunner {
   }
 
   /** Review the existing chapter and save observations without replanning its story. */
-  async reviewChapter(bookId: string, chapterNumber?: number, options?: { readonly requireStoryClosure?: boolean }): Promise<AuditResult & { readonly chapterNumber: number; readonly delivery?: ReturnType<typeof chapterLengthDelivery> }> {
+  async reviewChapter(bookId: string, chapterNumber?: number, options?: { readonly requireStoryClosure?: boolean }): Promise<AuditResult & { readonly chapterNumber: number; readonly reviewInputs: ChapterReviewInputs; readonly delivery?: ReturnType<typeof chapterLengthDelivery> }> {
     const book = await this.state.loadBookConfig(bookId);
     const bookDir = this.state.bookDir(bookId);
     const targetChapter = chapterNumber ?? (await this.state.getNextChapterNumber(bookId)) - 1;
@@ -845,9 +847,10 @@ export class PipelineRunner {
     }
 
     const content = await this.readChapterContent(bookDir, targetChapter);
-    const chapterBrief = await readChapterUserBrief(bookDir, targetChapter);
+    const reviewInputs = await readChapterReviewInputs(bookDir, targetChapter);
+    const chapterBrief = reviewInputs.authorBrief?.trim() ?? "";
     const governed = await this.prepareExistingChapterContext(book,targetChapter,
-      chapterBrief ?? (book.language==='en'?`Review existing chapter ${targetChapter}.`:`审查现有第${targetChapter}章。`));
+      chapterBrief, reviewInputs);
     if (options?.requireStoryClosure) governed.contextPackage.selectedContext.push({
       source: STORY_CLOSURE_SOURCE, protection: "protected",
       reason: "The authorized creation task requests story completion here, independently of chapter count.",
@@ -891,7 +894,7 @@ export class PipelineRunner {
     await syncWorkSourceArtifacts({ projectRoot: this.config.projectRoot, workId: bookId, accept: true, acceptPaths: ["source/chapters/index.json"] });
     const spec=buildLengthSpec(book.chapterWordCount,book.language,book);
     const delivery=chapterLengthDelivery(countChapterLength(content,spec.countingMode),spec);
-    return { ...result, chapterNumber: targetChapter,...(delivery?{delivery}:{}) };
+    return { ...result, chapterNumber: targetChapter, reviewInputs,...(delivery?{delivery}:{}) };
   }
 
   /** Revise the latest (or specified) chapter from user direction and review observations. */
@@ -1360,6 +1363,10 @@ export class PipelineRunner {
     // failure in this batch must not hide already completed chapters from Work readers.
     await syncWorkSourceArtifacts({projectRoot:this.config.projectRoot,workId:bookId,accept:true,
       acceptPaths:await changedWorkSourcePaths(this.config.projectRoot,bookId,sourceBefore)});
+    // Cleanup must never strand an accepted chapter before its Work revision is
+    // visible. A retained orphan is harmless: the chapter index owns progress.
+    try { await clearUnsettledDraft(this.config.projectRoot, bookId, chapterNumber); }
+    catch (error) { this.config.logger?.warn(`Chapter ${chapterNumber} was accepted; its recovery draft could not be retired: ${String(error)}`); }
     return result;
   }
 
@@ -1375,36 +1382,40 @@ export class PipelineRunner {
     const bookDir = this.state.bookDir(bookId);
     const chapterNumber = await this.state.getNextChapterNumber(bookId);
     const stageLanguage = await this.resolveBookLanguage(book);
+    const pipelineLang = book.language;
+    const lengthSpec = buildLengthSpec(wordCount ?? book.chapterWordCount, pipelineLang, book);
+    const writerContext = this.agentCtxFor("writer", bookId);
+    const request = { book, bookDir, chapterNumber, externalContext, lengthSpec, temperatureOverride, activatedSkills: writerContext.activatedSkills };
+    let checkpoint = await loadUnsettledDraft(this.config.projectRoot, request);
+    this.throwIfOperationAborted();
     this.logStage(stageLanguage, { zh: "准备章节输入", en: "preparing chapter inputs" });
-    const writeInput = await this.prepareWriteInput(
-      book,
-      bookDir,
-      chapterNumber,
-      externalContext,
-    );
+    const planningSources = checkpoint?.sources ?? await captureDraftSources(this.config.projectRoot, bookDir, bookId, chapterNumber, writerContext.activatedSkills);
+    const writeInput = checkpoint?.input ?? await this.prepareWriteInput(book, bookDir, chapterNumber, externalContext);
     const reducedControlInput = {
       chapterIntent: writeInput.chapterIntent,
       chapterMemo: writeInput.chapterMemo,
       chapterIntentData: writeInput.chapterIntentData,
       contextPackage: writeInput.contextPackage,
     };
-    const pipelineLang = book.language;
-    const lengthSpec = buildLengthSpec(
-      wordCount ?? book.chapterWordCount,
-      pipelineLang,
-      book,
-    );
+    const draftSources = checkpoint?.sources ?? await captureDraftSources(this.config.projectRoot, bookDir, bookId, chapterNumber, writerContext.activatedSkills);
+    if (!sameDraftPlanningSources(planningSources, draftSources)) {
+      throw Object.assign(new Error("Chapter source inputs changed during preparation; retry with current inputs."), { code: "CHAPTER_DRAFT_INPUTS_CHANGED" });
+    }
+    const writerInput: WriteChapterInput = { ...writeInput, ...request };
+    await assertPreparedDraftInputs(writerInput);
     // 1. Write chapter
-    const writer = new WriterAgent(this.agentCtxFor("writer", bookId));
-    this.logStage(stageLanguage, { zh: "撰写章节草稿", en: "writing chapter draft" });
+    const writer = new WriterAgent(writerContext);
+    this.logStage(stageLanguage, checkpoint
+      ? { zh: "恢复已生成草稿，继续结算与审查", en: "resuming generated draft for settlement and review" }
+      : { zh: "撰写章节草稿", en: "writing chapter draft" });
     const output = await writer.writeChapter({
-      book,
-      bookDir,
-      chapterNumber,
-      ...writeInput,
-      lengthSpec,
-      ...(wordCount ? { wordCountOverride: wordCount } : {}),
-      ...(temperatureOverride ? { temperatureOverride } : {}),
+      ...writerInput,
+      ...(checkpoint ? { resumeDraft: { ...checkpoint.draft, tokenUsage: checkpoint.tokenUsage } } : {}),
+      onDraftGenerated: async draft => {
+        checkpoint = await saveUnsettledDraft(this.config.projectRoot, writerInput, draftSources, draft);
+        this.throwIfOperationAborted();
+        await assertDraftSourcesCurrent(this.config.projectRoot, writerInput, checkpoint, writerContext.activatedSkills);
+      },
     });
     this.throwIfOperationAborted();
     const writerCount = countChapterLength(output.content, lengthSpec.countingMode);
@@ -1501,6 +1512,9 @@ export class PipelineRunner {
       };
     }
 
+    this.throwIfOperationAborted();
+    if (checkpoint) await assertDraftSourcesCurrent(this.config.projectRoot, writerInput, checkpoint, writerContext.activatedSkills);
+    this.throwIfOperationAborted();
     await persistChapterArtifacts({
       chapterNumber,
       chapterTitle: persistenceOutput.title,
@@ -1542,7 +1556,7 @@ export class PipelineRunner {
       lengthTelemetry,
       ...(chapterLengthDelivery(finalWordCount,lengthSpec)?{delivery:chapterLengthDelivery(finalWordCount,lengthSpec)}:{}),
       tokenUsage: totalUsage,
-      ...(writeInput.contextTrace ? { contextTrace: writeInput.contextTrace } : {}),
+      ...("contextTrace" in writeInput && writeInput.contextTrace ? { contextTrace: writeInput.contextTrace } : {}),
     };
   }
 
@@ -2188,14 +2202,24 @@ export class PipelineRunner {
     });
   }
 
-  private async prepareExistingChapterContext(book:BookConfig,chapterNumber:number,chapterIntent:string) {
+  private async prepareExistingChapterContext(book:BookConfig,chapterNumber:number,chapterIntent:string, reviewInputs?: ChapterReviewInputs) {
+    const originalPlan = reviewInputs ? (reviewInputs.plan === null ? null : parsePersistedPlan(reviewInputs.plan, chapterNumber))
+      : await loadPersistedPlan(this.state.bookDir(book.id), chapterNumber);
     const contextPackage=await new ComposerAgent(this.agentCtxFor('composer',book.id)).selectTaskContext({
       bookDir:this.state.bookDir(book.id),chapterNumber,goal:chapterIntent,language:book.language,
+      chapterMemo: originalPlan?.memo,
     });
-    const rules=await readFile(join(this.state.bookDir(book.id),'story/book_rules.md'),'utf8');
-    const originalPlan = await loadPersistedPlan(this.state.bookDir(book.id), chapterNumber);
+    if (reviewInputs && reviewInputs.bookRules === null) throw new Error('Book rules are missing; review cannot proceed without its authority.');
+    const rules = reviewInputs ? reviewInputs.bookRules! : await readFile(join(this.state.bookDir(book.id),'story/book_rules.md'),'utf8');
     const delivery = originalPlan?.memo.readerDelivery;
-    return {chapterIntent,contextPackage:{...contextPackage,selectedContext:[...contextPackage.selectedContext,
+    return {chapterIntent,contextPackage:{...contextPackage,selectedContext:[
+      ...contextPackage.selectedContext.filter(entry => entry.source !== 'runtime/chapter_memo'),
+      {source:'runtime/current_chapter_task',reason:'Current review/revision task; explicit later author direction supersedes generated plans.',
+        excerpt:chapterIntent,protection:'protected' as const},
+      ...(originalPlan ? [{source:'runtime/chapter_memo',
+        reason:'Original persisted chapter memo, not a newly generated review task. Later author instructions supersede this plan.',
+        excerpt:[`goal=${originalPlan.memo.goal}`,originalPlan.memo.body,
+          ...(delivery ? [`readerDelivery=${JSON.stringify(delivery)}`] : [])].join('\n'),protection:'protected' as const}] : []),
       {source:'story/book_rules.md',reason:'Author constraints for the existing chapter.',excerpt:rules,protection:'protected' as const},
       ...(delivery ? [{source:'runtime/original_reader_delivery',
         reason:'Original planned chapter delivery for comparison, not proof of success. Later author instructions supersede this plan.',

@@ -41,6 +41,16 @@ describe("state projections", () => {
     ].join("\n"));
   });
 
+  it.each(["en", "zh"] as const)("renders authored dependency IDs and arc context in %s without changing legacy rows", language => {
+    const hook = { hookId: "ledger", startChapter: 1, type: "mystery", status: "open" as const,
+      lastAdvancedChapter: 1, expectedPayoff: "Trace the ledger", notes: "Canonical record",
+      dependsOn: ["witness", "permit|seal"], paysOffInArc: "Return | quay\nAuthor's timing" };
+    const markdown = renderHooksProjection({ hooks: [hook] }, language);
+    expect(markdown).toContain("witness, permit\\|seal");
+    expect(markdown).toContain("Return \\| quay<br>Author's timing");
+    expect(markdown).toContain(language === "en" ? "depends_on | pays_off_in_arc" : "依赖伏笔 | 回收篇章语境");
+  });
+
   it("renders chapter summaries projection with deterministic Chinese ordering", () => {
     const markdown = renderChapterSummariesProjection({
       rows: [

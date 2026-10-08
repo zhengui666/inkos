@@ -122,6 +122,34 @@ browserFixtures('MegaNovel observed DOM binding in an isolated network-blocked C
     expect(await page.locator('input[placeholder="Chapter title"]').inputValue()).toBe('');
   });
 
+  it.each(['create', 'final-confirm'] as const)('stops stale authority at the actual %s editor effect boundary', async boundary => {
+    browser = await chromium.launch({headless: true, ...(process.env.INKOS_FIXTURE_CHROMIUM ? {executablePath: process.env.INKOS_FIXTURE_CHROMIUM} : {})});
+    const context = await browser.newContext(), state = await fixture(context), page = await context.newPage();
+    page.setDefaultTimeout(3000);
+    await page.goto(`${origin}/create_chapter/99?chapterId=103`);
+    const binding = createMegaNovelDomBinding({uiTimeoutMs: 3000});
+    const input = {packageId: 'fixture-four', chapterNumber: 4, scope, aiAssisted: true,
+      title: 'Fourth', content: 'Reviewed text.', revisionId: 'fixture-revision'};
+    const signal = new AbortController().signal;
+    if (boundary === 'create') {
+      const guard = vi.fn(async () => { throw Object.assign(new Error('Memo changed during probe'), {code: 'CHAPTER_REVIEW_INPUTS_CHANGED'}); });
+      await expect(binding.createDraft(page, input, signal, guard)).rejects.toMatchObject({code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
+      expect(guard).toHaveBeenCalledOnce(); expect(page.url()).toContain('chapterId=103');
+      expect(state.chapters).toHaveLength(3); expect(state.saveCount).toBe(0);
+    } else {
+      await binding.createDraft(page, input, signal);
+      const guard = vi.fn(async () => {
+        // The authority changes while the visible final schedule dialog is open.
+        if (await page.getByRole('radio', {name: 'Now', exact: true}).isChecked()) {
+          throw Object.assign(new Error('Brief changed before final Confirm'), {code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
+        }
+      });
+      await expect(binding.submit(page, {...input, remoteChapterId: '104'}, signal, guard)).rejects.toMatchObject({code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
+      expect(guard).toHaveBeenCalledTimes(3); expect(state.saveCount).toBe(1); expect(state.chapters[3]!.published).toBe(false);
+    }
+    expect(state.publishCount).toBe(0);
+  }, 30000);
+
   it.each([
     ['paragraph gap', 'A new reviewed paragraph.\n\nFinal paragraph.\n'],
     ['single line break', 'First line.\nSecond line.'],

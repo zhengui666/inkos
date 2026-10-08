@@ -101,6 +101,20 @@ describe('MegaNovel actual CDP transport with synthetic browser driver', () => {
       .rejects.toMatchObject({code: 'MEGANOVEL_BROWSER_BLOCKED'});
     expect(binding.createDraft).not.toHaveBeenCalled();
   });
+  it.each(['createDraft', 'submit'] as const)('rechecks authority after transport preflight and passes the guard to %s', async operation => {
+    port = await connectMegaNovelCdpPort(config, binding);
+    const input = {packageId: 'package-1', chapterNumber: 1, scope: config.scope, aiAssisted: true,
+      revisionId: 'revision-1', title: 'Title', content: 'Body', remoteChapterId: 'remote-1'};
+    let changed = false;
+    binding.probe = vi.fn(async () => { changed = true; return {scope: config.scope, origin: 'https://www.meganovel.com' as const, blocker: 'none' as const}; });
+    const beforeMutation = vi.fn(async () => { if (changed) throw Object.assign(new Error('New author brief'), {code: 'CHAPTER_REVIEW_INPUTS_CHANGED'}); });
+    await expect(port[operation](input, {beforeMutation})).rejects.toMatchObject({code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
+    expect(binding[operation]).not.toHaveBeenCalled();
+    changed = false;
+    binding.probe = vi.fn(async () => ({scope: config.scope, origin: 'https://www.meganovel.com' as const, blocker: 'none' as const}));
+    await port[operation](input, {beforeMutation});
+    expect(binding[operation]).toHaveBeenCalledWith(expect.anything(), input, expect.any(AbortSignal), beforeMutation);
+  });
   it('serializes binding operations on its owned target', async () => {
     port = await connectMegaNovelCdpPort(config, binding);
     const order: string[] = [];

@@ -1,3 +1,4 @@
+import type { ChapterReviewInputs } from "./review-inputs.js";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { realpathSync } from "node:fs";
@@ -26,7 +27,8 @@ export interface ScheduledChapter {
   reviewUnavailableChecks?: number;
   reviewAttempt?: { revisionId: string; startedAt: number };
   reviewRepair?: { revisionId: string; startedAt: number };
-  reviewReceipt?: { revisionId: string; reviewedAt: number; summary: string; observations: readonly Observation[] };
+  /** Legacy receipts without inputs can only reconcile prior remote attempts. */
+  reviewReceipt?: { inputs?: ChapterReviewInputs; revisionId: string; reviewedAt: number; summary: string; observations: readonly Observation[] };
   failures: number;
   nextAttemptAt: number;
   publicationStartedAt?: number;

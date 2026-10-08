@@ -11,15 +11,14 @@ export function renderHooksProjection(
 ): string {
   void options;
   const title = language === "en" ? "# Pending Hooks" : "# 伏笔池";
-  const headers = language === "en"
-    ? [
-      "| hook_id | start_chapter | type | status | last_advanced_chapter | expected_payoff | notes |",
-      "| --- | --- | --- | --- | --- | --- | --- |",
-    ]
-    : [
-      "| hook_id | 起始章节 | 类型 | 状态 | 最近推进 | 预期回收 | 备注 |",
-      "| --- | --- | --- | --- | --- | --- | --- |",
-    ];
+  // Keep legacy projections unchanged when no authored dependency metadata exists.
+  const hasDependencyContext = state.hooks.some((hook) => hook.dependsOn !== undefined || hook.paysOffInArc !== undefined);
+  const columns = language === "en"
+    ? ["hook_id", "start_chapter", "type", "status", "last_advanced_chapter", "expected_payoff", "notes"]
+    : ["hook_id", "起始章节", "类型", "状态", "最近推进", "预期回收", "备注"];
+  if (hasDependencyContext) columns.push(...(language === "en"
+    ? ["depends_on", "pays_off_in_arc"] : ["依赖伏笔", "回收篇章语境"]));
+  const headers = [`| ${columns.join(" | ")} |`, `| ${columns.map(() => "---").join(" | ")} |`];
 
   const rows = [...state.hooks]
     .sort((left, right) => (
@@ -36,6 +35,7 @@ export function renderHooksProjection(
           hook.lastAdvancedChapter,
           hook.expectedPayoff,
           hook.notes,
+          ...(hasDependencyContext ? [[...new Set(hook.dependsOn ?? [])].join(", "), hook.paysOffInArc ?? ""] : []),
         ].map(escapeTableCell).join(" | ")
       } |`);
 

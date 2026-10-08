@@ -4,17 +4,28 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 const fixture=vi.hoisted(()=>({status:'active',locked:false,events:[] as any[],goal:null as any,runGoal:vi.fn(),retryGoal:vi.fn()}));
 vi.mock('../goals/service.js',()=>({ChapterGoalService:class {get(){return fixture.goal;}events(){return {events:fixture.events};}run(...args:any[]){return fixture.runGoal(...args);}retryTransientFailure(...args:any[]){return fixture.retryGoal(...args);}close(){}}}));
-vi.mock('../state/manager.js',()=>({StateManager:class {async loadBookConfig(){return {status:fixture.status};}async acquireBookLock(){if(fixture.locked)throw new Error('busy');fixture.locked=true;return async()=>{fixture.locked=false;};}}}));
+vi.mock('../state/manager.js',()=>({StateManager:class {constructor(private root:string){} bookDir(id:string){return join(this.root,id);}async loadBookConfig(){return {status:fixture.status};}async acquireBookLock(){if(fixture.locked)throw new Error('busy');fixture.locked=true;return async()=>{fixture.locked=false;};}}}));
 vi.mock('../harness/work-store.js',()=>({loadWorkManifest:async()=>({profileId:'longform-novel'})}));
 vi.mock('../harness/builtin-profiles.js',()=>({createBuiltInWorkProfileRegistry:()=>({require:()=>({})})}));
 vi.mock('../skills/index.js',()=>({loadAvailableAgentSkills:async()=>({skills:[]}),resolveProfileSkillActivations:()=>[]}));
 import { AutonomousChapterRunner } from '../pipeline/autonomous-chapters.js';
 import { SchedulerStore } from '../pipeline/scheduler-store.js';
+const reviewInputs={version:1 as const,plan:null,authorBrief:null,bookRules:null};
 const roots:string[]=[];const stores:SchedulerStore[]=[];
 beforeEach(()=>{fixture.status='active';fixture.locked=false;fixture.events=[];fixture.goal=null;vi.clearAllMocks();});
 afterEach(async()=>{stores.splice(0).forEach(s=>s.close());await Promise.all(roots.splice(0).map(p=>rm(p,{recursive:true,force:true})));});
-async function setup(){const root=await mkdtemp(join(tmpdir(),'inkos-autonomous-'));roots.push(root);const store=new SchedulerStore(join(root,'harness.sqlite'));stores.push(store);const first=store.reserve('novel',4,Date.now(),1)!;const job={...first,phase:'reviewing' as const};store.save(job,'fixture');const pipeline={writeChapters:vi.fn(),runWithAbortSignal:(_s:any,f:any)=>f(),runWithAgentContext:(_c:any,f:any)=>f(),reviewChapter:vi.fn(async()=>({summary:'Current retained revision reviewed.',observations:[]})),reviseDraft:vi.fn()};const publisher={ready:vi.fn(async()=>{}),publish:vi.fn(async()=>({status:'published' as const,remoteChapterId:'remote-4'}))};let now=Date.now();const runner=new AutonomousChapterRunner(root,pipeline as any,store,{publisher,retryDelayMs:1,publicationPollMs:60000,now:()=>now});const revision=vi.spyOn(runner as any,'chapterRevision').mockResolvedValue({revisionId:'revision-4',observations:[]});return {root,store,job,pipeline,publisher,runner,revision,advance:()=>{now+=100000;}};}
+async function setup(){const root=await mkdtemp(join(tmpdir(),'inkos-autonomous-'));roots.push(root);const store=new SchedulerStore(join(root,'harness.sqlite'));stores.push(store);const first=store.reserve('novel',4,Date.now(),1)!;const job={...first,phase:'reviewing' as const};store.save(job,'fixture');const pipeline={writeChapters:vi.fn(),runWithAbortSignal:(_s:any,f:any)=>f(),runWithAgentContext:(_c:any,f:any)=>f(),reviewChapter:vi.fn(async()=>({reviewInputs,summary:'Current retained revision reviewed.',observations:[]})),reviseDraft:vi.fn()};const publisher={reconcile:vi.fn(async()=>undefined),ready:vi.fn(async()=>{}),publish:vi.fn(async()=>({status:'published' as const,remoteChapterId:'remote-4'}))};let now=Date.now();const runner=new AutonomousChapterRunner(root,pipeline as any,store,{publisher,retryDelayMs:1,publicationPollMs:60000,now:()=>now});const revision=vi.spyOn(runner as any,'chapterRevision').mockResolvedValue({revisionId:'revision-4',observations:[]});return {root,store,job,pipeline,publisher,runner,revision,advance:()=>{now+=100000;}};}
 const issue={code:'continuity',summary:'Unresolved source-supported issue',assessment:'issue',evidence:[]};
+it.each(['chapter-contract-inventory','chapter-contract-1'])('requires missing semantic evidence for %s without refunding retries or rewriting prose',async code=>{
+ const f=await setup();(f.runner as any).options.persistentTransientRetries=true;
+ const unknown={code,category:'quality',assessment:'unavailable',summary:'The revised author instruction is absent.',evidence:[],sourceRefs:[]};
+ f.pipeline.reviewChapter.mockResolvedValue({reviewInputs,summary:'Authority unavailable',observations:[unknown]} as any);
+ const result=await f.runner.run(f.job,new AbortController().signal);
+ expect(result.phase).toBe('blocked');expect(result.error?.code).toBe('CHAPTER_CONTRACT_EVIDENCE_REQUIRED');
+ expect(result.reviewChecks).toBe(1);expect(result.reviewUnavailableChecks??0).toBe(0);
+ for(let index=0;index<3;index++){f.advance();await f.runner.run(result,new AbortController().signal);}
+ expect(f.pipeline.reviewChapter).toHaveBeenCalledOnce();expect(f.pipeline.reviseDraft).not.toHaveBeenCalled();expect(f.publisher.publish).not.toHaveBeenCalled();
+});
 describe('autonomous retained chapter stages',()=>{
  it('publishes only the revision accepted under the existing book lock',async()=>{const f=await setup();f.revision.mockImplementation(async()=>{if(f.revision.mock.calls.length<=2)expect(fixture.locked).toBe(true);return {revisionId:'revision-4',observations:[]};});const result=await f.runner.run(f.job,new AbortController().signal);expect(result.phase).toBe('completed');expect(f.pipeline.reviewChapter).toHaveBeenCalledOnce();expect(result.reviewReceipt).toMatchObject({revisionId:'revision-4',summary:'Current retained revision reviewed.'});expect(f.publisher.publish).toHaveBeenCalledWith(expect.objectContaining({revisionId:'revision-4'}));expect(fixture.locked).toBe(false);});
  it('does not accept a changed revision with new unresolved observations',async()=>{const f=await setup();f.revision.mockResolvedValueOnce({revisionId:'A',observations:[]}).mockResolvedValue({revisionId:'B',observations:[{...issue,code:'state-sync-required'}]});const result=await f.runner.run(f.job,new AbortController().signal);expect(result.phase).toBe('blocked');expect(f.publisher.publish).not.toHaveBeenCalled();});
@@ -50,7 +61,7 @@ describe('revision-bound review and interrupted repair recovery',()=>{
  });
  it('accepts a positively evidenced ending and then uses the real publisher interface', async () => {
   const f=await setup(); (f.runner as any).options.requireStoryClosure=()=>true;
-  f.pipeline.reviewChapter.mockResolvedValue({summary:'Ending verified.',observations:[{code:'story-closure',category:'quality',assessment:'observation',evidence:[],sourceRefs:[{sourceId:'chapter-4',quote:'The central conflict was resolved.'}]}]} as any);
+  f.pipeline.reviewChapter.mockResolvedValue({reviewInputs,summary:'Ending verified.',observations:[{code:'story-closure',category:'quality',assessment:'observation',evidence:[],sourceRefs:[{sourceId:'chapter-4',quote:'The central conflict was resolved.'}]}]} as any);
   expect((await f.runner.run(f.job,new AbortController().signal)).phase).toBe('completed');
   expect(f.publisher.publish).toHaveBeenCalledOnce();
  });
@@ -93,7 +104,7 @@ describe('revision-bound review and interrupted repair recovery',()=>{
  });
  it('credits a new unavailable review result even after its attempt marker is cleared', async () => {
   const f=await setup(); (f.runner as any).options.persistentTransientRetries=true;
-  f.pipeline.reviewChapter.mockResolvedValueOnce({summary:'Review unavailable',observations:[],unavailable:true} as any);
+  f.pipeline.reviewChapter.mockResolvedValueOnce({reviewInputs,summary:'Review unavailable',observations:[],unavailable:true} as any);
   const waiting=await f.runner.run(f.job,new AbortController().signal);
   expect(waiting).toMatchObject({phase:'reviewing',reviewChecks:1,reviewUnavailableChecks:1});
   expect(waiting.reviewAttempt).toBeUndefined();expect(f.publisher.publish).not.toHaveBeenCalled();
@@ -106,7 +117,7 @@ describe('revision-bound review and interrupted repair recovery',()=>{
   f.publisher.ready.mockImplementation(async()=>{running=false;});
   const job={...f.job,phase:'writing' as const};await f.runner.run(job,new AbortController().signal);
   expect(f.pipeline.writeChapters).not.toHaveBeenCalled();expect(f.publisher.publish).not.toHaveBeenCalled();
-  running=true;f.publisher.ready.mockResolvedValue(undefined);f.pipeline.reviewChapter.mockImplementation(async()=>{running=false;return {summary:'Clean',observations:[]};});
+  running=true;f.publisher.ready.mockResolvedValue(undefined);f.pipeline.reviewChapter.mockImplementation(async()=>{running=false;return {reviewInputs,summary:'Clean',observations:[]};});
   await f.runner.run(f.job,new AbortController().signal);expect(f.publisher.publish).not.toHaveBeenCalled();
  });
 

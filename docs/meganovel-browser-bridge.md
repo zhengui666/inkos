@@ -49,6 +49,14 @@ Before enabling automation for a book with historical manual/assistant submissio
 
 The adapter does not implement a generic delivery queue, scanning/writing policy, account creation, agreements, authentication, contracting, payments, identity verification, or income reporting. It does not change the model configuration.
 
+## Current review input receipts
+
+Autonomous review receipts additionally retain a version-1 literal snapshot of the authoritative chapter `.plan.json`, chapter `.user-brief.md`, and `story/book_rules.md`. The pipeline captures these inputs before context selection and passes those same values into the audit, including the original memo's hook references. Missing files remain distinct from empty files; non-lossless UTF-8 is rejected. The human-readable `.intent.md` and generated `.context.json` projections are not authority. Existing prose revision/snapshot checks remain in force; no new content hashes are used.
+
+This is an additive optional field in the existing scheduler JSON, not a SQL migration. Legacy or incompatible unsubmitted receipts require a fresh audit without resetting retained editorial budgets. Completed history is unchanged. Prior remote chapter and remote-book attempts are independently reconciled before local inputs are checked: submitted/unknown outcomes never become a new submission just because the author edited an input. A verified unsubmitted draft may be audited again before its first submission.
+
+Scheduler publishers expose optional read-only `reconcile`; unavailable capability is explicit and cannot establish absence of a prior attempt. New mutation calls carry `reviewInputs` and `beforeMutation`. Installed browser ports and DOM bindings must forward and invoke the guard immediately before each effect after their asynchronous preflight, including the final Confirm. The built-in CDP/DOM path does this. A guard stop after an uncertainty reservation leaves that reservation intact for independent readback; it never rolls it back to permit a blind retry.
+
 ## Transport and ownership boundaries
 
 `playwright-core` is pinned to `1.61.0`. No browser binary is downloaded by this package. `connectOverCDP` attaches to an existing Chromium endpoint; it does not enable remote debugging, start Chrome, create a profile, sign in, read cookies, copy a browser profile or grant persistent access. The wrapper uses `noDefaults: true`, preserving the attached context's existing browser defaults.

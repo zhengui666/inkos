@@ -20,6 +20,8 @@ import {
 } from "./planner-prompts.js";
 import { contractFromContext } from "./reader-contract-context.js";
 import { ComposerAgent } from "./composer.js";
+import { CHAPTER_CONTRACT_SOURCE, chapterContractPlanningProtocol, validateChapterContractInventory } from "./chapter-contract.js";
+import { numberReviewSource } from "../models/observation.js";
 
 export interface PlanChapterInput {
   readonly book: BookConfig;
@@ -43,6 +45,19 @@ export interface PlanChapterOutput {
 export class PlannerAgent extends BaseAgent {
   get name(): string {
     return "planner";
+  }
+
+  /** Read-only source classification also supports existing free-Markdown memos. */
+  async classifyChapterContract(sources: ReadonlyMap<string, string>, language: "zh" | "en") {
+    const memo = sources.get(CHAPTER_CONTRACT_SOURCE)!;
+    return this.submitSourcedReview([
+      { role: "system", content: chapterContractPlanningProtocol(language) },
+      { role: "user", content: JSON.stringify({ sources: [...sources].map(([sourceId, content]) => ({ sourceId, numberedLines: numberReviewSource(content) })) }) },
+    ], sources, {
+      name: "submit_chapter_contract", label: "Classify current chapter memo",
+      description: "Read-only source-preserving classification; no prose, new obligations, or state changes.",
+    }, { temperature: 0, maxTokens: this.ctx.client.defaults.maxTokens,
+      validateObservations: items => validateChapterContractInventory(items, memo) });
   }
 
   async planChapter(input: PlanChapterInput): Promise<PlanChapterOutput> {

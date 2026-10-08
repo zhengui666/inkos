@@ -99,10 +99,15 @@ describe("real foundation to planner to writer/reviewer propagation", () => {
         // Prove the host rejects a sparse commercial memo, then keeps the repair.
         return { calls: [{ name, args: { goal: "Earn a test", body: "Refusal leads to an offered stake and a witnessed test.", threadRefs: [], ...(memoAttempts++ ? { readerDelivery: delivery } : {}) } }] };
       }
+      if (name === "submit_chapter_contract") return { calls: [{ name, args: { summary: "Synthetic source inventory", observations: [{ code: "required-event", assessment: "observation", summary: "The offered stake leads to a witnessed test", sourceRefs: [{ sourceId: "chapter-contract-source", startLine: 1, endLine: 1 }] }] } }] };
       if (name === "submit_chapter_review") {
         expect(envelope).toContain(route.distinctiveHook);
         expect(envelope).toContain("opening-readability");
-        return { calls: [{ name, args: { summary: "Fixture coverage only, not a literary judgment", observations: reviewAttempts++ ? COMMERCIAL_REVIEW_CODES.map(code => ({ code, assessment: "observation", category: "quality", summary: "Transport fixture cites the supplied original line", sourceRefs: [{ sourceId: "chapter-1", startLine: 1, endLine: 1 }] })) : [] } }] };
+        return { calls: [{ name, args: { summary: "Fixture coverage only, not a literary judgment", observations: reviewAttempts++ ? [
+          ...COMMERCIAL_REVIEW_CODES.map(code => ({ code, assessment: "observation", category: "quality", summary: "Transport fixture cites the supplied original line", sourceRefs: [{ sourceId: "chapter-1", startLine: 1, endLine: 1 }] })),
+          { code: "chapter-contract-inventory", assessment: "observation", category: "quality", summary: "Synthetic inventory retains the source", sourceRefs: [{ sourceId: "chapter-contract-source", startLine: 1, endLine: 1 }] },
+          { code: "chapter-contract-1", assessment: "observation", category: "quality", summary: "Synthetic requirement evidence transport", sourceRefs: [{ sourceId: "chapter-contract-1", startLine: 1, endLine: 1 }, { sourceId: "chapter-1", startLine: 1, endLine: 1 }] },
+        ] : [] } }] };
       }
       throw new Error(`Unexpected model operation ${name}`);
     });
@@ -133,8 +138,8 @@ describe("real foundation to planner to writer/reviewer propagation", () => {
     const chapter = language === "zh" ? "门闩还没落下，她把最后一件工具放在桌上，要求当众试一次。" : "Before the dock gate closed, Neri set her last fuel cartridge on the desk and asked for one witnessed test.";
     const review = await new ContinuityAuditor(f.ctx).auditChapter(f.bookDir, chapter, 1, f.book.genre, { language, contextPackage: composed.contextPackage });
     expect(reviewAttempts).toBe(2);
-    expect(review.observations.map(item => item.code)).toEqual([...COMMERCIAL_REVIEW_CODES]);
-    expect(review.observations.every(item => item.sourceRefs?.[0]?.quote === chapter)).toBe(true);
+    expect(review.observations.map(item => item.code)).toEqual([...COMMERCIAL_REVIEW_CODES, "chapter-contract-inventory", "chapter-contract-1"]);
+    expect(review.observations.slice(0, COMMERCIAL_REVIEW_CODES.length).every(item => item.sourceRefs?.[0]?.quote === chapter)).toBe(true);
   });
 });
 

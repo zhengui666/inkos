@@ -138,6 +138,9 @@ function mergeHookRecord(existing: HookRecord, incoming: HookRecord): HookRecord
     lastAdvancedChapter: advanced,
     expectedPayoff: incoming.expectedPayoff.trim() || existing.expectedPayoff,
     notes: incoming.notes.trim() || existing.notes,
+    // Omission is a legacy/no-change update; explicit empty values clear authored context.
+    ...(incoming.dependsOn !== undefined ? { dependsOn: [...new Set(incoming.dependsOn)] } : {}),
+    ...(incoming.paysOffInArc !== undefined ? { paysOffInArc: incoming.paysOffInArc } : {}),
   };
 }
 

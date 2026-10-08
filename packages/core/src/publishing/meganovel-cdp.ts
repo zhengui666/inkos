@@ -18,8 +18,8 @@ export interface MegaNovelDomBinding {
   /** Optional additive capability; legacy dom-v1 modules keep their original snapshot contract. */
   observeSnapshot?(page: Page, input: MegaNovelSnapshotRequest, signal: AbortSignal): Promise<MegaNovelSnapshot>;
   snapshot(page: Page, input: Parameters<MegaNovelBrowserPort['snapshot']>[0], signal: AbortSignal): ReturnType<MegaNovelBrowserPort['snapshot']>;
-  createDraft(page: Page, input: Parameters<MegaNovelBrowserPort['createDraft']>[0], signal: AbortSignal): Promise<void>;
-  submit(page: Page, input: Parameters<MegaNovelBrowserPort['submit']>[0], signal: AbortSignal): Promise<void>;
+  createDraft(page: Page, input: Parameters<MegaNovelBrowserPort['createDraft']>[0], signal: AbortSignal, beforeMutation?: () => Promise<void>): Promise<void>;
+  submit(page: Page, input: Parameters<MegaNovelBrowserPort['submit']>[0], signal: AbortSignal, beforeMutation?: () => Promise<void>): Promise<void>;
 }
 
 const AuthorizationEvidence = z.object({
@@ -171,10 +171,10 @@ class MegaNovelCdpPort implements MegaNovelBrowserPort {
     }, options.signal);
   }
   createDraft(input: Parameters<MegaNovelBrowserPort['createDraft']>[0], options: MegaNovelBrowserOptions = {}) {
-    return this.serial(async signal => { await this.check(input.scope, signal); await this.binding.createDraft(this.page, input, signal); }, options.signal);
+    return this.serial(async signal => { await this.check(input.scope, signal); await options.beforeMutation?.(); signal.throwIfAborted(); await this.binding.createDraft(this.page, input, signal, options.beforeMutation); }, options.signal);
   }
   submit(input: Parameters<MegaNovelBrowserPort['submit']>[0], options: MegaNovelBrowserOptions = {}) {
-    return this.serial(async signal => { await this.check(input.scope, signal); await this.binding.submit(this.page, input, signal); }, options.signal);
+    return this.serial(async signal => { await this.check(input.scope, signal); await options.beforeMutation?.(); signal.throwIfAborted(); await this.binding.submit(this.page, input, signal, options.beforeMutation); }, options.signal);
   }
   close(): Promise<void> {
     this.closing = true;

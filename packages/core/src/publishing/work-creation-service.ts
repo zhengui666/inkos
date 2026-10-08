@@ -80,6 +80,10 @@ export class RemoteWorkCreationService {
       if (current.phase === 'bound') return current;
       if ((error as {code?: string}).code === 'REMOTE_WORK_VERSION_CONFLICT') return current;
       if (current.attempts === 1) return this.block(current, uncertain);
+      // A local publication guard failed before any remote attempt was reserved.
+      // Preserve that classification so the scheduler can re-audit the inputs.
+      if (['CHAPTER_REVIEW_INPUTS_CHANGED', 'CHAPTER_REVISION_CHANGED', 'CHAPTER_PUBLICATION_PAUSED']
+        .includes((error as {code?: string}).code ?? '')) throw error;
       if (signal.aborted) throw error;
       return this.block(current, {status: 'needs_setup', code: 'REMOTE_WORK_INSPECTION_REQUIRED',
         message: 'The selected account/session could not be verified. Restore the existing setup and retry this same operation.'});

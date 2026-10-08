@@ -72,7 +72,26 @@ export interface PendingHook {
 }
 
 function splitTableRow(line: string): string[] {
-  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+  const row = line.trim();
+  const cells: string[] = [];
+  let cell = "";
+  for (let index = 0; index < row.length; index++) {
+    // The state projection adds one backslash per pipe but preserves existing
+    // backslashes. Remove only that pipe escape, including after literal slashes.
+    if (row[index] === "\\" && row[index + 1] === "|") {
+      cell += "|";
+      index++;
+    } else if (row[index] === "|") {
+      cells.push(cell.trim());
+      cell = "";
+    } else {
+      cell += row[index];
+    }
+  }
+  cells.push(cell.trim());
+  if (row.startsWith("|")) cells.shift();
+  if (row.endsWith("|") && !row.endsWith("\\|")) cells.pop();
+  return cells;
 }
 
 // pending_hooks.md is an explicit-state tracking table. Only a few columns are

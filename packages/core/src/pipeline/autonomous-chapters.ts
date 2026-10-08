@@ -1,3 +1,4 @@
+import { readChapterReviewInputs, sameChapterReviewInputs, type ChapterReviewInputs } from "./review-inputs.js";
 import { isCreationTransientFailure } from '../creation/transient.js';
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -18,8 +19,11 @@ export interface SchedulerPublisher {
     signal: AbortSignal; beforeMutation?: () => void | Promise<void>}): Promise<void>;
   /** Read-only check of configured transport and actual signed-in account/book. */
   ready(workId: string, signal: AbortSignal, continuingChapter?: number): Promise<void>;
-  /** Reconcile prior attempts before any write; pending must never imply a new submission. */
-  publish(input: { workId: string; chapterNumber: number; revisionId: string; signal: AbortSignal }): Promise<NonNullable<ScheduledChapter["publication"]>>;
+  /** Read-only reconciliation. A verified draft still needs approval before submission. */
+  reconcile?(input: { workId: string; chapterNumber: number; signal: AbortSignal }): Promise<NonNullable<ScheduledChapter["publication"]> | { status: "draft" } | { status: "unsupported" } | undefined>;
+  /** Reconcile first; invoke beforeMutation immediately before every NEW mutation. */
+  publish(input: { workId: string; chapterNumber: number; revisionId: string; signal: AbortSignal;
+    reviewInputs?: ChapterReviewInputs; beforeMutation?: () => Promise<void> }): Promise<NonNullable<ScheduledChapter["publication"]>>;
   close?(): Promise<void>;
 }
 
@@ -57,7 +61,7 @@ export class AutonomousChapterRunner {
     const reviewChecksBefore = job.reviewChecks ?? 0;
     try {
       // No new model work while the explicitly selected publishing destination is unavailable.
-      await this.options.publisher?.ready(job.workId, signal, job.phase === "publishing" ? job.chapter : undefined);
+      await this.options.publisher?.ready(job.workId, signal, job.phase === "publishing" || job.publicationStartedAt !== undefined ? job.chapter : undefined);
       if (this.options.shouldContinue?.(job.workId) === false) return job;
       if (job.phase === "writing") job = await this.write(job, signal);
       signal.throwIfAborted();
@@ -67,20 +71,7 @@ export class AutonomousChapterRunner {
       if (job.phase === "publishing") {
         signal.throwIfAborted();
         if (!["active", "outlining"].includes((await this.state.loadBookConfig(job.workId)).status)) return job;
-        const current = await this.chapterRevision(job.workId, job.chapter);
-        if (current.revisionId !== job.revisionId || job.reviewReceipt?.revisionId !== current.revisionId
-          || unresolvedReview(current.observations).length) {
-          job = { ...job, phase: "reviewing", revisionId: undefined, reviewReceipt: undefined };
-          this.store.save(job, "review-invalidated-by-edit", now());
-          return job;
-        }
-        if (this.options.shouldContinue?.(job.workId) === false) return job;
-        const publication = await this.options.publisher!.publish({ workId: job.workId, chapterNumber: job.chapter,
-          revisionId: job.revisionId!, signal });
-        job = { ...job, publication, failures: 0, error: undefined, publicationStartedAt: job.publicationStartedAt ?? now(),
-          phase: publication.status === "published" ? "completed" : "publishing",
-          nextAttemptAt: now() + (this.options.publicationPollMs ?? 900_000) };
-        this.store.save(job, "publication-readback", now());
+        job = await this.publish(job, signal);
       }
       if (job.phase === "completed") {
         // A UI/notification callback cannot turn committed work into another writing attempt.
@@ -94,6 +85,8 @@ export class AutonomousChapterRunner {
       if (retained?.chapter === job.chapter) job = retained;
       if (signal.aborted) { this.store.event("chapter-interrupted", { workId: job.workId, chapter: job.chapter }, now()); return job; }
       const failure = { code: (error as { code?: string }).code ?? "DAEMON_OPERATION_FAILED", message: String(error) };
+      if (failure.code === "CHAPTER_REVIEW_INPUTS_CHANGED") return this.invalidateReview(job);
+      if (failure.code === "CHAPTER_PUBLICATION_PAUSED") return job;
       if (failure.code === "PUBLISHING_HISTORY_PENDING") {
         const startedAt = job.publicationStartedAt ?? now();
         job = { ...job, error: failure, publicationStartedAt: startedAt, nextAttemptAt: now() + (this.options.publicationPollMs ?? 900_000) };
@@ -216,6 +209,10 @@ export class AutonomousChapterRunner {
       job = { ...job, reviewAttempt: undefined };
       this.store.save(job, "review-finished", now());
       const issues = [...unresolvedReview(result.observations), ...unresolvedReview(reviewed.observations)];
+      const contractUnknown = issues.filter(issue => issue.assessment === "unavailable" && issue.code.startsWith("chapter-contract-"));
+      if (contractUnknown.length) {
+        return this.block(job, "CHAPTER_CONTRACT_EVIDENCE_REQUIRED", contractUnknown.map(issue => issue.summary).join("\n"));
+      }
       if (result.unavailable || issues.some(issue => issue.code === "review-unavailable" || issue.assessment === "unavailable")) {
         throw Object.assign(new Error("The current revision has no available review result."), { code: "CHAPTER_REVIEW_UNAVAILABLE" });
       }
@@ -225,8 +222,11 @@ export class AutonomousChapterRunner {
         return this.block(job, 'STORY_CLOSURE_REVIEW_REQUIRED', 'The final chapter has no source-supported story closure acceptance. The task cannot publish or finish on chapter count alone.');
       }
       if (!issues.length) {
+        if (!sameChapterReviewInputs(result.reviewInputs, await readChapterReviewInputs(this.state.bookDir(job.workId), job.chapter))) {
+          return this.invalidateReview(job);
+        }
         job = { ...job, revisionId: reviewed.revisionId, reviewReceipt: {
-          revisionId: reviewed.revisionId, reviewedAt: now(), summary: result.summary, observations: result.observations,
+          inputs: result.reviewInputs, revisionId: reviewed.revisionId, reviewedAt: now(), summary: result.summary, observations: result.observations,
         } };
         return this.advance(job, this.options.publisher ? "publishing" : "completed", "review-accepted");
       }
@@ -247,6 +247,59 @@ export class AutonomousChapterRunner {
       // Reconcile and independently review the resulting current revision. An
       // interrupted repair uses this same path on resume, never a blind repair retry.
     }
+  }
+
+  private async publish(job: ScheduledChapter, signal: AbortSignal): Promise<ScheduledChapter> {
+    const publisher = this.options.publisher!;
+    // Reconcile even legacy receipts and changed/missing local sources first.
+    // An accepted or unknown remote outcome never becomes a fresh submission.
+    const prior = await publisher.reconcile?.({ workId: job.workId, chapterNumber: job.chapter, signal });
+    const canReconcile = Boolean(publisher.reconcile) && prior?.status !== "unsupported";
+    if (prior && prior.status !== "draft" && prior.status !== "unsupported") return this.recordPublication(job, prior);
+    if (prior?.status === "draft") job = { ...job, publicationStartedAt: job.publicationStartedAt ?? (this.options.now ?? Date.now)() };
+    const beforeMutation = async () => {
+      signal.throwIfAborted();
+      if (this.options.shouldContinue?.(job.workId) === false
+        || !["active", "outlining"].includes((await this.state.loadBookConfig(job.workId)).status)) {
+        throw Object.assign(new Error("Publication paused before a new mutation."), { code: "CHAPTER_PUBLICATION_PAUSED" });
+      }
+      const current = await this.chapterRevision(job.workId, job.chapter);
+      if (current.revisionId !== job.revisionId || job.reviewReceipt?.revisionId !== current.revisionId
+        || unresolvedReview(current.observations).length
+        || !sameChapterReviewInputs(job.reviewReceipt?.inputs, await readChapterReviewInputs(this.state.bookDir(job.workId), job.chapter))) {
+        throw Object.assign(new Error("The chapter or its authoritative review inputs changed; review again before submission."), { code: "CHAPTER_REVIEW_INPUTS_CHANGED" });
+      }
+    };
+    try { await beforeMutation(); }
+    catch (error) {
+      if ((error as {code?: string}).code !== "CHAPTER_REVIEW_INPUTS_CHANGED") throw error;
+      if (!canReconcile && (job.publication || job.publicationStartedAt !== undefined)) {
+        throw Object.assign(new Error("This publisher must reconcile the retained attempt before invalidating its review."), { code: "PUBLISHING_RECONCILIATION_REQUIRED" });
+      }
+      return this.invalidateReview(job);
+    }
+    job = { ...job, publicationStartedAt: job.publicationStartedAt ?? (this.options.now ?? Date.now)() };
+    this.store.save(job, "publication-started", (this.options.now ?? Date.now)());
+    const publication = await publisher.publish({ workId: job.workId, chapterNumber: job.chapter,
+      revisionId: job.revisionId!, reviewInputs: job.reviewReceipt!.inputs, beforeMutation, signal });
+    return this.recordPublication(job, publication);
+  }
+
+  private recordPublication(job: ScheduledChapter, publication: NonNullable<ScheduledChapter["publication"]>): ScheduledChapter {
+    const now = this.options.now ?? Date.now;
+    const next: ScheduledChapter = { ...job, publication, failures: 0, error: undefined,
+      publicationStartedAt: job.publicationStartedAt ?? now(),
+      phase: publication.status === "published" ? "completed" : "publishing",
+      nextAttemptAt: now() + (this.options.publicationPollMs ?? 900_000) };
+    this.store.save(next, "publication-readback", now());
+    return next;
+  }
+
+  private invalidateReview(job: ScheduledChapter): ScheduledChapter {
+    const next: ScheduledChapter = { ...job, phase: "reviewing", revisionId: undefined, reviewReceipt: undefined,
+      reviewAttempt: undefined, error: undefined };
+    this.store.save(next, "review-invalidated-by-edit", (this.options.now ?? Date.now)());
+    return next;
   }
 
   private async chapterRevision(workId: string, chapter: number) {

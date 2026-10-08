@@ -57,10 +57,7 @@ export async function loadPersistedPlan(
     throw error;
   }
 
-  const persisted: z.infer<typeof PersistedPlanSchema> = PersistedPlanSchema.parse(JSON.parse(raw));
-  if (persisted.memo.chapter !== chapterNumber || persisted.intent.chapter !== chapterNumber) {
-    throw new Error(`Persisted plan chapter identity does not match chapter ${chapterNumber}.`);
-  }
+  const persisted = parsePersistedPlan(raw, chapterNumber);
 
   let intentMarkdown = persisted.memo.body;
   try {
@@ -80,4 +77,13 @@ export async function loadPersistedPlan(
 
 export function relativeToBookDir(bookDir: string, absolutePath: string): string {
   return relative(bookDir, absolutePath).replaceAll("\\", "/");
+}
+
+/** Parse the exact bytes captured for review, without rereading a newer memo. */
+export function parsePersistedPlan(raw: string, chapterNumber: number): z.infer<typeof PersistedPlanSchema> {
+  const persisted = PersistedPlanSchema.parse(JSON.parse(raw));
+  if (persisted.memo.chapter !== chapterNumber || persisted.intent.chapter !== chapterNumber) {
+    throw new Error(`Persisted plan chapter identity does not match chapter ${chapterNumber}.`);
+  }
+  return persisted;
 }
