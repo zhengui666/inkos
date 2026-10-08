@@ -74,12 +74,21 @@ export async function loadRuntimeStateSnapshotAtChapter(params: {
     String(params.chapterNumber),
   );
   const stateDir = join(snapshotDir, "state");
-  const [manifest, currentState, hooks, chapterSummaries] = await Promise.all([
-    readJsonOrNull(join(stateDir, "manifest.json"), StateManifestSchema),
-    readJsonOrNull(join(stateDir, "current_state.json"), CurrentStateStateSchema),
-    readJsonOrNull(join(stateDir, "hooks.json"), HooksStateSchema),
-    readJsonOrNull(join(stateDir, "chapter_summaries.json"), ChapterSummariesStateSchema),
+  let firstFailure: { reason: unknown } | undefined;
+  const retainFailure = (reason: unknown): never => { firstFailure ??= { reason }; throw reason; };
+  // Settle all sibling reads before returning the original first failure.
+  const results = await Promise.allSettled([
+    readJsonOrNull(join(stateDir, "manifest.json"), StateManifestSchema).catch(retainFailure),
+    readJsonOrNull(join(stateDir, "current_state.json"), CurrentStateStateSchema).catch(retainFailure),
+    readJsonOrNull(join(stateDir, "hooks.json"), HooksStateSchema).catch(retainFailure),
+    readJsonOrNull(join(stateDir, "chapter_summaries.json"), ChapterSummariesStateSchema).catch(retainFailure),
   ]);
+  if (firstFailure) throw firstFailure.reason;
+  // A checkpoint failure must not release its caller's mutation scope while
+  // sibling file reads are still open (notably on Windows).
+  const [manifest, currentState, hooks, chapterSummaries] = [
+    readResult(results[0]), readResult(results[1]), readResult(results[2]), readResult(results[3]),
+  ] as const;
 
   if (manifest && currentState && hooks && chapterSummaries) {
     return validateLoadedSnapshot(
@@ -167,6 +176,11 @@ export async function saveRuntimeStateSnapshot(
       { relativePath: join("story", "chapter_summaries.md"), content: renderChapterSummariesProjection(parsed.chapterSummaries, language) },
     ],
   });
+}
+
+function readResult<T>(result: PromiseSettledResult<T>): T {
+  if (result.status === "rejected") throw result.reason;
+  return result.value;
 }
 
 async function readJson<T>(

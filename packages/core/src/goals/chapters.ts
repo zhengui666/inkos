@@ -108,23 +108,29 @@ type ChapterState = Awaited<ReturnType<typeof readChapterState>>;
 async function checkAcceptedInputs(root: string, state: ChapterState, context: GoalStepContext): Promise<void> {
   const { bookDir, runtime, work } = state, workId = context.goal.workId;
   // Every earlier accepted chapter remains a protected input of later writing.
-  for (const step of context.goal.steps) {
-    if (!step.receipt || step.kind !== CHAPTER_GOAL_KIND) continue;
-    const acceptedChapter = ChapterInput.parse(step.input).chapterNumber;
-    const checkpoint = await loadRuntimeStateSnapshotAtChapter({ bookDir, chapterNumber: acceptedChapter, language: runtime.manifest.language });
-    const retainedCheckpoint = step.receipt.evidence.checkpointState;
-    if (typeof retainedCheckpoint !== "string" || goalInputValue(checkpoint) !== retainedCheckpoint) {
-      throw goalError("CHAPTER_CHECKPOINT_CHANGED", `Accepted checkpoint ${step.id} changed or its older receipt has no retained checkpoint content. The receipt was kept without silently resuming it.`);
-    }
-    for (const ref of step.receipt.artifacts) {
-      const artifact = work.artifacts.find(item => item.id === ref.artifactId);
-      const current = artifact?.revisions.find(item => item.id === artifact.currentRevisionId);
-      const saved = current?.snapshotPath ? await readFile(safeChildPath(join(root, "works", workId), current.snapshotPath)) : undefined;
-      if (current?.id !== ref.revisionId || !saved
-        || !saved.equals(await readFile(safeChildPath(join(root, "works", workId), ref.path)))) {
-        throw goalError("CHAPTER_BASELINE_CHANGED", `Accepted chapter ${step.id} changed. Reconcile the goal baseline before continuing.`);
+  // Reads are bounded to four checkpoints at once under the same mutation scope.
+  // Settle the whole batch before throwing, preserving the earliest step's error
+  // without leaving open reads behind when the scope releases its lock.
+  const accepted = context.goal.steps.filter(step => step.receipt && step.kind === CHAPTER_GOAL_KIND);
+  for (let offset = 0; offset < accepted.length; offset += 4) {
+    const results = await Promise.allSettled(accepted.slice(offset, offset + 4).map(async step => {
+      const acceptedChapter = ChapterInput.parse(step.input).chapterNumber;
+      const checkpoint = await loadRuntimeStateSnapshotAtChapter({ bookDir, chapterNumber: acceptedChapter, language: runtime.manifest.language });
+      const retainedCheckpoint = step.receipt!.evidence.checkpointState;
+      if (typeof retainedCheckpoint !== "string" || goalInputValue(checkpoint) !== retainedCheckpoint) {
+        throw goalError("CHAPTER_CHECKPOINT_CHANGED", `Accepted checkpoint ${step.id} changed or its older receipt has no retained checkpoint content. The receipt was kept without silently resuming it.`);
       }
-    }
+      for (const ref of step.receipt!.artifacts) {
+        const artifact = work.artifacts.find(item => item.id === ref.artifactId);
+        const current = artifact?.revisions.find(item => item.id === artifact.currentRevisionId);
+        const saved = current?.snapshotPath ? await readFile(safeChildPath(join(root, "works", workId), current.snapshotPath)) : undefined;
+        if (current?.id !== ref.revisionId || !saved
+          || !saved.equals(await readFile(safeChildPath(join(root, "works", workId), ref.path)))) {
+          throw goalError("CHAPTER_BASELINE_CHANGED", `Accepted chapter ${step.id} changed. Reconcile the goal baseline before continuing.`);
+        }
+      }
+    }));
+    for (const result of results) if (result.status === "rejected") throw result.reason;
   }
 }
 

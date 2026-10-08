@@ -1,7 +1,9 @@
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it as test, vi } from "vitest";
+import { DrainedTestScope } from "./fixtures/drained-test-scope.js";
+import * as runtimeState from "../state/runtime-state-store.js";
 vi.mock("../codex/client.js", () => ({ createCodexClient: () => { throw new Error("Unexpected model transport in goal fixture."); } }));
 import { GoalStore } from "../goals/store.js";
 import { GoalExecutor } from "../goals/executor.js";
@@ -27,10 +29,21 @@ import {
   loadRuntimeStateSnapshotAtChapter, saveRuntimeStateSnapshot,
 } from "../state/runtime-state-store.js";
 
+let scope: DrainedTestScope;
+beforeEach(({ signal }) => { scope = new DrainedTestScope(signal); });
+function it(name: string, body: () => Promise<void>, timeout?: number) {
+  test(name, () => scope.run(body), timeout);
+}
+function runGoal(executor: GoalExecutor, signal?: AbortSignal) {
+  scope.signal.throwIfAborted();
+  return executor.run("goal", signal ? AbortSignal.any([scope.signal, signal]) : scope.signal);
+}
+
 const roots: string[] = [], stores: Array<GoalStore | PublishingStore | CreativeEpisodeStore> = [];
 afterEach(async () => {
+  await scope.drain();
   vi.restoreAllMocks();
-  for (const store of stores.splice(0)) store.close();
+  for (const store of [...stores]) { store.close(); stores.splice(stores.indexOf(store), 1); }
   await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
 });
 function open(root: string) { const store = new GoalStore(join(root, ".inkos", "harness.sqlite")); stores.push(store); return store; }
@@ -107,12 +120,12 @@ describe("chapter goals with native persistence", () => {
     const controller = new AbortController();
     f.write.mockImplementationOnce(async () => { controller.abort(new Error("connection lost")); throw goalError("MODEL_UNAVAILABLE", "provider unavailable"); });
     f.create(); start(f.store);
-    const first = await new GoalExecutor(f.store, [f.adapter], 0).run("goal", controller.signal);
+    const first = await runGoal(new GoalExecutor(f.store, [f.adapter], 0), controller.signal);
     expect(first.status, JSON.stringify(first.error)).toBe("interrupted"); expect(first.steps.slice(0, 17).every(step => step.status === "completed")).toBe(true);
     expect(f.write.mock.calls.map(([input]) => input.chapterNumber)).toEqual([18]);
     expect(await filesUnder(join(f.bookDir, "chapters"))).toEqual(chapters);
     close(f.store); const reopened = open(f.root); start(reopened);
-    const finished = await new GoalExecutor(reopened, [f.adapter], 0).run("goal");
+    const finished = await runGoal(new GoalExecutor(reopened, [f.adapter], 0));
     expect(finished.status).toBe("completed"); expect(finished.attempts).toBe(2);
     expect(f.write.mock.calls.map(([input]) => input.chapterNumber)).toEqual([18, 18]);
     expect((await f.state.loadChapterIndex("novel")).slice(0, 17)).toEqual(index);
@@ -122,13 +135,61 @@ describe("chapter goals with native persistence", () => {
     expect((await loadRuntimeStateSnapshot(f.bookDir)).manifest.lastAppliedChapter).toBe(18);
   }, 30000);
 
+  for (const earlierFails of [false, true]) it(`settles bounded checkpoint reads before releasing a failed scope, earlier failure=${earlierFails}`, async () => {
+    const f = await setup(5);
+    for (let chapter = 1; chapter <= 5; chapter++) await f.save(chapter);
+    await syncWorkSourceArtifacts({ projectRoot: f.root, workId: "novel", accept: true });
+    f.create(); start(f.store);
+    const lease = f.store.claim("goal")!;
+    try {
+      for (const step of f.store.get("goal").steps) {
+        const context = { goal: f.store.get("goal"), step, signal: scope.signal };
+        const result = await f.adapter.withScope(context, () => f.adapter.reconcile(context));
+        expect(result.status).toBe("completed");
+        if (result.status === "completed") f.store.recordStep(lease, step.id, result);
+      }
+    } finally { f.store.release(lease, "interrupted"); }
+    start(f.store);
+    const loadCheckpoint = runtimeState.loadRuntimeStateSnapshotAtChapter;
+    const checkpoints: number[] = [];
+    let release!: () => void, settled = false;
+    const delayed = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(runtimeState, "loadRuntimeStateSnapshotAtChapter").mockImplementation(async input => {
+      checkpoints.push(input.chapterNumber);
+      if (input.chapterNumber === 1) {
+        await delayed;
+        if (earlierFails) throw goalError("FIXTURE_EARLIER_READ", "The earlier checkpoint failed later.");
+      }
+      if (input.chapterNumber === 2) throw goalError("FIXTURE_LATER_READ", "The later checkpoint failed first.");
+      return loadCheckpoint(input);
+    });
+    const running = runGoal(new GoalExecutor(f.store, [f.adapter], 0));
+    void running.then(() => { settled = true; });
+    try {
+      await vi.waitFor(() => expect(checkpoints).toContain(4));
+      // Chapter 5 is read once for the current state; it must not enter the next batch.
+      expect(checkpoints).toEqual([5, 1, 2, 3, 4]);
+      expect(settled).toBe(false);
+      expect(f.store.get("goal").owner).not.toBeNull();
+      expect(() => f.store.close()).toThrow(/Drain owned work/);
+      expect(await readFile(join(f.bookDir, ".write.lock"), "utf8")).toBeTruthy();
+    } finally { release(); await running; }
+    const result = await running;
+    expect(result.status).toBe("reconciliation_required");
+    expect(result.error?.code).toBe(earlierFails ? "FIXTURE_EARLIER_READ" : "FIXTURE_LATER_READ");
+    expect(result.owner).toBeNull();
+    expect(result.attempts).toBe(0); expect(f.write).not.toHaveBeenCalled();
+    expect(checkpoints).toEqual([5, 1, 2, 3, 4]);
+    await expect(readFile(join(f.bookDir, ".write.lock"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("does not confuse retained prose with settled runtime state", async () => {
     const f = await setup(); await f.save(1);
     await syncWorkSourceArtifacts({ projectRoot: f.root, workId: "novel", accept: true });
     const baseline = await loadRuntimeStateSnapshotAtChapter({ bookDir: f.bookDir, chapterNumber: 0, language: "en" });
     await saveRuntimeStateSnapshot(f.bookDir, baseline);
     f.create(); start(f.store);
-    const result = await new GoalExecutor(f.store, [f.adapter]).run("goal");
+    const result = await runGoal(new GoalExecutor(f.store, [f.adapter]));
     expect(result.status).toBe("reconciliation_required"); expect(result.error?.code).toBe("CHAPTER_STATE_BEHIND");
     expect(f.write).not.toHaveBeenCalled(); expect((await f.state.loadChapterIndex("novel")).map(chapter => chapter.number)).toEqual([1]);
   });
@@ -144,7 +205,7 @@ describe("chapter goals with native persistence", () => {
     await saveRuntimeStateSnapshot(f.bookDir, baseline);
     f.create(); start(f.store);
     const executor = new GoalExecutor(f.store, [f.adapter], 0);
-    expect((await executor.run("goal")).error?.code).toBe("CHAPTER_STATE_BEHIND");
+    expect((await runGoal(executor)).error?.code).toBe("CHAPTER_STATE_BEHIND");
     expect(f.write).not.toHaveBeenCalled();
 
     const settle = vi.fn<StateReplayWorkers["writer"]["settleChapterState"]>(async input => ({
@@ -174,10 +235,10 @@ describe("chapter goals with native persistence", () => {
     const selectedState = stateArtifact.revisions.find(r => r.id === stateArtifact.currentRevisionId)!;
     expect(selectedState.path).toBe("source/story/state/manifest.json");
     expect(await readFile(join(f.root, "works/novel", selectedState.snapshotPath!))).toEqual(stateBytes);
-    expect((await executor.run("goal")).status).toBe("reconciliation_required");
+    expect((await runGoal(executor)).status).toBe("reconciliation_required");
     expect(f.write).not.toHaveBeenCalled(); // Repair alone grants no resume permission.
     start(f.store);
-    expect((await executor.run("goal")).status).toBe("completed");
+    expect((await runGoal(executor)).status).toBe("completed");
     expect(f.write.mock.calls.map(([input]) => input.chapterNumber)).toEqual([2]);
     expect(await readFile(join(f.bookDir, "chapters/0001_Departure_1.md"))).toEqual(beforeBytes);
 
@@ -224,7 +285,7 @@ describe("chapter goals with native persistence", () => {
     const execute = f.adapter.execute;
     f.adapter.execute = async context => { await execute(context); f.store.requestStop("goal", "paused", f.store.get("goal").version); };
     const executor = new GoalExecutor(f.store, [f.adapter], 0);
-    expect((await executor.run("goal")).status).toBe("paused");
+    expect((await runGoal(executor)).status).toBe("paused");
     const accepted = f.store.get("goal").steps[0]!.receipt;
     expect(accepted).not.toBeNull();
     await saveRuntimeStateSnapshot(f.bookDir,
@@ -237,7 +298,7 @@ describe("chapter goals with native persistence", () => {
       } }, validator: { validate: async () => ({ consistent: true, reconciliationRequired: false, observations: [] }) } }) });
     await commitStateReplay({ projectRoot: f.root, plan, expectedPlanId: stateReplayPlanId(plan) });
     f.adapter.execute = execute; start(f.store);
-    const result = await executor.run("goal");
+    const result = await runGoal(executor);
     expect(result.status).toBe("reconciliation_required");
     expect(result.error?.code).toBe("CHAPTER_CHECKPOINT_CHANGED");
     expect(result.steps[0]!.receipt).toEqual(accepted);
@@ -248,11 +309,11 @@ describe("chapter goals with native persistence", () => {
   it("rechecks a repaired Work registry without regenerating saved prose", async () => {
     const f = await setup(1); await f.save(1); f.create(); start(f.store);
     const executor = new GoalExecutor(f.store, [f.adapter]);
-    const pending = await executor.run("goal");
+    const pending = await runGoal(executor);
     expect(pending.error?.code).toBe("CHAPTER_REGISTRY_UNCONFIRMED");
     expect(pending.status).toBe("reconciliation_required");
     await syncWorkSourceArtifacts({ projectRoot: f.root, workId: "novel", accept: true });
-    start(f.store); expect((await executor.run("goal")).status).toBe("completed");
+    start(f.store); expect((await runGoal(executor)).status).toBe("completed");
     expect(f.write).not.toHaveBeenCalled(); expect(f.store.get("goal").attempts).toBe(0);
   });
 
@@ -261,10 +322,10 @@ describe("chapter goals with native persistence", () => {
     await syncWorkSourceArtifacts({ projectRoot: f.root, workId: "novel", accept: true });
     await rm(join(f.bookDir, "story/snapshots/1/state/manifest.json"));
     f.create(); start(f.store);
-    expect((await new GoalExecutor(f.store, [f.adapter]).run("goal")).status).toBe("reconciliation_required");
+    expect((await runGoal(new GoalExecutor(f.store, [f.adapter]))).status).toBe("reconciliation_required");
     await writeFile(join(f.bookDir, "chapters/0002_unindexed.md"), "Retain this draft.");
     start(f.store);
-    expect((await new GoalExecutor(f.store, [f.adapter]).run("goal")).error?.code).toBe("CHAPTER_EXPORT_SOURCE_MISMATCH");
+    expect((await runGoal(new GoalExecutor(f.store, [f.adapter]))).error?.code).toBe("CHAPTER_EXPORT_SOURCE_MISMATCH");
     expect(f.write).not.toHaveBeenCalled();
   });
 
@@ -272,12 +333,12 @@ describe("chapter goals with native persistence", () => {
     const f = await setup(); f.create(); start(f.store);
     const execute = f.adapter.execute;
     f.adapter.execute = async context => { await execute(context); f.store.requestStop("goal", "paused", f.store.get("goal").version); };
-    const paused = await new GoalExecutor(f.store, [f.adapter]).run("goal");
+    const paused = await runGoal(new GoalExecutor(f.store, [f.adapter]));
     expect(paused.status, JSON.stringify(paused.error)).toBe("paused");
     expect(f.write).toHaveBeenCalledTimes(1);
     await writeFile(join(f.bookDir, "chapters/0001_Departure_1.md"), "An author's new revision.");
     f.adapter.execute = execute; start(f.store);
-    const result = await new GoalExecutor(f.store, [f.adapter]).run("goal");
+    const result = await runGoal(new GoalExecutor(f.store, [f.adapter]));
     expect(result.status).toBe("reconciliation_required"); expect(result.error?.code).toBe("CHAPTER_BASELINE_CHANGED");
     expect(f.write).toHaveBeenCalledTimes(1);
   }, 15000);

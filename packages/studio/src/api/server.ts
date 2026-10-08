@@ -4314,8 +4314,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
   studioShutdowns.set(app, async () => {
     studioClosing = true;
     daemonStopRevision++;
+    // No request may reopen its temporary stores while the runtime drains.
+    creationTasks.close();
     try { await daemon.shutdown(); }
-    finally { creationTasks.close(); await Promise.all([...closeEventStreams].map(close => close())); }
+    finally { await Promise.all([...closeEventStreams].map(close => close())); }
   });
 
   app.get("/api/v1/daemon", (c) => c.json(daemon.status()));

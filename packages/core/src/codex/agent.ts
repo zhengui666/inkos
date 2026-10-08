@@ -5,6 +5,7 @@ import { executionTimeoutMs } from "../agent/execution-deadline.js";
 import { isUnboundedWorkerExecution } from "../agent/worker-execution-policy.js";
 import { createCodexClient, type CodexClient } from "./client.js";
 import { readCodexSettings, type CodexSettings } from "./settings.js";
+import { codexModelError, CodexCleanupError, CodexHostError, CodexModelError, CodexTurnIdentityError } from "./provider-error.js";
 import { CodexConfigurationError, readCodexModels, selectCodexModel } from "./account.js";
 import type { AgentEvent, AgentMessage, AgentTool, AgentToolResult, BeforeToolCallContext } from "./contracts.js";
 
@@ -51,9 +52,12 @@ export class Agent {
   private client?: CodexClient;
   private threadId?: string;
   private turnId?: string;
+  private interruptPromise?: Promise<void>;
   private stopping = false;
   /** Only a completed, non-commentary assistant item from a successful turn. */
   finalOutput: string | undefined;
+  /** Native terminal failure, retained without raw provider details for worker consumers. */
+  modelError: CodexModelError | undefined;
 
   constructor(private readonly options: CodexAgentOptions) {
     if (options.maxOutputTokens !== undefined && (!Number.isInteger(options.maxOutputTokens) || options.maxOutputTokens < 1)) {
@@ -108,10 +112,15 @@ export class Agent {
     await this.emit({ type: "message_end", message });
   }
 
-  private async interrupt(): Promise<void> {
-    if (this.client && this.threadId && this.turnId) {
-      await this.client.request("turn/interrupt", { threadId: this.threadId, turnId: this.turnId }, { timeoutMs: 5000 });
-    }
+  private interrupt(): Promise<void> {
+    const client = this.client, threadId = this.threadId, turnId = this.turnId;
+    if (!client || !threadId || !turnId) return Promise.resolve();
+    // Abort listeners, host completion and the start-response continuation can
+    // converge on the same turn. Cache before sending, including synchronous peers.
+    this.interruptPromise ??= Promise.resolve().then(async () => {
+      await client.request("turn/interrupt", { threadId, turnId }, { timeoutMs: 5000 });
+    });
+    return this.interruptPromise;
   }
 
   private async run(newMessages: AgentMessage[]): Promise<void> {
@@ -120,6 +129,7 @@ export class Agent {
     this.controller = controller;
     this.stopping = false;
     this.finalOutput = undefined;
+    this.modelError = undefined;
     const signal = this.options.signal ? AbortSignal.any([controller.signal, this.options.signal]) : controller.signal;
     const startIndex = this.state.messages.length;
     let unsubscribeNotification = () => {};
@@ -129,6 +139,9 @@ export class Agent {
     const activeToolWork = new Set<Promise<unknown>>();
     let idleTimer: ReturnType<typeof setInterval> | undefined;
     let runFailure: unknown;
+    let startRequestPending = false;
+    let queuedFailure: unknown;
+    let unconfirmedModelError: CodexModelError | undefined;
     try {
       signal.throwIfAborted();
       await this.emit({ type: "agent_start" });
@@ -169,6 +182,7 @@ export class Agent {
       // Attach a rejection handler immediately, including before turn/start resolves.
       void done.catch(() => {});
       const fail = (error: unknown) => {
+        if (!signal.aborted || error !== signal.reason) queuedFailure ??= error;
         rejectDone(error);
         if (!controller.signal.aborted) controller.abort(error);
       };
@@ -179,8 +193,12 @@ export class Agent {
       let failedToolCalls = 0;
       let turnFinished = false;
       const activity = (event: string) => { lastActivityAt = Date.now(); lastEvent = event; };
-      const enqueue = <T>(task: () => Promise<T>): Promise<T> => {
-        const work = queue.then(() => { signal.throwIfAborted(); return task(); });
+      const enqueue = <T>(task: () => Promise<T>, inspectBeforeAbort?: () => void): Promise<T> => {
+        const work = queue.then(() => {
+          inspectBeforeAbort?.(); // Read-only protocol validation, never host effects.
+          signal.throwIfAborted();
+          return task();
+        });
         queue = work.then(() => {}, fail);
         return work;
       };
@@ -242,17 +260,50 @@ export class Agent {
         await this.emit({ type: "message_update", message,
           assistantMessageEvent: { type: thinking ? "thinking_delta" : "text_delta", contentIndex: message.content.length - 1, delta, partial: message } });
       };
-      unsubscribeNotification = client.onNotification((method, raw) => {
-        const params = object(raw);
-        if (params.threadId !== this.threadId) return;
-        if (["turn/started", "turn/completed", "item/started", "item/completed", "thread/tokenUsage/updated"].includes(method)
-          || method.endsWith("Delta") && typeof params.delta === "string" && params.delta.length > 0
-          || method === "item/agentMessage/delta" && typeof params.delta === "string" && params.delta.length > 0) activity(method);
-        void enqueue(async () => {
-          if (method === "turn/started") {
-            this.turnId = object(params.turn).id;
-            if (signal.aborted || this.stopping) await this.interrupt();
-          } else if (method === "item/agentMessage/delta") await updateText(params, false);
+      const pendingTerminals: Array<{ method: string; params: Record<string, any> }> = [];
+      const assertTurnIdentity = (id: unknown) => {
+        if (typeof id === "string" && id && this.turnId && this.turnId !== id) {
+          throw new CodexTurnIdentityError(this.modelError);
+        }
+      };
+      const bindTurn = async (id: unknown, authoritative = false) => {
+        if (typeof id !== "string" || !id) return;
+        if (this.turnId && this.turnId !== id) {
+          if (!authoritative) return;
+          assertTurnIdentity(id);
+        }
+        this.turnId = id;
+        const pending = pendingTerminals.splice(0);
+        unconfirmedModelError = undefined;
+        for (const event of pending) {
+          if (signal.aborted) break;
+          await handleNotification(event.method, event.params);
+        }
+      };
+      const handleNotification = async (method: string, params: Record<string, any>) => {
+        if (method === "turn/started") {
+          await bindTurn(object(params.turn).id);
+          if (signal.aborted || this.stopping) await this.interrupt();
+          return;
+        }
+        const turnId = method === "turn/completed" ? object(params.turn).id : params.turnId;
+        const terminal = method === "turn/completed" || method === "error" && params.willRetry === false;
+        if (terminal && !this.turnId) {
+          // A terminal notification can precede the turn/start RPC response.
+          // It cannot cancel/classify an unidentified request as retry-safe.
+          pendingTerminals.push({ method, params });
+          const turn = object(params.turn);
+          if (method === "error" || turn.status === "failed" || typeof object(turn.error).message === "string") {
+            unconfirmedModelError ??= method === "error"
+              ? codexModelError(params.error, { source: "error", willRetry: false }, toolCalls.size, false)
+              : codexModelError(turn.error, { source: "turn/completed", turnStatus: turn.status }, toolCalls.size, false);
+          }
+          return;
+        }
+        // Never let a stale terminal frame replace the current turn's outcome.
+        if (terminal && typeof turnId === "string" && turnId !== this.turnId) return;
+        if (terminal && turnFinished) return;
+          if (method === "item/agentMessage/delta") await updateText(params, false);
           else if (method === "item/reasoning/summaryTextDelta" || method === "item/reasoning/textDelta") await updateText(params, true);
           else if (method === "item/completed") {
             const item = object(params.item);
@@ -277,12 +328,23 @@ export class Agent {
             const turn = object(params.turn);
             finalStatus = turn.status;
             finalError = typeof object(turn.error).message === "string" ? object(turn.error).message : finalError;
+            if (finalStatus === "failed" || finalError) {
+              this.modelError = codexModelError(turn.error, { source: "turn/completed", turnStatus: finalStatus }, toolCalls.size, typeof turnId === "string");
+            }
             resolveDone();
           } else if (method === "error" && params.willRetry === false) {
             finalError = typeof object(params.error).message === "string" ? object(params.error).message : "Codex model request failed";
-            fail(Object.assign(new Error(finalError), { code: "WORKER_MODEL_ERROR", stopReason: "error" }));
+            this.modelError = codexModelError(params.error, { source: "error", willRetry: false }, toolCalls.size, typeof turnId === "string");
+            fail(this.modelError);
           }
-        }).catch(() => {});
+      };
+      unsubscribeNotification = client.onNotification((method, raw) => {
+        const params = object(raw);
+        if (params.threadId !== this.threadId) return;
+        if (["turn/started", "turn/completed", "item/started", "item/completed", "thread/tokenUsage/updated"].includes(method)
+          || method.endsWith("Delta") && typeof params.delta === "string" && params.delta.length > 0
+          || method === "item/agentMessage/delta" && typeof params.delta === "string" && params.delta.length > 0) activity(method);
+        void enqueue(() => handleNotification(method, params)).catch(() => {});
       });
       unsubscribeRequest = client.onRequest((method, raw) => {
         const params = object(raw);
@@ -292,7 +354,11 @@ export class Agent {
         if (previous) return previous;
         const task = enqueue(async () => {
           signal.throwIfAborted();
-          if (this.stopping || this.options.shouldStop?.()) return { success: false, contentItems: [{ type: "inputText", text: "The host has already completed this turn. Do not execute more tools." }] };
+          // Ownership is checked in queue order, after any earlier start-response binding.
+          if (this.turnId && typeof params.turnId === "string" && params.turnId !== this.turnId) {
+            return { success: false, contentItems: [{ type: "inputText", text: "Tool request does not match the active turn." }] };
+          }
+          if (turnFinished || this.stopping || this.options.shouldStop?.()) return { success: false, contentItems: [{ type: "inputText", text: "The host has already completed this turn. Do not execute more tools." }] };
           this.checkOutputBudget(JSON.stringify(params.arguments) ?? "");
           await flushText();
           // A pre-tool message is not the final result of the whole turn.
@@ -327,6 +393,7 @@ export class Agent {
         fail(Object.assign(new Error(`Codex stopped reporting progress while awaiting the model (${idleTimeoutMs}ms; last event: ${lastEvent}; failed tools: ${failedToolCalls}). Saved results are retained.`),
           { code: "AGENT_MODEL_STALLED", idleTimeoutMs, lastEvent, failedToolCalls }));
       }, Math.min(idleTimeoutMs, 1000));
+      startRequestPending = true;
       const start = object(await client.request("turn/start", {
         threadId: this.threadId, input: encodeContext(context), environments: [],
         ...(this.options.outputSchema ? { outputSchema: this.options.outputSchema } : {}),
@@ -336,7 +403,12 @@ export class Agent {
         // that default rather than merely clearing the sticky thread setting.
         serviceTierForTurn: selected.serviceTier ?? "default",
       }, { signal }));
-      this.turnId = object(start.turn).id ?? this.turnId;
+      startRequestPending = false;
+      // Register inspection and binding as one queue operation so later frames
+      // cannot overtake this response. Identity validation remains read-only after
+      // abort; binding and buffered effects still require the same abort guard.
+      await enqueue(() => bindTurn(object(start.turn).id, true),
+        () => assertTurnIdentity(object(start.turn).id));
       if (signal.aborted || this.stopping) await this.interrupt();
       await done;
       await queue;
@@ -352,7 +424,22 @@ export class Agent {
       await flushText();
       await this.emit({ type: "turn_end", message: last, toolResults });
       await this.emit({ type: "agent_end", messages: this.state.messages.slice(startIndex) });
-    } catch (error) { runFailure = error; throw error; }
+    } catch (error) {
+      // A late start-RPC cancellation/deadline must not replace a retained native
+      // failure. Unbound terminal frames remain explicitly nonretryable. Preserve
+      // explicit caller cancellation, and keep provider provenance for cleanup.
+      this.modelError ??= unconfirmedModelError;
+      const callerCancelled = this.options.signal?.aborted
+        && (this.options.signal.reason as { code?: unknown })?.code !== "WORKER_TIMEOUT";
+      const interruptedTransport = signal.aborted && (startRequestPending || error === signal.reason);
+      const hostFailure = queuedFailure !== undefined && !(queuedFailure instanceof CodexModelError) ? queuedFailure
+        : !interruptedTransport && error !== this.modelError ? error : undefined;
+      runFailure = callerCancelled ? this.options.signal!.reason ?? error
+        : error instanceof CodexTurnIdentityError ? error
+        : this.modelError && hostFailure !== undefined ? new CodexHostError(hostFailure, this.modelError)
+          : interruptedTransport ? this.modelError ?? error : error;
+      throw runFailure;
+    }
     finally {
       // Terminate the peer and signal host work before returning, including on
       // persistence failures. Never let queued mutations outlive their episode.
@@ -364,8 +451,9 @@ export class Agent {
       unsubscribeClose();
       try { await this.client?.close(); }
       catch (cleanupError) {
-        if (runFailure instanceof Error) Object.assign(runFailure, { cleanupError });
-        else throw cleanupError;
+        // Includes failed turn/completed, which returns a failed assistant
+        // message rather than throwing. Never retry an unconfirmed peer close.
+        throw new CodexCleanupError(runFailure, cleanupError, this.modelError);
       }
       finally {
         // Never release execution ownership while a host mutation is still alive.
@@ -373,6 +461,7 @@ export class Agent {
         this.client = undefined;
         this.threadId = undefined;
         this.turnId = undefined;
+        this.interruptPromise = undefined;
         this.controller = undefined;
       }
     }
