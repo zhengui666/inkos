@@ -92,6 +92,9 @@ export class CreationTaskCoordinator {
   async prepare(taskId: string, signal: AbortSignal): Promise<void> {
     let task = this.tasks.get(taskId);
     if (task.desiredState !== 'run' || task.phase === 'completed' || task.foundation === 'blocked' || task.nextAttemptAt > Date.now()) return;
+    // Book settings and task controls are independent user-owned pauses. A
+    // retained task's old run marker must not restart a currently paused book.
+    if (!await this.bookAllowsFoundation(task.workId)) return;
     if (!task.plan.platform) {
       this.saveIfChanged(task.id, { phase: 'blocked', error: { code: 'CREATION_PLATFORM_REQUIRED', message: 'Set the platform in this task’s plan before writing. Your language and finite length are already filled in.' } });
       return;
@@ -121,6 +124,10 @@ export class CreationTaskCoordinator {
       const profile = createBuiltInWorkProfileRegistry(this.root).require('longform-novel');
       const skills = resolveProfileSkillActivations((await loadAvailableAgentSkills({ projectRoot: this.root })).skills, profile);
       await withExecutionEvidence(undefined, () => this.pipeline.runWithAgentContext({ signal, activatedSkills: skills }, async () => {
+        signal.throwIfAborted();
+        // Async profile/skill reads must not carry stale controls into a model call.
+        if (!await this.bookAllowsFoundation(task.workId) || this.tasks.get(task.id).desiredState !== 'run') return;
+        signal.throwIfAborted();
         if (task.planStatus !== 'ready') {
           const proposed = await new CreationPlannerAgent(this.pipeline.createAgentContext('architect')).plan(task.request, task.plan);
           signal.throwIfAborted();
@@ -129,7 +136,9 @@ export class CreationTaskCoordinator {
             endingIntent: proposed.endingIntent, planSummary: proposed.summary }));
         }
         signal.throwIfAborted();
-        if (this.tasks.get(task.id).desiredState !== 'run') return;
+        // The author may pause the book while the planner is in flight.
+        if (!await this.bookAllowsFoundation(task.workId) || this.tasks.get(task.id).desiredState !== 'run') return;
+        signal.throwIfAborted();
         await this.pipeline.initBook(creationBook(task), { externalContext: creationInstruction(task), authorIntent: creationInstruction(task) });
       }), profile, null, task.request.brief);
       if (await this.state.isCompleteBookDirectory(this.state.bookDir(task.workId))) this.tasks.update(task.id, current => ({ ...current, foundation: 'completed', phase: 'writing', error: undefined }));
@@ -142,6 +151,17 @@ export class CreationTaskCoordinator {
         foundationTransientFailures: transientFailures, foundationFailures,
         nextAttemptAt: Date.now() + Math.min(3_600_000, Math.max(1000, this.retryDelayMs) * 2 ** Math.min(task.foundationAttempts - 1, 10)),
         error: signal.aborted ? undefined : { code: (error as { code?: string }).code ?? 'CREATION_FOUNDATION_FAILED', message: String(error) } }));
+    }
+  }
+  private async bookAllowsFoundation(workId: string): Promise<boolean> {
+    try {
+      const book = await this.state.loadBookConfig(workId);
+      return ['active', 'outlining'].includes(book.status);
+    } catch (error) {
+      // New tasks and the retained manifest-before-book.json crash window have
+      // no book-level control yet. Other read/validation failures stay closed.
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+      throw error;
     }
   }
   async applyPlan(task: CreationTask): Promise<void> {
