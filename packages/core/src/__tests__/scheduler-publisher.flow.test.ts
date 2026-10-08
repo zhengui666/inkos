@@ -22,6 +22,64 @@ const signal=()=>new AbortController().signal;
 beforeEach(async()=>{root=await mkdtemp(join(tmpdir(),'inkos-publisher-bridge-'));state=new StateManager(root);const now=new Date().toISOString();await state.saveBookConfig('book',{id:'book',title:'Novel',platform:'meganovel',genre:'fantasy',status:'active',targetChapters:24,chapterWordCount:2000,language:'en',createdAt:now,updatedAt:now});await state.saveChapterIndex('book',[{number:1,title:'Scene',wordCount:3,provenance:'generated',observations:[],createdAt:now,updatedAt:now}]);await syncWorkSourceArtifacts({projectRoot:root,workId:'book',accept:true,writes:[{relativePath:sourcePath,content}]});store=new PublishingStore(join(root,'.inkos/harness.sqlite'));packages=new ManualPublishingAdapter(root,store);targetId=(await packages.mapBook({workId:'book',platform:'meganovel',accountLabel:scope.accountLabel,remoteBookId:scope.remoteBookId})).id;revisionId=(await currentRevision()).revisionId;snapshot={scope,origin:'https://www.meganovel.com',blocker:'none',chapterNumber:1,complete:true,candidates:[]};browser={probe:vi.fn(async()=>({scope,origin:'https://www.meganovel.com' as const,blocker:'none' as const})),snapshot:vi.fn(async()=>structuredClone(snapshot)),createDraft:vi.fn(async input=>{snapshot.candidates=[{remoteChapterId:'remote-1',number:1,title:input.title,content:input.content,status:'draft',aiDisclosure:'declared_ai',evidence:'Synthetic reopened detail'}];}),submit:vi.fn(async()=>{snapshot.candidates[0].status='reviewing';})};});
 afterEach(async()=>{vi.restoreAllMocks();await publisher?.close();publisher=undefined;store.close();await rm(root,{recursive:true,force:true});});
 describe('scheduler publishing wrapper with retained real packages and synthetic remote port',()=>{
+ it.each(['submitted', 'reviewing', 'published', 'rejected'] as const)(
+  'blocks new writing when previously observed %s history disappears and recovers only through matching readback', async status => {
+  const p = configure(2);
+  snapshot.candidates = [{remoteChapterId:'remote-1',number:1,title:'Scene',content,status,
+   aiDisclosure:'declared_ai',evidence:'Synthetic independently reopened chapter detail'}];
+  if (status === 'published') await expect(p.ready('book', signal())).resolves.toBeUndefined();
+  else await expect(p.ready('book', signal())).rejects.toMatchObject({code:'PUBLISHING_HISTORY_PENDING'});
+  const pkg = store.listPackages(targetId)[0];
+  const retained = store.getMegaNovelRun(pkg.manifest.id, 1);
+  await p.close(); publisher = undefined;
+  const reopened = configure(2);
+  snapshot.candidates = [];
+  for (let attempt = 0; attempt < 2; attempt++) {
+   await expect(reopened.ready('book', signal())).rejects.toMatchObject({code:'MEGANOVEL_READBACK_REQUIRED'});
+   await expect(reopened.reconcile!({workId:'book',chapterNumber:1,signal:signal()}))
+    .rejects.toMatchObject({code:'MEGANOVEL_READBACK_REQUIRED'});
+   await expect(reopened.publish({workId:'book',chapterNumber:1,revisionId,
+    reviewInputs:await readChapterReviewInputs(state.bookDir('book'),1),signal:signal()}))
+    .rejects.toMatchObject({code:'MEGANOVEL_READBACK_REQUIRED'});
+   expect(store.getMegaNovelRun(pkg.manifest.id, 1)).toEqual(retained);
+   expect(store.listPackages(targetId)).toEqual([pkg]);
+  }
+  for (const conflict of [{remoteChapterId:'other-id'}, {content:'different body'}]) {
+   snapshot.candidates = [{remoteChapterId:'remote-1',number:1,title:'Scene',content,status,
+    aiDisclosure:'declared_ai',evidence:'Synthetic conflicting detail',...conflict}];
+   await expect(reopened.ready('book', signal())).rejects.toMatchObject({code:'MEGANOVEL_CONTENT_CONFLICT'});
+   expect(store.getMegaNovelRun(pkg.manifest.id, 1)).toEqual(retained);
+  }
+  const evidence = 'Synthetic independently reopened matching detail';
+  snapshot.candidates = [{remoteChapterId:'remote-1',number:1,title:'Scene',content,status,aiDisclosure:'declared_ai',evidence}];
+  if (status === 'published') await expect(reopened.ready('book', signal())).resolves.toBeUndefined();
+  else await expect(reopened.ready('book', signal())).rejects.toMatchObject({code:'PUBLISHING_HISTORY_PENDING'});
+  expect(store.getMegaNovelRun(pkg.manifest.id, 1)).toEqual({...retained,evidence});
+  expect(store.listPackages(targetId)).toHaveLength(1);
+  expect(browser.createDraft).not.toHaveBeenCalled();
+  expect(browser.submit).not.toHaveBeenCalled();
+ });
+ it('does not repeat a completed draft or submission when published readback disappears above the history boundary', async () => {
+  const p = configure(1);
+  const input = {workId:'book',chapterNumber:1,revisionId,
+   reviewInputs:await readChapterReviewInputs(state.bookDir('book'),1),signal:signal()};
+  await p.publish(input);
+  snapshot.candidates[0].status = 'published';
+  expect((await p.publish(input)).status).toBe('published');
+  const observed = structuredClone(snapshot.candidates);
+  const pkg = store.listPackages(targetId)[0];
+  const retained = store.getMegaNovelRun(pkg.manifest.id, 1);
+  snapshot.candidates = [];
+  await expect(p.ready('book', signal())).rejects.toMatchObject({code:'MEGANOVEL_READBACK_REQUIRED'});
+  await expect(p.publish(input)).rejects.toMatchObject({code:'MEGANOVEL_READBACK_REQUIRED'});
+  expect(store.getMegaNovelRun(pkg.manifest.id, 1)).toEqual(retained);
+  expect(store.listPackages(targetId)).toEqual([pkg]);
+  snapshot.candidates = observed;
+  await expect(p.ready('book', signal())).resolves.toBeUndefined();
+  expect((await p.publish(input)).status).toBe('published');
+  expect(browser.createDraft).toHaveBeenCalledOnce();
+  expect(browser.submit).toHaveBeenCalledOnce();
+ });
  it('freezes TXT, sends once, and distinguishes review from publication across invocations',async()=>{const p=configure();await p.ready('book',signal());expect((await p.publish({workId:'book',chapterNumber:1,revisionId,reviewInputs:await readChapterReviewInputs(state.bookDir("book"),1),signal:signal()})).status).toBe('submitted');expect(store.listPackages(targetId)[0].manifest.formats).toEqual(['txt']);snapshot.candidates[0].status='published';expect((await p.publish({workId:'book',chapterNumber:1,revisionId,reviewInputs:await readChapterReviewInputs(state.bookDir("book"),1),signal:signal()})).status).toBe('published');expect(browser.createDraft).toHaveBeenCalledOnce();expect(browser.submit).toHaveBeenCalledOnce();});
  it('keeps an unknown submission across wrapper recreation without resending',async()=>{browser.submit=vi.fn(async()=>{throw new Error('response lost');});let p=configure();expect((await p.publish({workId:'book',chapterNumber:1,revisionId,reviewInputs:await readChapterReviewInputs(state.bookDir("book"),1),signal:signal()})).status).toBe('pending');await p.close();publisher=undefined;p=configure();await p.publish({workId:'book',chapterNumber:1,revisionId,reviewInputs:await readChapterReviewInputs(state.bookDir("book"),1),signal:signal()});expect(browser.createDraft).toHaveBeenCalledOnce();expect(browser.submit).toHaveBeenCalledOnce();});
  it('historical chapters are readback-only even when no remote row is visible',async()=>{const p=configure(2);await expect(p.ready('book',signal())).rejects.toMatchObject({code:'PUBLISHING_HISTORY_PENDING'});expect(browser.createDraft).not.toHaveBeenCalled();expect(browser.submit).not.toHaveBeenCalled();const pkg=store.listPackages(targetId)[0];expect(store.getMegaNovelRun(pkg.manifest.id,1)?.phase).toBe('draft_unknown');snapshot.candidates=[{remoteChapterId:'remote-1',number:1,title:'Scene',content,status:'published',aiDisclosure:'declared_ai',evidence:'Synthetic independently reopened published detail'}];await expect(p.ready('book',signal())).resolves.toBeUndefined();expect(browser.createDraft).not.toHaveBeenCalled();});

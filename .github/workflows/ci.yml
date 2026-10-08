@@ -27,6 +27,8 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: pnpm
 
+      - name: Verify installed-package workflow gates
+        run: node --test scripts/installed-gates-workflow.test.mjs
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: pnpm typecheck
@@ -39,6 +41,63 @@ jobs:
         env:
           INKOS_CODEX_INTEGRATION: '1'
         run: pnpm --filter @actalk/inkos-core exec vitest run src/codex/__tests__/isolation.integration.test.ts src/codex/__tests__/worker-output.integration.test.ts src/codex/__tests__/code-mode.integration.test.ts src/codex/__tests__/main-completion.integration.test.ts src/codex/__tests__/research-discovery.integration.test.ts src/codex/__tests__/native-compaction.integration.test.ts
+
+  installed-package-smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Install all three local tarballs in a clean directory
+        id: installed-package
+        run: |
+          set -euo pipefail
+          INSTALLED_ROOT=$(mktemp -d "$RUNNER_TEMP/inkos-installed.XXXXXX")
+          PACK_DIR=$(mktemp -d "$RUNNER_TEMP/inkos-pack.XXXXXX")
+          INSTALLED_EVIDENCE_DIR=$(mktemp -d "$RUNNER_TEMP/inkos-evidence.XXXXXX")
+          echo "INSTALLED_ROOT=$INSTALLED_ROOT" >> "$GITHUB_ENV"
+          echo "INSTALLED_EVIDENCE_DIR=$INSTALLED_EVIDENCE_DIR" >> "$GITHUB_ENV"
+          EXPECTED_VERSION=$(node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          const versions = ['core', 'studio', 'cli'].map(pkg => JSON.parse(readFileSync(`packages/${pkg}/package.json`, 'utf8')).version);
+          if (!versions[0] || !versions.every(version => version === versions[0])) throw new Error('Publishable package versions must match');
+          console.log(versions[0]);
+          NODE
+          )
+          echo "EXPECTED_VERSION=$EXPECTED_VERSION" >> "$GITHUB_ENV"
+          for pkg in core studio cli; do
+            (cd "packages/$pkg" && npm pack --pack-destination "$PACK_DIR")
+          done
+          CORE_TGZ="$PACK_DIR/actalk-inkos-core-$EXPECTED_VERSION.tgz"
+          STUDIO_TGZ="$PACK_DIR/actalk-inkos-studio-$EXPECTED_VERSION.tgz"
+          CLI_TGZ="$PACK_DIR/actalk-inkos-$EXPECTED_VERSION.tgz"
+          test -f "$CORE_TGZ" && test -f "$STUDIO_TGZ" && test -f "$CLI_TGZ"
+          cd "$INSTALLED_ROOT"
+          npm init -y
+          npm install --no-audit --no-fund "$CORE_TGZ" "$STUDIO_TGZ" "$CLI_TGZ"
+      - name: Verify exact installed package versions and CLI
+        if: ${{ !cancelled() && steps.installed-package.outcome == 'success' }}
+        run: node scripts/verify-installed-release.mjs --root "$INSTALLED_ROOT" --version "$EXPECTED_VERSION" --output "$INSTALLED_EVIDENCE_DIR/release.json"
+      - name: Verify installed Studio without model calls or accounts
+        if: ${{ !cancelled() && steps.installed-package.outcome == 'success' }}
+        run: node scripts/verify-installed-studio.mjs --root "$INSTALLED_ROOT" --output "$INSTALLED_EVIDENCE_DIR/studio.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: installed-package-smoke-node-${{ matrix.node-version }}
+          path: ${{ runner.temp }}/inkos-evidence.*/*.json
+          retention-days: 7
 
   codex-browser:
     runs-on: ubuntu-latest
