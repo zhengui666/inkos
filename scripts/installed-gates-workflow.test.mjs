@@ -5,8 +5,13 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 
-const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
-const release = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
+// Windows checkouts may use CRLF. Normalize before parsing or mutation matching.
+function normalizeWorkflow(source) {
+  return source.replace(/\r\n/g, '\n');
+}
+
+const ci = normalizeWorkflow(readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8'));
+const release = normalizeWorkflow(readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8'));
 const gateCondition = "${{ !cancelled() && steps.installed-package.outcome == 'success' }}";
 const finalCondition = "${{ !contains(github.ref_name, '-') }}";
 
@@ -119,6 +124,22 @@ function assertDependencies(source) {
   }
 }
 
+test('LF and CRLF workflow inputs have identical static contracts', () => {
+  for (const [source, names] of [
+    [ci, ['installed-package-smoke']],
+    [release, ['smoke-test', 'verify-canary', 'verify-release']],
+  ]) {
+    const crlf = source.replace(/\n/g, '\r\n');
+    assert.notEqual(crlf, source);
+    assert.equal(normalizeWorkflow(source), source);
+    const normalized = normalizeWorkflow(crlf);
+    assert.equal(normalized, source);
+    for (const name of names) assertGates(normalized, name);
+    assertLocalInstall(normalized, names[0]);
+    if (source === release) assertDependencies(normalized);
+  }
+});
+
 for (const [source, name] of [[ci, 'installed-package-smoke'], [release, 'smoke-test'], [release, 'verify-canary'], [release, 'verify-release']]) {
   test(`${name} runs both installed checks as blocking gates and always uploads evidence`, () => assertGates(source, name));
 }
@@ -197,9 +218,14 @@ for (const [label, mutate, check] of [
   ['registry fallback for local package', text => text.replace('"$CORE_TGZ" "$STUDIO_TGZ" "$CLI_TGZ"', '"$CORE_TGZ" "$STUDIO_TGZ" "@actalk/inkos@latest"'), text => assertLocalInstall(text, 'smoke-test')],
 ]) {
   test(`static contract rejects ${label}`, () => {
-    const changed = mutate(release);
-    assert.notEqual(changed, release);
-    assert.throws(() => check(changed));
+    for (const newline of ['\n', '\r\n']) {
+      const source = normalizeWorkflow(release.replace(/\n/g, newline));
+      assert.equal(source, release);
+      check(source);
+      const changed = mutate(source);
+      assert.notEqual(changed, source);
+      assert.throws(() => check(changed), { code: 'ERR_ASSERTION' });
+    }
   });
 }
 
