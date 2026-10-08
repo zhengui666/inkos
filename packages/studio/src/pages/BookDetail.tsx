@@ -1,3 +1,4 @@
+import { reviewIssueCount } from "../lib/review-status";
 import { fetchJson, useApi, postApi } from "../hooks/use-api";
 import { useEffect, useMemo, useState } from "react";
 import type { Theme } from "../hooks/use-theme";
@@ -483,9 +484,9 @@ export function BookDetail({
                   </td>
                   <td className="px-6 py-4 text-muted-foreground font-medium tabular-nums text-xs">{(ch.wordCount ?? 0).toLocaleString()}</td>
                   <td className="px-6 py-4">
-                    <div className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-tight ${ch.observations.length > 0 ? "text-amber-600 bg-amber-500/10" : "text-emerald-600 bg-emerald-500/10"}`}>
-                      {ch.observations.length > 0
-                        ? `${ch.observations.length} ${t("book.observations")}`
+                    <div className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-tight ${reviewIssueCount(ch.observations) > 0 ? "text-amber-600 bg-amber-500/10" : "text-emerald-600 bg-emerald-500/10"}`}>
+                      {reviewIssueCount(ch.observations) > 0
+                        ? `${reviewIssueCount(ch.observations)} ${t("book.observations")}`
                         : t("book.currentRevision")}
                     </div>
                   </td>

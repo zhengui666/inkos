@@ -201,6 +201,15 @@ export class PublishingStore {
         .get(pkg.manifest.target.id, remoteId, input.packageId, input.chapterNumber)) {
         throw publishingError('PUBLISHING_CHAPTER_MAPPING_CONFLICT', 'This remote chapter is already mapped to a different local chapter.');
       }
+      if (remoteId && this.db.prepare(`SELECT r.package_id FROM (
+        SELECT package_id,number,run_json FROM publishing_fanqie_runs
+        UNION ALL SELECT package_id,number,run_json FROM publishing_meganovel_runs
+        ) r JOIN publishing_packages p ON p.id=r.package_id
+        WHERE p.target_id=? AND json_extract(r.run_json,'$.remoteChapterId')=?
+          AND NOT (r.package_id=? AND r.number=?)`)
+        .get(pkg.manifest.target.id, remoteId, input.packageId, input.chapterNumber)) {
+        throw publishingError('PUBLISHING_CHAPTER_MAPPING_CONFLICT', 'This remote chapter ID already belongs to a browser-observed local chapter.');
+      }
       this.db.prepare("UPDATE publishing_chapters SET status=?,remote_chapter_id=?,evidence=?,provenance='user_reported' WHERE package_id=? AND number=?")
         .run(receipt.status, remoteId, receipt.evidence, input.packageId, input.chapterNumber);
     });
@@ -242,6 +251,19 @@ export class PublishingStore {
             throw publishingError('FANQIE_RUN_CONFLICT', 'Cannot change the session, declaration, content, remote identity or schedule of this run.');
           }
           if (!fanqieTransitions[existing.phase].includes(run.phase)) throw publishingError('FANQIE_RUN_CONFLICT', 'Cannot reset a possibly submitted chapter to allow another write.');
+        }
+        if (run.remoteChapterId) {
+          const otherRuns = this.db.prepare(`SELECT run_json FROM publishing_fanqie_runs
+            WHERE account_id=? AND remote_book_id=? AND NOT (package_id=? AND number=?)`)
+            .all(run.scope.accountId, run.scope.remoteBookId, run.packageId, run.chapterNumber);
+          const browserConflict = otherRuns.some(row =>
+            FanqieRunSchema.parse(JSON.parse(String(row.run_json))).remoteChapterId === run.remoteChapterId);
+          const manualConflict = this.db.prepare(`SELECT c.package_id FROM publishing_chapters c
+            JOIN publishing_packages p ON p.id=c.package_id
+            WHERE p.target_id=? AND c.remote_chapter_id=?
+              AND NOT (c.package_id=? AND c.number=?)`)
+            .get(target.id, run.remoteChapterId, run.packageId, run.chapterNumber);
+          if (browserConflict || manualConflict) throw publishingError('PUBLISHING_CHAPTER_MAPPING_CONFLICT', 'This remote chapter ID already belongs to another local chapter.');
         }
         this.db.prepare('INSERT INTO publishing_fanqie_runs VALUES (?,?,?,?,?) ON CONFLICT(package_id,number) DO UPDATE SET run_json=excluded.run_json')
           .run(run.packageId, run.chapterNumber, run.scope.accountId, run.scope.remoteBookId, JSON.stringify(run));

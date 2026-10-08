@@ -1,4 +1,5 @@
 import { Agent } from "../codex/agent.js";
+import { CodexCleanupError, CodexHostError, CodexModelError, CodexTurnIdentityError } from "../codex/provider-error.js";
 import type { AgentTool, AgentToolResult } from "../codex/contracts.js";
 import type { Api, AssistantMessage, Message, Model } from "@mariozechner/pi-ai";
 import type { Static, TSchema } from "@sinclair/typebox";
@@ -14,15 +15,16 @@ import { recordExecutionEvidence } from "../harness/execution-evidence.js";
 import { decodeWorkerOutput, workerOutputSchema } from "./worker-output.js";
 import { decodeStructuredFields } from "./structured-arguments.js";
 import { preserveToolArgumentTypes, toolArgumentIssues } from "./tool-arguments.js";
+import { isUnboundedWorkerExecution } from "./worker-execution-policy.js";
 
 export interface WorkerAgentOptions {
   /** Resolve the same persisted Codex account/model settings as the parent workflow. */
   readonly projectRoot?: string;
-  /** Total worker deadline, including correction turns; overrides INKOS_WORKER_TIMEOUT_MS (default: one hour). */
+  /** Outside unbounded creation scopes: total deadline including corrections; overrides INKOS_WORKER_TIMEOUT_MS (default: one hour). */
   readonly timeoutMs?: number;
   /** @deprecated Codex controls sampling; retained for source compatibility and not sent. */
   readonly temperature?: number;
-  /** Estimated visible output/tool-argument limit enforced by InkOS before acceptance. */
+  /** Outside unbounded creation scopes: estimated visible output/tool-argument limit enforced before acceptance. */
   readonly maxTokens?: number;
   /** @deprecated Worker native web tools are disabled; use the host research capability. */
   readonly webSearch?: boolean;
@@ -75,16 +77,34 @@ function lastAssistant(messages: ReadonlyArray<Message>): AssistantMessage | und
   return [...messages].reverse().find((message): message is AssistantMessage => message.role === "assistant");
 }
 
-function modelFailure(message: AssistantMessage | undefined): (Error & { code: string }) | undefined {
+function modelFailure(message: AssistantMessage | undefined, nativeError?: Error & { code: string }): (Error & { code: string }) | undefined {
   if (!message) return;
   if (message.stopReason === "length") {
     return Object.assign(new Error("Worker output reached the configured model output limit"), { code: "MODEL_OUTPUT_LIMIT" });
   }
+  if (message.stopReason === "error" && nativeError) return nativeError;
   if (message.stopReason === "error" || message.stopReason === "aborted") {
     return Object.assign(new Error(message.errorMessage ?? `Worker Agent stopped: ${message.stopReason}`), {
       code: (message as AssistantMessage & { errorCode?: string }).errorCode ?? "WORKER_MODEL_ERROR",
     });
   }
+}
+
+class WorkerResultUncertainError extends Error {
+  readonly code = "WORKER_MODEL_ERROR";
+  constructor(failure: CodexModelError, readonly resultTool: string, readonly attempts: number) {
+    super(failure.message, { cause: failure });
+    this.name = "WorkerResultUncertainError";
+  }
+}
+
+function throwIfWorkerAborted(signal?: AbortSignal, failure?: unknown): void {
+  if (failure instanceof CodexCleanupError || failure instanceof CodexHostError) return;
+  // A late deadline cannot replace a retained native failure, including an
+  // unconfirmed turn or uncertain tool outcome. Explicit caller cancellation wins.
+  if ((failure instanceof CodexModelError || failure instanceof CodexTurnIdentityError || failure instanceof WorkerResultUncertainError)
+    && signal?.aborted && (signal.reason as { code?: unknown })?.code === "WORKER_TIMEOUT") return;
+  signal?.throwIfAborted();
 }
 
 function watchWorker(agent: Agent, options: WorkerAgentOptions, resultTool?: string): () => void {
@@ -121,7 +141,7 @@ async function runTextWorker(
   const agent = new Agent({
     projectRoot: options.projectRoot ?? client._codex?.projectRoot ?? process.cwd(),
     signal: options.signal,
-    maxOutputTokens: options.maxTokens ?? client.defaults?.maxTokens ?? 32_768,
+    ...(isUnboundedWorkerExecution() ? {} : { maxOutputTokens: options.maxTokens ?? client.defaults?.maxTokens ?? 32_768 }),
     ...(client._codex?.settings ? { settings: client._codex.settings } : {}),
     initialState: {
       model,
@@ -134,11 +154,11 @@ async function runTextWorker(
   try {
     options.signal?.throwIfAborted();
     await agent.prompt(promptMessages);
-    options.signal?.throwIfAborted();
+    throwIfWorkerAborted(options.signal, agent.modelError);
     const responseMessages = agent.state.messages.slice(promptMessages.length);
     const final = lastAssistant(responseMessages);
     if (!final) throw new Error("Worker Agent completed without an assistant response");
-    const failure = modelFailure(final);
+    const failure = modelFailure(final, agent.modelError);
     if (failure) throw failure;
     const usage = usageFrom(responseMessages);
     options.onUsage?.(usage);
@@ -147,7 +167,7 @@ async function runTextWorker(
       usage,
     };
   } catch (error) {
-    options.signal?.throwIfAborted();
+    throwIfWorkerAborted(options.signal, error);
     throw error;
   } finally {
     stopWatching();
@@ -172,6 +192,11 @@ async function runStructuredWorker<TParameters extends TSchema>(
   let resultAttempts = 0;
   let lastValidationError: (Error & { code?: string }) | undefined;
   const exhausted = () => resultAttempts >= MAX_RESULT_ATTEMPTS || modelTurns >= MAX_RESULT_ATTEMPTS;
+  // Result validation can persist candidates and spans all correction turns,
+  // including outputSchema validation outside the native Agent tool loop.
+  const preserveAttemptOutcome = (failure: unknown) => failure instanceof CodexModelError
+    && failure.code !== "WORKER_MODEL_ERROR" && resultAttempts > 0
+    ? new WorkerResultUncertainError(failure, resultTool.name, resultAttempts) : failure;
   const { validate, ...toolDefinition } = resultTool;
   const tool: AgentTool<TParameters, Static<TParameters>> = {
     ...toolDefinition,
@@ -217,7 +242,7 @@ async function runStructuredWorker<TParameters extends TSchema>(
   const agent = new Agent({
     projectRoot: options.projectRoot ?? client._codex?.projectRoot ?? process.cwd(),
     signal: options.signal,
-    maxOutputTokens: options.maxTokens ?? client.defaults?.maxTokens ?? 32_768,
+    ...(isUnboundedWorkerExecution() ? {} : { maxOutputTokens: options.maxTokens ?? client.defaults?.maxTokens ?? 32_768 }),
     ...(client._codex?.settings ? { settings: client._codex.settings } : {}),
     initialState: {
       model,
@@ -243,8 +268,8 @@ async function runStructuredWorker<TParameters extends TSchema>(
     options.signal?.throwIfAborted();
     await agent.prompt(promptMessages);
     const acceptFinalOutput = async () => {
-      options.signal?.throwIfAborted();
-      const failure = modelFailure(lastAssistant(agent.state.messages));
+      const failure = preserveAttemptOutcome(modelFailure(lastAssistant(agent.state.messages), agent.modelError));
+      throwIfWorkerAborted(options.signal, failure);
       if (failure) throw Object.assign(failure, { resultTool: resultTool.name, attempts: Math.max(modelTurns, resultAttempts) });
       if (hasSubmitted || resultAttempts >= MAX_RESULT_ATTEMPTS || !agent.finalOutput?.trim()) return;
       try {
@@ -265,7 +290,7 @@ async function runStructuredWorker<TParameters extends TSchema>(
     }
     if (!hasSubmitted) {
       const last = lastAssistant(agent.state.messages);
-      const failure = modelFailure(last) ?? lastValidationError;
+      const failure = modelFailure(last, agent.modelError) ?? lastValidationError;
       const rejectedTools = agent.state.messages.filter(message => message.role === "toolResult" && message.isError).length;
       throw Object.assign(new Error(failure?.message ?? `Worker completed without a valid ${resultTool.name} result (model turns: ${modelTurns}; submissions: ${resultAttempts}; rejected tools: ${rejectedTools})`), {
         code: failure?.code ?? (resultAttempts > 0 ? "WORKER_RESULT_INVALID" : "WORKER_RESULT_MISSING"),
@@ -280,14 +305,18 @@ async function runStructuredWorker<TParameters extends TSchema>(
     options.onUsage?.(usageFrom(agent.state.messages));
     return submitted!;
   } catch (error) {
-    options.signal?.throwIfAborted();
-    throw error;
+    const failure = preserveAttemptOutcome(error);
+    throwIfWorkerAborted(options.signal, failure);
+    throw failure;
   } finally {
     stopWatching();
   }
 }
 
 async function withWorkerDeadline<T>(options: WorkerAgentOptions, run: (bounded: WorkerAgentOptions) => Promise<T>): Promise<T> {
+  // Creation tasks opt out of application budgets while retaining their caller's
+  // AbortSignal. Async-local policy never changes concurrently running workers.
+  if (isUnboundedWorkerExecution()) return run(options);
   // Resolve in the host, not the sanitized Codex child environment. Keep one
   // budget across correction turns rather than resetting it for every request.
   const configured = process.env.INKOS_WORKER_TIMEOUT_MS?.trim();

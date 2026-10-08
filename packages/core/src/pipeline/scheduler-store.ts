@@ -1,3 +1,4 @@
+import type { ChapterReviewInputs } from "./review-inputs.js";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { realpathSync } from "node:fs";
@@ -17,12 +18,17 @@ export interface ScheduledChapter {
   goalId: string;
   phase: "writing" | "reviewing" | "publishing" | "completed" | "blocked";
   revisionId?: string;
+  /** A committed chapter exists even when a later review blocks acceptance. */
+  writingCompleted?: boolean;
   reviewAttempts: number;
   /** Audit and repair budgets survive both process restarts and chapter edits. */
   reviewChecks?: number;
+  /** Failed provider checks do not consume the creation-task editorial quality budget. */
+  reviewUnavailableChecks?: number;
   reviewAttempt?: { revisionId: string; startedAt: number };
   reviewRepair?: { revisionId: string; startedAt: number };
-  reviewReceipt?: { revisionId: string; reviewedAt: number; summary: string; observations: readonly Observation[] };
+  /** Legacy receipts without inputs can only reconcile prior remote attempts. */
+  reviewReceipt?: { inputs?: ChapterReviewInputs; revisionId: string; reviewedAt: number; summary: string; observations: readonly Observation[] };
   failures: number;
   nextAttemptAt: number;
   publicationStartedAt?: number;
@@ -118,6 +124,10 @@ export class SchedulerStore {
   latest(workId: string): ScheduledChapter | undefined {
     const row = this.db.prepare("SELECT data_json FROM scheduler_chapters WHERE work_id=? ORDER BY chapter DESC LIMIT 1").get(workId);
     return row ? JSON.parse(String(row.data_json)) : undefined;
+  }
+  chapters(workId: string): ScheduledChapter[] {
+    return this.db.prepare("SELECT data_json FROM scheduler_chapters WHERE work_id=? ORDER BY chapter").all(workId)
+      .map(row => JSON.parse(String(row.data_json)));
   }
   /** Least recently admitted work first; empty ticks and restarts cannot reset fairness. */
   orderForAdmission(workIds: readonly string[]): string[] {

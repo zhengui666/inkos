@@ -53,7 +53,11 @@ export interface MegaNovelObservationPort {
   probe(scope: MegaNovelScope, options?: MegaNovelBrowserOptions): Promise<MegaNovelProbe>;
   snapshot(input: MegaNovelSnapshotRequest, options?: MegaNovelBrowserOptions): Promise<MegaNovelSnapshot>;
 }
-export interface MegaNovelBrowserOptions { signal?: AbortSignal }
+export interface MegaNovelBrowserOptions {
+  signal?: AbortSignal;
+  /** Recheck local authority after async preflight, immediately before each editor effect. */
+  beforeMutation?: () => Promise<void>;
+}
 
 /** Browser paragraph text may omit the document's final newline. No prose or internal spacing is changed. */
 export function normalizeMegaNovelBodyText(content: string): string {

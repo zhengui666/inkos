@@ -195,4 +195,55 @@ describe("mode-aware narrative guidance routing", () => {
     const custom = { ...input.profile, id: "custom-voice", requiredSkillIds: ["inkos-short-writing"] };
     expect(resolveProfileSkillActivations(available.skills, custom).map(activation => activation.skill.id)).toEqual(["inkos-short-writing"]);
   });
+
+  it.each([true, false])("carries evidence boundaries into selected market research (native=%s)", async native => {
+    const input = await fixture("workspace-default");
+    const direction = "Compare official charts and the publicly accessible openings; report exactly what was read.";
+    const result = await prepare(input, [{ role: "user", content: direction }], {
+      native, worker: "researcher", authorRequest: direction,
+      scopedProfile: { ...input.profile, requiredSkillIds: ["inkos-long-market-research"] },
+    });
+    expect(result.skills.map(skill => skill.id)).toEqual(["inkos-long-market-research"]);
+    expect(result.skills[0]?.references.map(reference => reference.path)).toContain("references/research-rubric.md");
+    expect(result.content).toContain("chart name, category, ranking metric, active filters, observation time, and official URL");
+    expect(result.content).toContain("Separate chart, synopsis, contents and actually read prose evidence");
+    expect(result.content).toContain("chapters or passages read and the unread scope");
+    expect(result.content).toContain("An opening sample cannot establish whole-book payoff");
+    expect(result.content).toContain("counterexamples that challenge a proposed mechanism");
+    expect(result.content).toContain("not proven causes of popularity");
+    expect(result.content).not.toContain("# Commercial underdog story engine");
+  });
+
+  it.each(["architect", "planner", "writer", "auditor", "reviser"].flatMap(worker =>
+    [true, false].map(native => ({ worker, native }))))
+  ("keeps evidence-calibrated guidance and existing commercial promises for $worker (native=$native)", async ({ worker, native }) => {
+    const direction = "Use the selected fast-paced commercial mode: an underdog acts for a contested gain. Keep natural dialogue and paragraphs.";
+    const result = await prepare(await fixture("longform-novel", "en"), [{ role: "user", content: direction }],
+      { worker, native, authorRequest: direction });
+    expect(result.content).toContain("For the selected fast-paced commercial mode");
+    expect(result.content).toContain("a pacing default, not a universal opening order");
+    expect(result.content).not.toContain("For the default commercial web-fiction target, open with");
+    expect(result.content).toContain("persistent, meaningful change that affects later choices");
+    expect(result.content).toContain("real trade-offs where they apply");
+    expect(result.content).not.toContain("and an irreversible price");
+    expect(result.content).toContain("meaningful opposing interests");
+    expect(result.content).toContain("the protagonist's actions should supply the win");
+    expect(result.content).toContain("what the protagonist contributes");
+    expect(result.content).toContain("inspection window, not a quota requiring a villain, complete system or win");
+    expect(result.content).toContain("do not force suffering, injury or punishment into every win");
+    expect(result.content).toContain("Use varied natural paragraphs");
+    expect(result.content).toContain("dialogue driven by different aims");
+    expect(result.messages.some(message => message.role === "user" && message.content === direction)).toBe(true);
+  });
+
+  it.each([true, false])("preserves an explicitly chosen commercial slow-burn without requiring a literary exception (native=%s)", async native => {
+    const direction = "明确写商业慢热成长文，保留翻身目标和能力边界，开篇先让读者看懂农家生活，不强加当场胜利。";
+    const result = await prepare(await fixture("longform-novel"), [{ role: "user", content: direction }],
+      { native, authorRequest: direction });
+    expect(result.content).toContain("An explicitly chosen commercial slow-burn");
+    expect(result.content).toContain("keep the current event understandable and the promised reader experience intact");
+    expect(result.content).toContain("Whether fast-paced or slow-burn, keep the current reader promise clear");
+    expect(result.content).not.toContain("do not use these exceptions to dilute the default web-fiction promise");
+    expect(result.messages.some(message => message.role === "user" && message.content === direction)).toBe(true);
+  });
 });

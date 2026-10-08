@@ -1,6 +1,6 @@
 import { Type, type Static } from "@mariozechner/pi-ai";
 import type { AgentTool, AgentToolResult } from "../../codex/contracts.js";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { executeEditTransaction, type EditRequest } from "../../interaction/edit-controller.js";
 import { StateManager } from "../../state/manager.js";
@@ -109,7 +109,17 @@ export function createWriteTruthFileTool(
           if (!params.bookRulesData) {
             throw new Error("write_truth_file requires bookRulesData when replacing book_rules.md");
           }
-          const data = BookRulesSchema.parse({ version: "2", ...params.bookRulesData });
+          let previousContract;
+          try {
+            const previous = JSON.parse(await readFile(join(state.bookDir(bookId), "story/book_rules.json"), "utf8"));
+            previousContract = BookRulesSchema.parse(previous).readerContract;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          }
+          // An unrelated rules edit must not silently disable the reader contract.
+          // An explicit supplied replacement (including author-directed) still wins.
+          const data = BookRulesSchema.parse({ version: "2", ...params.bookRulesData,
+            readerContract: params.bookRulesData.readerContract ?? previousContract });
           await commitAtomicFileSet({
             rootDir: state.bookDir(bookId),
             writes: [

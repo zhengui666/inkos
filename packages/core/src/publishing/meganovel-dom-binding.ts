@@ -148,12 +148,14 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       evidence: 'Calibration date has day precision; the midnight timestamp does not identify a session. Authorized visible author-center account menu, editor/TinyMCE, chapter rows and public reader observations on 2026-10-06. Overflow and new UI remain unsupported.'},
     probe, snapshot,
     observeSnapshot: (page, input, signal) => snapshot(page, MegaNovelSnapshotRequestSchema.parse(input), signal),
-    async createDraft(page, input, signal) {
+    async createDraft(page, input, signal, beforeMutation) {
+      const guard = async () => { await beforeMutation?.(); signal.throwIfAborted(); };
       await probe(page, input.scope, signal);
       const newChapter = page.locator('div.top div.side-bar-title').filter({hasText: /^New Chapter$/u});
       await requireOne(newChapter, 'New Chapter');
       const previousId = editorIdentity(page.url())?.chapterId;
       await beforeEditorEffect(page, input.scope, signal);
+      await guard();
       await newChapter.click();
       await page.waitForURL(url => editorIdentity(url.href)?.bookId === input.scope.remoteBookId
         && editorIdentity(url.href)?.chapterId !== previousId, {timeout: config.uiTimeoutMs});
@@ -166,6 +168,7 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       await beforeEditorEffect(page, input.scope, signal);
       await page.locator(TITLE).click({trial: true});
       signal.throwIfAborted();
+      await guard();
       await page.locator(TITLE).fill(input.title);
       await beforeEditorEffect(page, input.scope, signal);
       let identityCheckedAt = Date.now();
@@ -175,6 +178,7 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       // can add internal blank lines. Enter explicit soft breaks through the
       // observed editor UI, then verify the resulting text before Save.
       const lines = input.content.replace(/\r\n?/gu, '\n').split('\n');
+      await guard();
       await body.fill(lines[0]!);
       for (let index = 1; index < lines.length; index++) {
         const line = lines[index]!;
@@ -188,6 +192,7 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
         } else await checkEditor(page, input.scope, signal);
         await body.click({trial: true});
         signal.throwIfAborted();
+        await guard();
         await body.press('Shift+Enter');
         await checkEditor(page, input.scope, signal);
         if (line) {
@@ -195,6 +200,7 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
             throw publishingError('MEGANOVEL_EDITOR_FOCUS_CHANGED', 'The observed body no longer owns keyboard focus. Preserve it without further typing.');
           }
           signal.throwIfAborted();
+          await guard();
           await page.keyboard.insertText(line);
         }
       }
@@ -205,12 +211,14 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       }
       await requireOne(page.locator(SAVE), 'Save');
       await beforeEditorEffect(page, input.scope, signal);
+      await guard();
       await page.locator(SAVE).click();
       await page.waitForURL(url => editorIdentity(url.href)?.bookId === input.scope.remoteBookId
         && Boolean(editorIdentity(url.href)?.chapterId), {timeout: config.uiTimeoutMs});
       recent.set(key(input), editorIdentity(page.url())!.chapterId!);
     },
-    async submit(page, input, signal) {
+    async submit(page, input, signal, beforeMutation) {
+      const guard = async () => { await beforeMutation?.(); signal.throwIfAborted(); };
       await probe(page, input.scope, signal);
       await page.goto(editorUrl(input.scope.remoteBookId, input.remoteChapterId), {waitUntil: 'domcontentloaded'});
       const editor = await readEditor(page, input.scope, signal);
@@ -221,6 +229,7 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       if (await disclosureState(page) !== 'not_present') throw publishingError('MEGANOVEL_DISCLOSURE_UNVERIFIED', 'A new AI declaration UI needs truthful mapping before submission.');
       await requireOne(page.locator(PUBLISH), 'Publish');
       await beforeEditorEffect(page, input.scope, signal);
+      await guard();
       await page.locator(PUBLISH).click();
       const scheduleTitle = page.getByText('Publish Schedule', {exact: true}).filter({visible: true});
       await requireOne(scheduleTitle, 'Publish Schedule');
@@ -235,6 +244,7 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       await verifyVisibleAccount(page, input.scope, config.avatarSelector, config.uiTimeoutMs, signal);
       await verifyScheduleDialog(scheduleTitle, [now, later, confirm, cancel]);
       signal.throwIfAborted();
+      await guard();
       await now.click();
       const selectedNow = page.getByRole('radio', {name: 'Now', exact: true});
       if (await selectedNow.count() !== 1 || !await selectedNow.isChecked()) {
@@ -247,6 +257,7 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       }
       await verifyScheduleDialog(scheduleTitle, [now, later, confirm, cancel]);
       signal.throwIfAborted();
+      await guard();
       await confirm.click(); // Exactly one final action. Readback is performed independently by the adapter.
     },
   };

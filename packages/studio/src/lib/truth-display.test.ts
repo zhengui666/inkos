@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { renderHooksProjection } from "../../../core/src/state/state-projections.js";
 import { setAppLanguage } from "./app-language";
 import {
   firstParagraph,
@@ -33,4 +34,25 @@ describe("truth artifact presentation", () => {
     ].join("\n"));
     expect(hooks).toEqual([{ id: "H001", type: "主线伏笔", status: "deferred", payoff: "第五卷揭晓", content: "旧账页缺了一角。" }]);
   });
+  it.each(["en", "zh"] as const)("round-trips escaped legacy hook cells and optional dependency columns in %s", language => {
+    const values = ["Plain text", "A | B", String.raw`one\|pipe`, String.raw`two\\|pipe`, "C:\\notes\\end\\", "", "|"];
+    for (const value of values) {
+      const hook = { hookId: "H001", startChapter: 0, type: "mystery", status: "open" as const,
+        lastAdvancedChapter: 0, expectedPayoff: value, notes: value };
+      const expected = [{ id: hook.hookId, type: hook.type, status: hook.status, payoff: value, content: value }];
+      expect(parsePendingHooks(renderHooksProjection({ hooks: [hook] }, language))).toEqual(expected);
+      expect(parsePendingHooks(renderHooksProjection({ hooks: [{ ...hook,
+        dependsOn: value ? [value] : [], paysOffInArc: value,
+      }] }, language))).toEqual(expected);
+    }
+  });
+
+  it("keeps cards when only dependency metadata contains pipes and preserves empty projected cells", () => {
+    const hook = { hookId: "H001", startChapter: 0, type: "mystery", status: "open" as const,
+      lastAdvancedChapter: 0, expectedPayoff: "", notes: "", dependsOn: [String.raw`witness\|seal`], paysOffInArc: "Return | quay" };
+    expect(parsePendingHooks(renderHooksProjection({ hooks: [hook] }, "en"))).toEqual([
+      { id: "H001", type: "mystery", status: "open", payoff: "", content: "" },
+    ]);
+  });
+
 });

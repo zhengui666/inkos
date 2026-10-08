@@ -53,6 +53,8 @@ export class ReviserAgent extends BaseAgent {
     const observationList = observations.length > 0
       ? observations.map((issue) => [
           `- ${issue.code}: ${issue.summary}`,
+          ...(issue.repairScope ? [`  Repair layer: ${issue.repairScope}`] : []),
+          ...(issue.sourceRefs ?? []).map(ref => `  Source ${ref.sourceId}: ${ref.quote}`),
           ...(issue.evidence.length > 0
             ? [`  ${isEnglish ? "Evidence" : "证据"}: ${issue.evidence.join("; ")}`]
             : []),

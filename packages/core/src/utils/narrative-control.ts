@@ -26,6 +26,7 @@ export function renderMemoAsNarrativeBlock(
     sections.push(memo.body);
   }
 
+  if (memo.readerDelivery) sections.push(`## ${isEn ? "Reader delivery" : "读者承诺兑现"}\n${JSON.stringify(memo.readerDelivery)}`);
   return sections.join("\n\n");
 }
 

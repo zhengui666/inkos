@@ -8,6 +8,7 @@ export const ObservationSchema = z.object({
   category: z.enum(["execution", "quality", "scope"]).optional(),
   assessment: z.enum(["issue", "resolved", "unavailable", "observation"]).optional(),
   scope: z.string().optional(),
+  repairScope: z.enum(["local", "structural", "foundation", "unknown"]).optional(),
   targetHash: z.string().optional(),
   target: z.object({ workId: z.string(), artifactId: z.string(), revisionId: z.string() }).strict().optional(),
   sourceRefs: z.array(z.object({ sourceId: z.string().min(1), quote: z.string().min(1) }).strict()).optional(),

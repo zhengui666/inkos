@@ -76,7 +76,7 @@ export const statusCommand = new Command("status")
           if (opts.chapters && index.length > 0) {
             log("");
             for (const ch of index) {
-              const icon = ch.observations.length > 0 ? "!" : "+";
+              const icon = ch.observations.some(observation => observation.assessment !== "resolved" && (observation.assessment === "issue" || observation.assessment === "unavailable" || observation.assessment === undefined)) ? "!" : "+";
               log(`    [${icon}] Ch.${ch.number} "${ch.title}" | ${formatLengthCount(ch.wordCount, countingMode)} | ${ch.provenance}`);
               for (const observation of ch.observations) {
                 log(`        ${observation.code}: ${observation.summary}`);

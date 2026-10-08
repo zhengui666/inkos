@@ -1,10 +1,12 @@
 import { z } from "zod";
+import { ChapterDeliverySchema } from "./reader-contract.js";
 
 export const ChapterMemoSchema = z.object({
   chapter: z.number().int().min(1),
   goal: z.string().min(1),
   body: z.string().min(1),
   threadRefs: z.array(z.string()),
+  readerDelivery: ChapterDeliverySchema.optional(),
 }).strict();
 
 export type ChapterMemo = z.infer<typeof ChapterMemoSchema>;

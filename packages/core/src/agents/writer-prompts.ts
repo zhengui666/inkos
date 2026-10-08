@@ -21,6 +21,7 @@ export function buildWriterSystemPrompt(
         lengthContract(resolvedLength, "en"),
         narrativePersonContract(bookRules, "en"),
         protagonistContract(bookRules, "en"),
+        authorityBlock("Reader contract", bookRules?.readerContract ? JSON.stringify(bookRules.readerContract) : undefined),
         authorityBlock("Book rules", bookRulesBody),
         authorityBlock("Style guide", styleGuide),
       ]
@@ -30,6 +31,7 @@ export function buildWriterSystemPrompt(
         lengthContract(resolvedLength, "zh"),
         narrativePersonContract(bookRules, "zh"),
         protagonistContract(bookRules, "zh"),
+        authorityBlock("读者承诺", bookRules?.readerContract ? JSON.stringify(bookRules.readerContract) : undefined),
         authorityBlock("本书规则", bookRulesBody),
         authorityBlock("文风指南", styleGuide),
       ];
@@ -39,9 +41,11 @@ export function buildWriterSystemPrompt(
 function governedContract(language: "zh" | "en"): string {
   return language === "en"
     ? `## Authority
-The current user instruction and chapter memo govern this chapter. Established facts, explicit prohibitions, selected context, and real hook ids remain binding. The outline is a fallback only when it does not conflict with higher authority. Satisfy every populated memo requirement in the prose; do not duplicate or rename an existing narrative promise.`
+Latest explicit author direction overrides conflicting plans. Realize required current events, choices and consequences; respect prohibitions and time/order. Background facts constrain consistency, not recital. Future plans are not facts; setup/aftermath need not force wins. Use outlines only as compatible fallback; preserve real hook ids without duplication or renaming.
+Make actual changes clear: who pays/receives what and what remains unsettled. A promise or invoice is not a completed payment. Avoid procedural or balance recitals unless explicitly requested.`
     : `## 权威顺序
-当前用户指令和 chapter memo 决定本章任务；既成事实、显式禁令、已选上下文和真实 hook id 必须保留。卷纲仅在无冲突时作为兜底。memo 已填写的每项要求都要在正文落地，不要为同一承诺重复开 hook，也不要改名既有叙事承诺。`;
+最新明确作者指令优先于冲突计划。本章必需事件、选择和后果须在正文兑现，遵守禁令和时间/先后约束。背景约束一致性，不是复述清单；未来计划不是事实，铺垫和余韵不强迫胜利。卷纲仅作无冲突兜底，真实 hook id 不重复、不改名。
+写清谁实际支付或收到什么、哪些仍未结清。承诺付款或开出账单不等于已经收款。避免复述流程或累计余额，但遵循作者明确要求的细节。`;
 }
 
 function lengthContract(spec: LengthSpec, language: "zh" | "en"): string {

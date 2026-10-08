@@ -16,6 +16,8 @@ export type ChapterGoalCreateInput = Parameters<typeof chapterGoalInput>[0];
 export interface ChapterGoalServiceOptions {
   readonly projectRoot: string;
   readonly retryDelayMs?: number;
+  /** Creation automation may replace a safely reconciled interrupted attempt once. */
+  readonly compensateInterruptedAttempts?: boolean;
   /** Called only by a runnable writing request, never create/status/recover. */
   readonly createPipeline?: () => Promise<GoalPipeline> | GoalPipeline;
 }
@@ -78,13 +80,18 @@ export class ChapterGoalService {
     return this.store.recover(id, Version.parse(expectedVersion));
   }
 
+  retryTransientFailure(id: string, expectedVersion: number, workId?: string, additionalAttempts = 3): Goal {
+    this.get(id, workId);
+    return this.store.retryTransientFailure(id, Version.parse(expectedVersion), additionalAttempts);
+  }
+
   async run(id: string, expectedVersion: number, options: { signal?: AbortSignal; workId?: string } = {}): Promise<Goal> {
     const goal = this.get(id, options.workId);
     if (goal.version !== Version.parse(expectedVersion)) throw goalError('GOAL_VERSION_CONFLICT', 'Goal changed. Read its latest state first.');
     if (goal.status === 'completed') return goal;
     if (goal.status === 'cancelled' || goal.status === 'failed') throw goalError('GOAL_TERMINAL', 'This goal is terminal; inspect its retained results instead of resuming it.');
     if (goal.owner) throw goalError('GOAL_BUSY', 'The previous executor still owns this goal. Recover only after it has exited.');
-    if (Date.now() >= goal.budget.expiresAt) throw goalError('GOAL_BUDGET_EXHAUSTED', 'Goal deadline has elapsed.');
+    if (goal.budget.expiresAt !== null && Date.now() >= goal.budget.expiresAt) throw goalError('GOAL_BUDGET_EXHAUSTED', 'Goal deadline has elapsed.');
     if (goal.steps.some(step => step.kind !== CHAPTER_GOAL_KIND)) throw goalError('GOAL_ADAPTER_UNAVAILABLE', 'This entry point only runs the fixed chapter-writing adapter.');
     options.signal?.throwIfAborted();
     const { work, profile } = await this.requireWork(goal.workId);
@@ -94,7 +101,8 @@ export class ChapterGoalService {
     options.signal?.throwIfAborted();
     // requestRun performs the atomic CAS after all non-writing preparation.
     this.store.requestRun(id, expectedVersion);
-    const executor = new GoalExecutor(this.store, [createChapterGoalAdapter({ projectRoot: this.root, pipeline })], this.options.retryDelayMs);
+    const executor = new GoalExecutor(this.store, [createChapterGoalAdapter({ projectRoot: this.root, pipeline })], this.options.retryDelayMs,
+      { compensateInterruptedAttempts: this.options.compensateInterruptedAttempts });
     return withExecutionEvidence(undefined, () => pipeline.runWithAgentContext({ activatedSkills: skills },
       () => executor.run(id, options.signal)), profile, work, goal.intent);
   }

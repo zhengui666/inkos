@@ -116,7 +116,9 @@ export async function retrieveMemorySelection(params: {
       summaries: selectSummariesById(summaries, params.chapterNumber, selectedIds),
       lookupSummaries: summaries,
       hooks: searchableHooks.filter((hook) => selectedIds.has(hookDocumentId(hook.hookId))),
-      lookupHooks: searchableHooks,
+      // Exact-ID evidence lookup includes terminal records; it does not make
+      // resolved or withdrawn promises selectable as active work.
+      lookupHooks: hooks,
       volumeSummaries: parsedVolumeSummaries.filter((_, index) => selectedIds.has(volumeSummaryDocumentId(index))),
       dbPath,
       retrievalTrace: {
@@ -205,7 +207,11 @@ function buildMemorySearchDocuments(input: {
       kind: "hook",
       source: `story/pending_hooks.md#${hook.hookId}`,
       title: [hook.hookId, hook.type].filter(Boolean).join(" "),
-      body: [hook.status, hook.expectedPayoff, hook.notes].filter(Boolean).join("\n"),
+      body: [
+        hook.status, hook.expectedPayoff, hook.notes,
+        hook.dependsOn !== undefined ? `dependsOn=${[...new Set(hook.dependsOn)].join(", ")}` : undefined,
+        hook.paysOffInArc !== undefined ? `paysOffInArc=${hook.paysOffInArc} (author-authored context, not a deadline)` : undefined,
+      ].filter(Boolean).join("\n"),
       metadata: { hookId: hook.hookId },
     })),
     ...input.volumeSummaries.map((summary, index) => ({

@@ -61,6 +61,8 @@ describe('independent generic scheduling review', () => {
     fixture.next.set('recently-admitted', 2); fixture.slowProcess = 'waiting-work';
     // Execute the exact scheduled-cycle entry point with no unrelated startup resume pass.
     (scheduler as any).running = true; await (scheduler as any).runWriteCycle(false);
+    // A cycle now admits independent work; wait for its actual operations before checking allocation.
+    await Promise.all([...(scheduler as any).workInFlight.values()]);
     expect(fixture.run.mock.calls.map(c => c[0].workId)).toEqual(['waiting-work']);
   });
 

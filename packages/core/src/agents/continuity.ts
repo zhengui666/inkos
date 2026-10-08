@@ -1,12 +1,16 @@
+import { contractFromContext } from "./reader-contract-context.js";
+import { commercialReviewProtocol, validateCommercialReview, STORY_CLOSURE_SOURCE, storyClosureReviewProtocol, validateStoryClosureReview } from "./commercial-review.js";
 import { BaseAgent } from "./base.js";
 import type { ContextPackage } from "../models/input-governance.js";
 import { renderNarrativeSelectedContext } from "../utils/narrative-control.js";
 import { numberReviewSource, type Observation } from "../models/observation.js";
 import {loadWorkManifest} from '../harness/work-store.js';
 import {readArtifactRevision} from '../harness/artifact-reader.js';
-import {currentExecutionBaselineWork} from '../harness/execution-evidence.js';
+import {currentExecutionBaselineWork, currentExecutionAuthorRequest} from '../harness/execution-evidence.js';
 import {chapterDocumentBody} from '../utils/chapter-document.js';
 import {changedSourceRegion} from '../utils/source-text.js';
+import { PlannerAgent } from "./planner.js";
+import { CHAPTER_CONTRACT_SOURCE, chapterContractRequirements, chapterContractReviewProtocol, validateChapterContractReview } from "./chapter-contract.js";
 
 export interface AuditResult {
   readonly observations: ReadonlyArray<Observation>;
@@ -37,6 +41,8 @@ export class ContinuityAuditor extends BaseAgent {
     },
   ): Promise<AuditResult> {
     const isEnglish = options.language === "en";
+    const requireClosure = options.contextPackage.selectedContext.some(item => item.source === STORY_CLOSURE_SOURCE);
+    const commercial = contractFromContext(options.contextPackage)?.mode === "commercial-underdog";
     const systemPrompt = isEnglish
       ? "Audit this chapter against the activated review Skill and supplied governed context. Identify each observation with a code, assessment and exact numbered source lines. Do not estimate length; the host computes it. Return a concise overall summary. An empty observations array is valid."
       : "按已激活的审稿 Skill 和权威上下文审查本章。为每条观察提交代码、判断以及所给编号原文中的确切证据行。不估算字数，字数由宿主计算。提交简短总结，observations 为空是合法结果。";
@@ -46,6 +52,22 @@ export class ContinuityAuditor extends BaseAgent {
     );
     const sources = new Map([["governed-context", governedContext], [`chapter-${chapterNumber}`, chapterContent]]);
     const primarySourceId=`chapter-${chapterNumber}`;
+    const memo = options.contextPackage.selectedContext.filter(item => item.source === "runtime/chapter_memo")
+      .map(item => item.excerpt ?? "").join("\n\n");
+    const authorRequest = currentExecutionAuthorRequest();
+    if (authorRequest?.trim()) sources.set("chapter-contract-author-request", authorRequest);
+    let contract: Awaited<ReturnType<PlannerAgent["classifyChapterContract"]>> | undefined;
+    if (memo.trim()) {
+      sources.set(CHAPTER_CONTRACT_SOURCE, memo);
+      // Classification sees original authority, never draft prose that could bias
+      // the expected requirements toward whatever the writer happened to deliver.
+      contract = await new PlannerAgent(this.ctx).classifyChapterContract(
+        new Map([...sources].filter(([id]) => id !== primarySourceId)), options.language);
+      for (const requirement of chapterContractRequirements(contract.result.observations)) {
+        const original = requirement.sourceRefs.map(ref => ref.quote).join("\n");
+        if (original) sources.set(requirement.code, original);
+      }
+    }
     let reviewedArtifact:AuditResult['reviewedArtifact'];
     let comparison:{scope:'episode_start'|'parent_revision';sourceId:string;before:{revisionId:string;checksum?:string};after:{revisionId:string;checksum?:string};changedRegion:ReturnType<typeof changedSourceRegion>}|undefined;
     if(this.ctx.bookId){
@@ -71,11 +93,16 @@ export class ContinuityAuditor extends BaseAgent {
         }
       }
     }
-    const userPrompt = JSON.stringify({ chapterNumber,comparison, sources: [...sources].map(([sourceId, content]) => ({ sourceId, numberedLines: numberReviewSource(content) })) });
+    const userPrompt = JSON.stringify({ chapterNumber,comparison,
+      ...(contract ? { chapterContract: { inventory: contract.result.observations, requirements: chapterContractRequirements(contract.result.observations) } } : {}),
+      sources: [...sources].map(([sourceId, content]) => ({ sourceId, numberedLines: numberReviewSource(content) })) });
 
     const { result, usage } = await this.submitSourcedReview(
       [
         { role: "system", content: systemPrompt },
+        ...(contract ? [{ role: "system" as const, content: chapterContractReviewProtocol(options.language) }] : []),
+        ...(requireClosure ? [{ role: "system" as const, content: storyClosureReviewProtocol(options.language) }] : []),
+        ...(commercial ? [{ role: "system" as const, content: commercialReviewProtocol(options.language, chapterNumber) }] : []),
         ...(comparison?[{role:'system' as const,content:'Separately check the actual before/current changes against the author-authorized revision region. Classify verified changes outside that region as scope and cite both versions. Classify ordinary content findings as quality and tool/external-operation claims as execution. Missing comparison evidence is unavailable, not a scope violation. A narrow edit request does not narrow a separately requested whole-chapter review.'}]:[]),
         { role: "user", content: userPrompt },
       ],
@@ -86,8 +113,11 @@ export class ContinuityAuditor extends BaseAgent {
           ? "Submit evidence-backed observations only."
           : "只提交有证据的审稿观察。",
       },
-      { temperature: options.temperature ?? 0.3, maxTokens: Math.min(4096, this.ctx.client.defaults.maxTokens),categoryRequired:!!comparison,
+      { temperature: options.temperature ?? 0.3, maxTokens: Math.min(4096, this.ctx.client.defaults.maxTokens),categoryRequired:!!comparison || commercial || requireClosure || !!contract,
         validateObservations:observations=>{
+          if (contract) validateChapterContractReview(observations, contract.result.observations, primarySourceId);
+          if (commercial) validateCommercialReview(observations, primarySourceId);
+          if (requireClosure) validateStoryClosureReview(observations, primarySourceId);
           for(const observation of observations.filter(item=>item.category==='scope'&&item.assessment==='issue')){
             const ids=new Set(observation.sourceRefs.map(ref=>ref.sourceId));
             if(!comparison||comparison.before.revisionId===comparison.after.revisionId||!ids.has(comparison.sourceId)||!ids.has(primarySourceId))throw Object.assign(new Error('A scope violation requires distinct verified before/current sources and citations to both.'),{code:'REVIEW_SCOPE_EVIDENCE_REQUIRED'});
@@ -98,7 +128,11 @@ export class ContinuityAuditor extends BaseAgent {
     return {
       observations: result.observations,
       summary: result.summary,
-      tokenUsage: usage,
+      tokenUsage: contract ? {
+        promptTokens: usage.promptTokens + contract.usage.promptTokens,
+        completionTokens: usage.completionTokens + contract.usage.completionTokens,
+        totalTokens: usage.totalTokens + contract.usage.totalTokens,
+      } : usage,
       ...(reviewedArtifact?{reviewedArtifact}:{}),
     };
   }

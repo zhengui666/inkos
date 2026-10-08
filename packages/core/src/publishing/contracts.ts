@@ -9,7 +9,15 @@ export const PublishingTargetInputSchema = z.object({
   accountLabel: Label, remoteBookId: Label,
 }).strict();
 export const PublishingTargetSchema = PublishingTargetInputSchema.extend({
-  id: HarnessIdSchema, createdAt: z.string(), verification: z.literal('user_supplied'),
+  id: HarnessIdSchema, createdAt: z.string(), verification: z.enum(['user_supplied', 'independently_observed']),
+  observedAccountId: Label.optional(), creationOperationId: HarnessIdSchema.optional(),
+}).superRefine((target, ctx) => {
+  if (target.verification === 'independently_observed' && (!target.observedAccountId || !target.creationOperationId)) {
+    ctx.addIssue({code: z.ZodIssueCode.custom, message: 'An observed target needs its actual account and creation operation.'});
+  }
+  if (target.verification === 'user_supplied' && (target.observedAccountId !== undefined || target.creationOperationId !== undefined)) {
+    ctx.addIssue({code: z.ZodIssueCode.custom, message: 'User-supplied targets cannot claim observed creation provenance.'});
+  }
 });
 export type PublishingTarget = z.infer<typeof PublishingTargetSchema>;
 

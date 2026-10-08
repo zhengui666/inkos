@@ -11,7 +11,8 @@ Use this skill when the user wants current market evidence, platform differences
 - Clarify the market, platform, audience, language, and time window only when they materially affect the answer.
 - Use `research_web` for current claims. Separate observed evidence, interpretation, and creative recommendation.
 - Use `ingest_material` for user-provided reports or URLs and `retrieve_material` for already archived evidence.
-- Do not treat rankings, popularity, or one successful book as a writing formula. Extract mechanisms and uncertainty.
+- Do not treat rankings, popularity, or one successful book as a writing formula. Extract mechanisms and uncertainty. Separate what ranks/titles establish from what accessible synopsis, contents or opening demonstrates; do not infer a whole plot or style from a rank.
+- For a new commercial recommendation, supply a readerContract: familiar genre pleasure, specific original hook, readable opening question and causal underdog rise route. Starting disadvantage, bounded advantage, conflicting interests, protagonist contribution and meaningful return must fit. These are creative proposals, not claims about benchmarks. Familiar systems, rebirth, identity and progression devices are allowed when fitting; vary routes rather than reproducing one template.
 - Research never mutates book canon. If the user later wants a source available during chapter writing, archive it and explicitly bind it with `manage_book_reference` in the active book.
 - Respond in the user's language.
 

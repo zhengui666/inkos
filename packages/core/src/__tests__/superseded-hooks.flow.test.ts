@@ -25,7 +25,9 @@ it("archives explicitly withdrawn premises, excludes them from future retrieval 
     expect(saved.hooks.hooks.find(hook => hook.hookId === "plan")).toMatchObject({ ...planned, status: "superseded", notes: planned.notes + "\n" + delta.hookOps.upsert[0]!.notes });
     expect(saved.hooks.hooks.find(hook => hook.hookId === "past")).toEqual(resolved);
     const selection = await retrieveMemorySelection({ bookDir, chapterNumber: 2, goal: "workshop prohibition", semanticSelector: async request => request.candidates.map(candidate => candidate.id) });
-    expect(new Set([...selection.hooks, ...selection.lookupHooks].map(hook => hook.hookId))).toEqual(new Set(["active"]));
+    expect(selection.hooks.map(hook => hook.hookId)).toEqual(["active"]);
+    expect(new Set(selection.lookupHooks.map(hook => hook.hookId))).toEqual(new Set(["plan", "past", "active"]));
+    expect(selection.retrievalTrace.candidates.map(candidate => candidate.id)).toEqual(["hook:active"]);
     const reactivated = buildRuntimeStateArtifactsFromSnapshot({ snapshot: saved, delta: { ...delta, chapter: 2, hookOps: { ...delta.hookOps, upsert: [planned] } }, language: "en" });
     expect(reactivated.snapshot.hooks.hooks.find(hook => hook.hookId === "plan")?.status).toBe("superseded");
     expect(() => buildRuntimeStateArtifactsFromSnapshot({ snapshot: saved, delta: { ...delta, chapter: 2, hookOps: { ...delta.hookOps, upsert: [{ ...resolved, status: "superseded", notes: "Replace the plan" }] } }, language: "en" })).toThrowError(expect.objectContaining({ code: "HOOK_RESOLVED_HISTORY" }));

@@ -14,7 +14,7 @@ Translate user-requested proportions between story lines into visible distributi
 
 ## Characters
 
-Build characters from motive, constraint, history, relationship, contradiction, and cost. The protagonist arc needs a concrete starting condition, an internal and external destination, and an irreversible price. Supporting characters need independent reasons to cooperate, resist, misread, or leave.
+Build characters from motive, constraint, history, relationship, contradiction, and cost. The protagonist arc needs a concrete starting condition, an internal and external destination, and a persistent, meaningful change that affects later choices. Include real trade-offs where they apply; do not force suffering, injury or punishment into every arc or gain. Supporting characters need independent reasons to cooperate, resist, misread, or leave.
 
 ## Initial hooks
 
@@ -23,3 +23,7 @@ Seed only facts and promises the story can carry. Distinguish dormant future see
 ## Derivative works
 
 Treat supplied canon as authority. Canon-faithful work fills genuine gaps without changing established facts. AU work names a divergence and propagates its consequences consistently. Intentional OOC needs a visible cause while preserving recognizable voice. Pairing-led work advances the relationship through events rather than placing both characters in the same scene without change. In every mode, create new narrative space instead of replaying the source plot.
+
+## Shared reader contract
+
+Submit the outline's structured `readerContract` alongside story frame and volume map. All three must agree on the familiar attraction, original hook, opening question and route to the first meaningful gain. Book rules retain that same contract rather than inventing a second promise. The cast must have concrete conflicts of interest around that route; volumes develop options and stakes instead of repeating a fixed face-slapping scene. Propagate user corrections consistently when revision is authorized.

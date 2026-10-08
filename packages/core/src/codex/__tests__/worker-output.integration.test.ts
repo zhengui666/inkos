@@ -17,14 +17,35 @@ vi.mock("../client.js", () => ({ createCodexClient: factory }));
  * Unlike transport mocks, this verifies outputSchema reaches Responses text.format,
  * and real App Server final-item notifications reach the host's domain validator. */
 describe.skipIf(process.env.INKOS_CODEX_INTEGRATION !== "1")("Codex native structured worker transport", () => {
-  it.each(["radar", "open-schema", "dynamic", "large-input"])("validates %s through the production worker", async mode => {
+  it.each(["radar", "radar-missing-reader-contract", "open-schema", "dynamic", "large-input"])("validates %s through the production worker", async mode => {
     const root = await mkdtemp(join(tmpdir(), "inkos-worker-wire-"));
     const bodies: Array<Record<string, any>> = [];
     const dynamicCalls: unknown[] = [];
-    const value = mode === "radar"
-      ? { recommendations: [{ platform: "qidian", genre: "fantasy", concept: "A clockmaker", reasoning: "Based on Fixture ranking", benchmarkTitles: ["Fixture ranking"] }], marketSummary: "Evidence from Fixture ranking" }
+    const isRadar = mode === "radar" || mode === "radar-missing-reader-contract";
+    const readerContract = {
+      mode: "commercial-underdog",
+      familiarPromise: "A clockmaker earns independence through practical skill",
+      distinctiveHook: "A broken clock reveals the next mechanical fault",
+      readingPleasure: "Useful work becomes real bargaining power",
+      openingQuestion: "Can the apprentice prove the fault and recover withheld pay?",
+      proseApproach: "Concrete language and clear cause and effect",
+      riseRoute: {
+        startingDisadvantage: "The apprentice lacks rent money and cannot take outside work",
+        desiredChange: "Recover withheld pay and earn one independent repair",
+        opportunity: "A broken clock reveals one faulty component",
+        opportunityLimits: "The component must be tested and a wrong repair costs scarce parts",
+        opposition: { force: "The workshop owner", interest: "Retain cheap labor", leverage: "Controls wages and access to tools" },
+        protagonistContribution: "Find a witness and demonstrate the repair",
+        firstPayoff: "Recover the wages after the witnessed repair succeeds",
+        payoffMeaning: "Pay rent and gain the option to refuse unfair work",
+        escalation: "An independent repair brings a new client and a harder problem",
+      },
+    };
+    const value = isRadar
+      ? { recommendations: [{ platform: "qidian", genre: "fantasy", concept: "A clockmaker", reasoning: "Based on Fixture ranking",
+        ...(mode === "radar" ? { readerContract } : {}), benchmarkTitles: ["Fixture ranking"] }], marketSummary: "Evidence from Fixture ranking" }
       : { value: { flag: true, count: 1, text: "1", absent: null }, optional: "present" };
-    const tool = mode === "radar" ? "submit_market_radar" : "submit_open_result";
+    const tool = isRadar ? "submit_market_radar" : "submit_open_result";
     const server = createServer((request, response) => {
       if (request.method !== "POST") { response.writeHead(404).end(); return; }
       const chunks: Buffer[] = [];
@@ -61,11 +82,21 @@ describe.skipIf(process.env.INKOS_CODEX_INTEGRATION !== "1")("Codex native struc
     try {
       const source = mode === "large-input" ? "原".repeat(119500) : "Analyze Fixture ranking and return the requested result.";
       const prepared = await prepareWorkerInput({ client }, [{ role: "user", content: source }], 4096, "fixture", false);
-      const result = await runWorkerAgentTool(client, "ignored", prepared.messages, {
+      const result = runWorkerAgentTool(client, "ignored", prepared.messages, {
         name: tool, label: "Result", description: "Submit result", validate: validate as never,
-        parameters: mode === "radar" ? RadarResultToolSchema : Type.Object({ value: Type.Record(Type.String(), Type.Unknown()), optional: Type.Optional(Type.String()) }),
+        parameters: isRadar ? RadarResultToolSchema : Type.Object({ value: Type.Record(Type.String(), Type.Unknown()), optional: Type.Optional(Type.String()) }),
       }, { timeoutMs: 20_000 });
-      expect(result).toEqual(value);
+      if (mode === "radar-missing-reader-contract") {
+        await expect(result).rejects.toMatchObject({
+          code: "WORKER_RESULT_INVALID", resultTool: tool, attempts: 3, submissions: 3,
+          message: expect.stringContaining('"path":"/recommendations/0/readerContract"'),
+        });
+        expect(validate).not.toHaveBeenCalled();
+        expect(bodies).toHaveLength(3);
+        expect(dynamicCalls).toHaveLength(0);
+        return;
+      }
+      expect(await result).toEqual(value);
       expect(JSON.stringify(bodies[0]!.input)).toContain(source);
       if (mode === "large-input") {
         expect(prepared.inputTokens).toBeGreaterThan(117760);

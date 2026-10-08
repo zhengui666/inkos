@@ -29,6 +29,7 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+      - run: pnpm typecheck
       - run: pnpm test
       - name: Verify real Studio SSE shutdown and daemon drain without model calls
         if: runner.os == 'Linux'
@@ -66,6 +67,8 @@ jobs:
           printf '%s\n' '{"name":"Codex browser tests","version":"0.1.0","language":"en"}' > test-project/inkos.json
       - name: Verify Codex settings, Doctor and radar UI with mocked account APIs
         run: pnpm --filter @actalk/inkos-studio exec playwright test --config=playwright.codex.config.ts codex-settings.spec.ts
+      - name: Verify creation-board controls with isolated offline API fixtures
+        run: pnpm --filter @actalk/inkos-studio exec playwright test --config=playwright.creation.config.ts
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

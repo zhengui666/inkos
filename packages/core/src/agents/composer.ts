@@ -1,3 +1,4 @@
+import { readerContractContext } from "./reader-contract-context.js";
 import { readFile, mkdir, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { BaseAgent, prepareWorkerInput } from "./base.js";
@@ -221,8 +222,25 @@ async function applyContextBudgetIfNeeded(params: {
     );
   }
 
-  const compileBudget = Math.max(1, availableInputTokens - protectedTokens);
+  const compiledEntry = {
+    source: "runtime/compiled-compressible-context",
+    reason: "Semantic compilation of lower-priority context after selected context exceeded the input budget.",
+    protection: "compressible" as const,
+  };
+  // Include the newline before nonempty compiled text, using the same envelope
+  // as estimateSelectedContextTokens. The total configured budget is unchanged.
+  const wrapperTokens = estimateTextTokens(`${compiledEntry.source}\n${compiledEntry.reason}\n`);
+  const compileBudget = availableInputTokens - protectedTokens - wrapperTokens;
   const compressibleTokens = estimateSelectedContextTokens(compressibleEntries);
+  if (compileBudget < 1) {
+    const message = "No room for compiled context after protected evidence and entry metadata.";
+    params.onContextCompression?.({
+      category: "story_context", phase: "error", message,
+      protectedTokens, compressibleTokens, budgetTokens: availableInputTokens,
+      sources: compressibleEntries.map((entry) => entry.source),
+    });
+    throw new Error(message);
+  }
   params.onContextCompression?.({
     category: "story_context",
     phase: "start",
@@ -265,6 +283,25 @@ async function applyContextBudgetIfNeeded(params: {
     });
     throw new Error("Compressible context compiler returned empty output.");
   }
+  const contextPackage = ContextPackageSchema.parse({
+    chapter: params.contextPackage.chapter,
+    selectedContext: [
+      ...protectedEntries,
+      { ...compiledEntry, excerpt: compiled },
+    ],
+  });
+  // The compiler's requested limit is not proof of its actual output size.
+  // Check the complete envelope before reporting success or persisting it.
+  const compiledTokens = estimateSelectedContextTokens(contextPackage.selectedContext);
+  if (compiledTokens > availableInputTokens) {
+    const message = `Compiled context exceeds available input budget (${compiledTokens}/${availableInputTokens} tokens).`;
+    params.onContextCompression?.({
+      category: "story_context", phase: "error", message,
+      protectedTokens, compressibleTokens: compiledTokens - protectedTokens,
+      budgetTokens: availableInputTokens, sources: contextPackage.selectedContext.map((entry) => entry.source),
+    });
+    throw new Error(message);
+  }
   params.onContextCompression?.({
     category: "story_context",
     phase: "end",
@@ -275,18 +312,7 @@ async function applyContextBudgetIfNeeded(params: {
   });
 
   return {
-    contextPackage: ContextPackageSchema.parse({
-      chapter: params.contextPackage.chapter,
-      selectedContext: [
-        ...protectedEntries,
-        {
-          source: "runtime/compiled-compressible-context",
-          reason: "Semantic compilation of lower-priority context after protected context exceeded the input budget.",
-          excerpt: compiled,
-          protection: "compressible",
-        },
-      ],
-    }),
+    contextPackage,
     notes: ["compiled-compressible-context"],
     compression: {
       compiledSource: "runtime/compiled-compressible-context",
@@ -337,10 +363,12 @@ export class ComposerAgent extends BaseAgent {
     readonly goal: string;
     readonly language: "zh" | "en";
     readonly contextBudget?: ContextBudget;
+    /** An existing chapter's actual memo preserves exact hook references. */
+    readonly chapterMemo?: PlanChapterOutput["memo"];
   }): Promise<ContextPackage> {
     const plan: PlanChapterOutput = {
       intent: { chapter: input.chapterNumber, goal: input.goal },
-      memo: {
+      memo: input.chapterMemo ?? {
         chapter: input.chapterNumber,
         goal: input.goal,
         body: input.goal,
@@ -658,6 +686,7 @@ async function collectSelectedContext(
           excerpt: [
             `goal=${plan.memo.goal}`,
             memoBodyExcerpt,
+            ...(plan.memo.readerDelivery ? [`readerDelivery=${JSON.stringify(plan.memo.readerDelivery)}`] : []),
           ].filter(Boolean).join(" | "),
           protection: "protected" as const,
         }]
@@ -740,11 +769,12 @@ async function collectSelectedContext(
       goal: retrievalHints.join("\n"),
       semanticSelector: memorySemanticSelector,
     });
-    const referencedHookEntries = await buildReferencedHookEntries(
+    const referencedHookEntries = buildReferencedHookEntries(
       plan,
       memorySelection.lookupHooks,
       memorySelection.lookupSummaries,
       language,
+      memorySelection.hooks,
     );
 
     const summaryEntries = memorySelection.summaries.map((summary) => ({
@@ -755,10 +785,13 @@ async function collectSelectedContext(
         .join(" | "),
       protection: "compressible" as const,
     }));
-    const hookEntries = memorySelection.hooks.map((hook) => ({
+    const protectedHookSources = new Set(referencedHookEntries.map((entry) => entry.source));
+    const hookEntries = memorySelection.hooks
+      .filter((hook) => !protectedHookSources.has(`runtime/referenced_hook#${hook.hookId}`))
+      .map((hook) => ({
       source: `story/pending_hooks.md#${hook.hookId}`,
       reason: "Carry forward unresolved hooks that match the chapter focus.",
-      excerpt: [hook.type, hook.status, hook.expectedPayoff, hook.notes]
+      excerpt: [hook.hookId, hook.type, hook.status, hook.expectedPayoff, hook.notes]
         .filter(Boolean)
         .join(" | "),
       protection: "compressible" as const,
@@ -773,6 +806,7 @@ async function collectSelectedContext(
     return {
       entries: [
         ...chapterMemoEntry,
+        ...await readerContractContext(storyDir),
         ...entries.filter((entry): entry is NonNullable<typeof entry> => entry !== null),
         ...currentStateEntries,
         ...outlineEntries,
@@ -884,63 +918,85 @@ function deriveRetrievalHints(plan: PlanChapterOutput): string[] {
   ].filter((value): value is string => Boolean(value));
 }
 
-async function buildReferencedHookEntries(
+function buildReferencedHookEntries(
   plan: PlanChapterOutput,
-  lookupHooks: ReadonlyArray<{
-      readonly hookId: string;
-      readonly startChapter: number;
-      readonly type: string;
-      readonly status: string;
-      readonly lastAdvancedChapter: number;
-      readonly expectedPayoff: string;
-      readonly notes: string;
-    }>,
+  lookupHooks: MemorySelection["lookupHooks"],
   summaries: MemorySelection["lookupSummaries"],
   language: "zh" | "en",
-): Promise<ContextPackage["selectedContext"]> {
-    const targetHookIds = [...new Set(plan.memo.threadRefs)];
-    if (targetHookIds.length === 0) {
-      return [];
+  selectedHooks: MemorySelection["hooks"],
+): ContextPackage["selectedContext"] {
+  const memoIds = new Set(plan.memo.threadRefs);
+  const hooksById = new Map(lookupHooks.map((hook) => [hook.hookId, hook]));
+  // Semantic selection still determines relevance. Only authored edges expand
+  // that selection, and canonical IDs never fall back to similar names/titles.
+  const queue = [...new Set([...memoIds, ...selectedHooks
+    .filter((hook) => hook.dependsOn !== undefined || hook.paysOffInArc !== undefined)
+    .map((hook) => hook.hookId)])];
+  const seen = new Set(queue);
+  const requiredBy = new Map<string, Set<string>>();
+  for (let index = 0; index < queue.length; index++) {
+    const hook = hooksById.get(queue[index]!);
+    // Terminal authority is evidence, not an instruction to resume old work.
+    if (!hook || hook.status === "resolved" || hook.status === "superseded") continue;
+    for (const dependency of new Set(hook.dependsOn ?? [])) {
+      const parents = requiredBy.get(dependency) ?? new Set<string>();
+      parents.add(hook.hookId);
+      requiredBy.set(dependency, parents);
+      if (!seen.has(dependency)) { seen.add(dependency); queue.push(dependency); }
     }
+  }
+  return queue.map((hookId) => {
+    const hook = hooksById.get(hookId);
+    const references = [
+      memoIds.has(hookId) ? "chapter memo reference" : undefined,
+      requiredBy.has(hookId) ? `required by=${[...requiredBy.get(hookId)!].join(", ")}` : undefined,
+    ].filter(Boolean).join("; ");
+    if (!hook) return {
+      source: `runtime/missing_hook#${hookId}`,
+      reason: "Exact canonical hook reference is missing; retain the diagnostic rather than inventing history.",
+      excerpt: language === "en"
+        ? `${hookId}: not found in story/state/hooks.json; ${references}; no prior history is established. A new hook may still be seeded through the normal authorized workflow.`
+        : `${hookId}：未在 story/state/hooks.json 找到；${references}；尚无已确认的历史。仍可通过正常授权流程播种新伏笔。`,
+      protection: "protected" as const,
+    };
+    return renderReferencedHookEntry(hook, summaries, language, references);
+  });
+}
 
-    return targetHookIds.flatMap((hookId) => {
-      const hook = lookupHooks.find((entry) => entry.hookId === hookId);
-      if (!hook) {
-        return [];
-      }
-
-      const seedSummary = findHookSummary(summaries, hook.hookId, hook.startChapter, "seed");
-      const latestSummary = findHookSummary(summaries, hook.hookId, hook.lastAdvancedChapter, "latest");
-      const role = language === "en" ? "memo-referenced hook" : "备忘引用伏笔";
-      const promise = hook.expectedPayoff || (language === "en" ? "(unspecified)" : "（未写明）");
-      const seedBeat = seedSummary
-        ? renderHookTraceBeat(seedSummary)
-        : (hook.notes || promise);
-      const latestBeat = latestSummary && latestSummary !== seedSummary
-        ? renderHookTraceBeat(latestSummary)
-        : undefined;
-
-      return [{
-        source: `runtime/referenced_hook#${hook.hookId}`,
-        reason: language === "en"
-          ? "Traceable history for a hook referenced by the chapter memo."
-          : "章节备忘引用伏笔的可追溯历史。",
-        excerpt: language === "en"
-          ? [
-              `${hook.hookId} (${hook.type}, ${role}, status=${hook.status})`,
-              `reader promise: ${promise}`,
-              `original seed (ch${hook.startChapter}): ${seedBeat}`,
-              latestBeat ? `latest turn (ch${hook.lastAdvancedChapter}): ${latestBeat}` : undefined,
-            ].filter(Boolean).join(" | ")
-          : [
-              `${hook.hookId}（${hook.type}，${role}，状态=${hook.status}）`,
-              `读者承诺：${promise}`,
-              `种于第${hook.startChapter}章：${seedBeat}`,
-              latestBeat ? `推进于第${hook.lastAdvancedChapter}章：${latestBeat}` : undefined,
-            ].filter(Boolean).join(" | "),
-        protection: "protected" as const,
-      }];
-    });
+function renderReferencedHookEntry(
+  hook: MemorySelection["lookupHooks"][number],
+  summaries: MemorySelection["lookupSummaries"],
+  language: "zh" | "en",
+  references: string,
+): ContextPackage["selectedContext"][number] {
+  const seedSummary = findHookSummary(summaries, hook.hookId, hook.startChapter, "seed");
+  const latestSummary = findHookSummary(summaries, hook.hookId, hook.lastAdvancedChapter, "latest");
+  const promise = hook.expectedPayoff || (language === "en" ? "(unspecified)" : "（未写明）");
+  const seedBeat = seedSummary ? renderHookTraceBeat(seedSummary) : (hook.notes || promise);
+  const latestBeat = latestSummary && latestSummary !== seedSummary ? renderHookTraceBeat(latestSummary) : undefined;
+  const terminalMeaning = hook.status === "resolved"
+    ? (language === "en" ? "historical evidence only; do not reopen" : "仅作历史证据，不得重新开启")
+    : hook.status === "superseded"
+      ? (language === "en" ? "withdrawn authority; do not reactivate" : "已撤回的约束，不得重新启用") : undefined;
+  return {
+    source: `runtime/referenced_hook#${hook.hookId}`,
+    reason: language === "en" ? "Traceable canonical evidence for chapter-relevant hooks and their authored dependencies."
+      : "本章相关伏笔及作者所写依赖的可追溯正史证据。",
+    excerpt: [
+      `${hook.hookId} (${hook.type}, status=${hook.status})`,
+      `source=story/state/hooks.json#${hook.hookId}`,
+      references, terminalMeaning,
+      hook.dependsOn !== undefined ? `dependsOn=${[...new Set(hook.dependsOn)].join(", ")}` : undefined,
+      hook.paysOffInArc !== undefined ? `paysOffInArc=${hook.paysOffInArc} (${language === "en" ? "author-authored context, not a deadline" : "作者所写的篇章语境，不是固定期限"})` : undefined,
+      language === "en" ? `reader promise: ${promise}` : `读者承诺：${promise}`,
+      language === "en" ? `original seed (ch${hook.startChapter}): ${seedBeat}` : `种于第${hook.startChapter}章：${seedBeat}`,
+      latestBeat ? (language === "en" ? `latest turn (ch${hook.lastAdvancedChapter}): ${latestBeat}` : `推进于第${hook.lastAdvancedChapter}章：${latestBeat}`) : undefined,
+      // Withdrawal authority and other authored notes must survive even when
+      // chapter summaries supply the seed/latest narrative evidence.
+      hook.notes && seedBeat !== hook.notes ? `notes: ${hook.notes}` : undefined,
+    ].filter(Boolean).join(" | "),
+    protection: "protected",
+  };
 }
 
 async function maybeContextSource(

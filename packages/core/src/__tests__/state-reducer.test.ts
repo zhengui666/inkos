@@ -12,6 +12,25 @@ describe("runtime state reducer contract", () => {
     expect(resolved.hooks.hooks[0]).toMatchObject({status:"resolved",lastAdvancedChapter:3});
   });
 
+  it("applies authored dependency and arc updates while preserving omitted legacy fields", () => {
+    const original = snapshot();
+    const hook = original.hooks.hooks[0]!;
+    const delta = (upsert: typeof hook, chapter: number) => ({
+      chapter, factOps: { upsert: [], expire: [] },
+      hookOps: { upsert: [upsert], mention: [], resolve: [], defer: [] }, newHookCandidates: [],
+    });
+    const updated = applyRuntimeStateDelta({ snapshot: original, delta: delta({
+      ...hook, dependsOn: ["witness", "witness", "permit"], paysOffInArc: "Return to the quay",
+    }, 1) });
+    expect(updated.hooks.hooks[0]).toMatchObject({ dependsOn: ["witness", "permit"], paysOffInArc: "Return to the quay" });
+    const omitted = applyRuntimeStateDelta({ snapshot: updated, delta: delta(hook, 2) });
+    expect(omitted.hooks.hooks[0]).toEqual(updated.hooks.hooks[0]);
+    const cleared = applyRuntimeStateDelta({ snapshot: omitted, delta: delta({ ...hook, dependsOn: [], paysOffInArc: "" }, 3) });
+    expect(cleared.hooks.hooks[0]).toMatchObject({ dependsOn: [], paysOffInArc: "" });
+    expect(original.hooks.hooks[0]).not.toHaveProperty("dependsOn");
+    expect(original.hooks.hooks[0]).not.toHaveProperty("paysOffInArc");
+  });
+
   it("applies facts, exact hook operations, and one chapter summary", () => {
     const next = applyRuntimeStateDelta({
       snapshot: snapshot(),

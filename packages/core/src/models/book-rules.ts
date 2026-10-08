@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ReaderContractSchema } from "./reader-contract.js";
 
 const ProtagonistSchema = z.object({
   name: z.string(),
@@ -13,6 +14,7 @@ const GenreLockSchema = z.object({
 
 export const BookRulesSchema = z.object({
   version: z.literal("2"),
+  readerContract: ReaderContractSchema.optional(),
   protagonist: ProtagonistSchema,
   genreLock: GenreLockSchema,
   narrativePerson: z.string().trim().min(1).optional(),

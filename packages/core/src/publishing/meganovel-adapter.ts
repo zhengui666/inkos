@@ -11,7 +11,7 @@ import { MegaNovelIntentSchema, MegaNovelProbeSchema, MegaNovelScopeSchema, Mega
   type MegaNovelBrowserPort } from './meganovel-contracts.js';
 
 /** Durable single-chapter adapter. A concrete calibrated UI binding is a separate deployment prerequisite. */
-export interface MegaNovelOperationOptions { signal?: AbortSignal }
+export interface MegaNovelOperationOptions { signal?: AbortSignal; beforeMutation?: () => Promise<void> }
 
 export class MegaNovelPublishingAdapter {
   constructor(private readonly packages: ManualPublishingAdapter, private readonly store: PublishingStore,
@@ -36,6 +36,8 @@ export class MegaNovelPublishingAdapter {
     const run: MegaNovelRun = {...intent, revisionId: chapter.revisionId, phase: 'draft_unknown',
       remoteChapterId: null, evidence: null};
     if (found) return this.record(run, found, pkg.version);
+    await options.beforeMutation?.();
+    options.signal?.throwIfAborted();
     this.write(run, pkg.version); // Reserve before any editor input, including autosave.
     try {
       await this.browser.createDraft({...intent, title: chapter.title, content, revisionId: chapter.revisionId}, options);
@@ -59,6 +61,8 @@ export class MegaNovelPublishingAdapter {
     if (!found) throw publishingError('MEGANOVEL_READBACK_REQUIRED', 'The verified draft is no longer visible. Do not submit again.');
     if (found.status !== 'draft') return this.record(prior, found, pkg.version);
     this.assertDisclosure(found.aiDisclosure, intent.aiAssisted);
+    await options.beforeMutation?.();
+    options.signal?.throwIfAborted();
     this.write({...prior, phase: 'submit_unknown'}, pkg.version);
     try {
       await this.browser.submit({...intent, remoteChapterId: found.remoteChapterId,

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { connectMegaNovelCdpPort, validateMegaNovelCdpEndpoint, type MegaNovelCdpConfiguration,
   type MegaNovelDomBinding } from '../publishing/meganovel-cdp.js';
+import { PublisherStartupCleanupError } from '../publishing/publisher-cleanup.js';
 
 const fixture = vi.hoisted(() => ({connect: vi.fn()}));
 vi.mock('playwright-core', () => ({chromium: {connectOverCDP: fixture.connect}}));
@@ -100,6 +101,20 @@ describe('MegaNovel actual CDP transport with synthetic browser driver', () => {
       .rejects.toMatchObject({code: 'MEGANOVEL_BROWSER_BLOCKED'});
     expect(binding.createDraft).not.toHaveBeenCalled();
   });
+  it.each(['createDraft', 'submit'] as const)('rechecks authority after transport preflight and passes the guard to %s', async operation => {
+    port = await connectMegaNovelCdpPort(config, binding);
+    const input = {packageId: 'package-1', chapterNumber: 1, scope: config.scope, aiAssisted: true,
+      revisionId: 'revision-1', title: 'Title', content: 'Body', remoteChapterId: 'remote-1'};
+    let changed = false;
+    binding.probe = vi.fn(async () => { changed = true; return {scope: config.scope, origin: 'https://www.meganovel.com' as const, blocker: 'none' as const}; });
+    const beforeMutation = vi.fn(async () => { if (changed) throw Object.assign(new Error('New author brief'), {code: 'CHAPTER_REVIEW_INPUTS_CHANGED'}); });
+    await expect(port[operation](input, {beforeMutation})).rejects.toMatchObject({code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
+    expect(binding[operation]).not.toHaveBeenCalled();
+    changed = false;
+    binding.probe = vi.fn(async () => ({scope: config.scope, origin: 'https://www.meganovel.com' as const, blocker: 'none' as const}));
+    await port[operation](input, {beforeMutation});
+    expect(binding[operation]).toHaveBeenCalledWith(expect.anything(), input, expect.any(AbortSignal), beforeMutation);
+  });
   it('serializes binding operations on its owned target', async () => {
     port = await connectMegaNovelCdpPort(config, binding);
     const order: string[] = [];
@@ -166,6 +181,32 @@ describe('MegaNovel actual CDP transport with synthetic browser driver', () => {
     pageURL = 'https://www.meganovel.com/fixture-only';
     browser.close.mockImplementation(async () => { connected = false; events.emit('disconnected'); });
     port = await connectMegaNovelCdpPort(config, binding);
+  });
+  it('exposes cleanup-only retry for a failed startup without reconnecting or releasing a live owner', async () => {
+    pageURL = 'https://example.com';
+    browser.close.mockRejectedValueOnce(new Error('fixture startup close failed'));
+    const failure = await connectMegaNovelCdpPort(config, binding).catch(error => error) as PublisherStartupCleanupError;
+    expect(failure).toBeInstanceOf(PublisherStartupCleanupError);
+    expect(connected).toBe(true);
+    await expect(connectMegaNovelCdpPort(config, binding)).rejects.toMatchObject({ code: 'MEGANOVEL_BROWSER_BUSY' });
+    expect(fixture.connect).toHaveBeenCalledOnce();
+    let release!: () => void;
+    browser.close.mockImplementationOnce(() => new Promise<void>(resolve => {
+      release = () => { connected = false; events.emit('disconnected'); resolve(); };
+    }));
+    const retry = failure.cleanup.close();
+    expect(failure.cleanup.close()).toBe(retry);
+    await vi.waitFor(() => expect(browser.close).toHaveBeenCalledTimes(2));
+    await expect(connectMegaNovelCdpPort(config, binding)).rejects.toMatchObject({ code: 'MEGANOVEL_BROWSER_BUSY' });
+    release(); await retry; await failure.cleanup.close();
+    expect(connected).toBe(false);
+    expect(browser.close).toHaveBeenCalledTimes(2);
+    expect(fixture.connect).toHaveBeenCalledOnce();
+    expect(binding.createDraft).not.toHaveBeenCalled(); expect(binding.submit).not.toHaveBeenCalled();
+    connected = true;
+    pageURL = 'https://www.meganovel.com/fixture-only';
+    port = await connectMegaNovelCdpPort(config, binding);
+    expect(fixture.connect).toHaveBeenCalledTimes(2);
   });
   it('shares in-flight close and admits no replacement before disconnection completes', async () => {
     port = await connectMegaNovelCdpPort(config, binding);

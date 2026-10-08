@@ -44,6 +44,15 @@ export interface WriteChapterInput {
   readonly lengthSpec?: LengthSpec;
   readonly wordCountOverride?: number;
   readonly temperatureOverride?: number;
+  /** Host-owned recovery input; it still needs settlement and review. */
+  readonly resumeDraft?: GeneratedChapterDraft;
+  readonly onDraftGenerated?: (draft: GeneratedChapterDraft) => Promise<void>;
+}
+
+export interface GeneratedChapterDraft {
+  readonly title: string;
+  readonly content: string;
+  readonly tokenUsage?: TokenUsage;
 }
 
 export interface SettleChapterStateInput {
@@ -99,6 +108,7 @@ export class WriterAgent extends BaseAgent {
   }
 
   async writeChapter(input: WriteChapterInput): Promise<WriteChapterOutput> {
+    this.ctx.signal?.throwIfAborted();
     const { book, bookDir, chapterNumber } = input;
 
     const [styleGuide, runtimeSnapshot] = await Promise.all([
@@ -116,50 +126,12 @@ export class WriterAgent extends BaseAgent {
     if (!input.chapterIntent || !input.chapterMemo || !input.contextPackage) {
       throw new Error("Writer requires governed chapter intent, memo, and context package.");
     }
-    // ── Phase 1: Creative writing (temperature 0.7) ──
-    const creativeSystemPrompt = buildWriterSystemPrompt(
-      book, bookRules, bookRulesBody, styleGuide,
-      resolvedLanguage,
-      resolvedLengthSpec,
-    );
-
-    const renderCreative = (contextPackage: ContextPackage) => [{ role: "system" as const, content: creativeSystemPrompt },
-      { role: "user" as const, content: this.buildGovernedUserPrompt({
-      chapterNumber,
-      chapterMemo: input.chapterMemo,
-      chapterIntentData: input.chapterIntentData,
-      contextPackage,
-      externalContext: input.externalContext,
-      lengthSpec: resolvedLengthSpec,
-      language: book.language,
-    }) }];
-    const creativeContext = await fitGovernedContext({ context: this.ctx, worker: this.name, language: resolvedLanguage,
-      contextPackage: input.contextPackage, intent: input.chapterMemo.goal, render: renderCreative });
-
-    const creativeTemperature = input.temperatureOverride ?? 0.7;
-
-    this.logInfo(resolvedLanguage, {
-      zh: `阶段 1：创作正文（第${chapterNumber}章）`,
-      en: `Phase 1: creative writing for chapter ${chapterNumber}`,
-    });
-
-    const { result: creativeSubmission, usage: creativeUsage } = await this.submitStructured(
-      renderCreative(creativeContext),
-      {
-        name: "submit_chapter_draft",
-        label: resolvedLanguage === "en" ? "Submit chapter draft" : "提交章节初稿",
-        description: resolvedLanguage === "en"
-          ? "Submit the complete chapter title and prose."
-          : "提交完整的章节标题和正文。",
-        parameters: ChapterDraftToolSchema,
-      },
-      { temperature: creativeTemperature },
-    );
-    const creative = {
-      title: creativeSubmission.title.trim(),
-      content: creativeSubmission.content.trim(),
-      wordCount: countChapterLength(creativeSubmission.content, resolvedLengthSpec.countingMode),
-    };
+    const draft = input.resumeDraft ?? await this.generateDraft(input, bookRules, bookRulesBody, styleGuide, resolvedLengthSpec);
+    // Save a completed body before observing cancellation, but never settle or
+    // accept it after cancellation. A later authorized retry may resume it.
+    this.ctx.signal?.throwIfAborted();
+    const creative = { ...draft, wordCount: countChapterLength(draft.content, resolvedLengthSpec.countingMode) };
+    const creativeUsage = draft.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 
     // ── Phase 2: State settlement (temperature 0.3) ──
     this.logInfo(resolvedLanguage, {
@@ -210,6 +182,59 @@ export class WriterAgent extends BaseAgent {
       runtimeStateApplied: true,
       tokenUsage,
     };
+  }
+
+  private async generateDraft(input: WriteChapterInput, bookRules: BookRules | null, bookRulesBody: string, styleGuide: string,
+    resolvedLengthSpec: LengthSpec): Promise<GeneratedChapterDraft> {
+    const { book, chapterNumber } = input;
+    const resolvedLanguage = book.language;
+    // ── Phase 1: Creative writing (temperature 0.7) ──
+    const creativeSystemPrompt = buildWriterSystemPrompt(
+      book, bookRules, bookRulesBody, styleGuide,
+      resolvedLanguage,
+      resolvedLengthSpec,
+    );
+
+    const renderCreative = (contextPackage: ContextPackage) => [{ role: "system" as const, content: creativeSystemPrompt },
+      { role: "user" as const, content: this.buildGovernedUserPrompt({
+      chapterNumber,
+      chapterMemo: input.chapterMemo,
+      chapterIntentData: input.chapterIntentData,
+      contextPackage,
+      externalContext: input.externalContext,
+      lengthSpec: resolvedLengthSpec,
+      language: book.language,
+    }) }];
+    const creativeContext = await fitGovernedContext({ context: this.ctx, worker: this.name, language: resolvedLanguage,
+      contextPackage: input.contextPackage, intent: input.chapterMemo.goal, render: renderCreative });
+
+    const creativeTemperature = input.temperatureOverride ?? 0.7;
+
+    this.logInfo(resolvedLanguage, {
+      zh: `阶段 1：创作正文（第${chapterNumber}章）`,
+      en: `Phase 1: creative writing for chapter ${chapterNumber}`,
+    });
+
+    const { result: creativeSubmission, usage: creativeUsage } = await this.submitStructured(
+      renderCreative(creativeContext),
+      {
+        name: "submit_chapter_draft",
+        label: resolvedLanguage === "en" ? "Submit chapter draft" : "提交章节初稿",
+        description: resolvedLanguage === "en"
+          ? "Submit the complete chapter title and prose."
+          : "提交完整的章节标题和正文。",
+        parameters: ChapterDraftToolSchema,
+      },
+      { temperature: creativeTemperature },
+    );
+    const draft: GeneratedChapterDraft = {
+      title: creativeSubmission.title.trim(),
+      content: creativeSubmission.content.trim(),
+      tokenUsage: creativeUsage,
+    };
+
+    await input.onDraftGenerated?.(draft);
+    return draft;
   }
 
   async settleChapterState(input: SettleChapterStateInput): Promise<WriteChapterOutput> {

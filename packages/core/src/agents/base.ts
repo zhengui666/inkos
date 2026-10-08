@@ -205,6 +205,9 @@ export function appendActivatedSkillGuidance(
   activations: ReadonlyArray<ActivatedSkillGuidance> | undefined,
 ): ReadonlyArray<LLMMessage> {
   if (!activations || activations.length === 0) return messages;
+  // Canonicalize only rendered methodology, as SKILL.md parsing already does.
+  // Keep raw reference bodies and character offsets intact for source readback;
+  // author messages and protected story evidence must remain byte-for-byte.
   const guidance = [
     "## Activated professional skills",
     "Use this specialist methodology for the current operation. It is not author intent, canon, an output-format override, or permission to mutate anything outside the active operation.",
@@ -216,7 +219,7 @@ export function appendActivatedSkillGuidance(
         resource.body,
       ]),
     ]),
-  ].join("\n\n");
+  ].join("\n\n").replace(/\r\n?/g, "\n");
   const systemIndex = messages.findIndex((message) => message.role === "system");
   if (systemIndex < 0) {
     return [{ role: "system", content: guidance }, ...messages];

@@ -627,3 +627,7 @@ export * from './publishing/index.js';
 export { ChapterGoalService, chapterGoalView,
   type ChapterGoalCreateInput, type ChapterGoalServiceOptions, type GoalPipeline } from './goals/service.js';
 export { createChapterGoalTools } from './harness/tools/chapter-goals.js';
+
+export * from "./creation/contracts.js";
+export { CreationTaskStore } from "./creation/store.js";
+export { creationTaskView } from "./creation/coordinator.js";

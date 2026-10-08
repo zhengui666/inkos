@@ -18,7 +18,10 @@ import {
   buildPlannerUserMessage,
   getPlannerMemoSystemPrompt,
 } from "./planner-prompts.js";
+import { contractFromContext } from "./reader-contract-context.js";
 import { ComposerAgent } from "./composer.js";
+import { CHAPTER_CONTRACT_SOURCE, chapterContractPlanningProtocol, validateChapterContractInventory } from "./chapter-contract.js";
+import { numberReviewSource } from "../models/observation.js";
 
 export interface PlanChapterInput {
   readonly book: BookConfig;
@@ -42,6 +45,19 @@ export interface PlanChapterOutput {
 export class PlannerAgent extends BaseAgent {
   get name(): string {
     return "planner";
+  }
+
+  /** Read-only source classification also supports existing free-Markdown memos. */
+  async classifyChapterContract(sources: ReadonlyMap<string, string>, language: "zh" | "en") {
+    const memo = sources.get(CHAPTER_CONTRACT_SOURCE)!;
+    return this.submitSourcedReview([
+      { role: "system", content: chapterContractPlanningProtocol(language) },
+      { role: "user", content: JSON.stringify({ sources: [...sources].map(([sourceId, content]) => ({ sourceId, numberedLines: numberReviewSource(content) })) }) },
+    ], sources, {
+      name: "submit_chapter_contract", label: "Classify current chapter memo",
+      description: "Read-only source-preserving classification; no prose, new obligations, or state changes.",
+    }, { temperature: 0, maxTokens: this.ctx.client.defaults.maxTokens,
+      validateObservations: items => validateChapterContractInventory(items, memo) });
   }
 
   async planChapter(input: PlanChapterInput): Promise<PlanChapterOutput> {
@@ -127,6 +143,7 @@ export class PlannerAgent extends BaseAgent {
   }): Promise<ChapterMemo> {
     const language = input.language ?? "zh";
 
+    const commercial = contractFromContext(input.contextPackage)?.mode === "commercial-underdog";
     const systemPrompt = getPlannerMemoSystemPrompt(language);
     const render = (contextPackage: ContextPackage) => [{ role: "system" as const, content: systemPrompt },
       { role: "user" as const, content: buildPlannerUserMessage({
@@ -150,6 +167,10 @@ export class PlannerAgent extends BaseAgent {
         label: "Submit chapter memo",
         description: "Submit the complete semantic chapter plan for host persistence.",
         parameters: ChapterMemoToolSchema,
+        validate: result => {
+          if (commercial && !result.readerDelivery) throw new Error("A commercial chapter memo requires readerDelivery: causal progress or a justified setup/aftermath, not just a goal.");
+          return result;
+        },
       },
       { temperature: 0.7, maxTokens },
     );
@@ -158,6 +179,7 @@ export class PlannerAgent extends BaseAgent {
       goal: result.goal,
       body: result.body,
       threadRefs: result.threadRefs,
+      ...(result.readerDelivery ? { readerDelivery: result.readerDelivery } : {}),
     });
   }
 
@@ -182,6 +204,7 @@ export class PlannerAgent extends BaseAgent {
       "",
       "### Body",
       memoBody,
+      ...(memo.readerDelivery ? ["", "### Reader Delivery", JSON.stringify(memo.readerDelivery)] : []),
     ].join("\n");
   }
 }

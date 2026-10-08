@@ -1,3 +1,4 @@
+import { readChapterReviewInputs, sameChapterReviewInputs } from "../pipeline/review-inputs.js";
 import { join, resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
@@ -14,6 +15,7 @@ import { publishingError, type PublishingPackage } from './contracts.js';
 import { MegaNovelScopeSchema, type MegaNovelBrowserPort, type MegaNovelScope, type MegaNovelRun } from './meganovel-contracts.js';
 import type { MegaNovelCdpConfiguration, MegaNovelDomBinding } from './meganovel-cdp.js';
 import { createMegaNovelDomBinding, MegaNovelDomConfigurationSchema } from './meganovel-dom-binding.js';
+import { createPublisherCleanup, PublisherStartupCleanupError } from './publisher-cleanup.js';
 
 export interface SchedulerPublishingBinding {
   workId: string; targetId: string; scope: MegaNovelScope; aiAssisted: boolean;
@@ -33,11 +35,13 @@ export function createMegaNovelSchedulerPublisher(root: string, bindings: readon
     if (binding.requiredStateReplay) z.object({chapterNumber: z.number().int().positive(), planId: z.string().min(1)})
       .parse(binding.requiredStateReplay);
   }
+  const byWork = new Map(bindings.map(binding => [binding.workId, binding]));
+  if (byWork.size !== bindings.length) throw new Error('Select one publication destination per work.');
   const store = new PublishingStore(join(root, '.inkos', 'harness.sqlite'));
   const packages = new ManualPublishingAdapter(root, store), state = new StateManager(root);
-  const byWork = new Map(bindings.map(binding => [binding.workId, binding]));
-  if (byWork.size !== bindings.length) { store.close(); throw new Error('Select one publication destination per work.'); }
+  const cleanup = createPublisherCleanup(() => [bindings.map(binding => binding.browser), [store]]);
   const requireBinding = (workId: string) => {
+    if (cleanup.requested) throw publishingError('PUBLISHING_CLOSED', 'The configured publisher has closed.');
     const binding = byWork.get(workId);
     if (!binding) throw publishingError('PUBLISHING_BINDING_MISSING', `No configured publication destination for ${workId}.`);
     const target = store.getTarget(binding.targetId);
@@ -97,6 +101,15 @@ export function createMegaNovelSchedulerPublisher(root: string, bindings: readon
       ...(run.remoteChapterId ? { remoteChapterId: run.remoteChapterId } : {}), ...(run.evidence ? { evidence: run.evidence } : {}) };
   };
   return {
+    async reconcile(input) {
+      input.signal.throwIfAborted();
+      const binding = requireBinding(input.workId);
+      await requireCanonicalReplay(binding);
+      const prior = existingPackage(binding, input.chapterNumber);
+      if (!prior) return undefined;
+      const run = await adapter(binding).reconcile(intent(binding, prior, input.chapterNumber), { signal: input.signal });
+      return run.phase === 'draft' ? { status: 'draft' } : view(run);
+    },
     async ready(workId, signal, continuingChapter) {
       signal.throwIfAborted();
       const binding = requireBinding(workId), remote = adapter(binding);
@@ -144,21 +157,47 @@ export function createMegaNovelSchedulerPublisher(root: string, bindings: readon
       const binding = requireBinding(input.workId), remote = adapter(binding);
       await requireCanonicalReplay(binding);
       const prior = existingPackage(binding, input.chapterNumber);
-      const pkg = prior ?? await freeze(binding, input.chapterNumber, input.revisionId);
-      input.signal.throwIfAborted();
+      let pkg = prior;
+      let run: MegaNovelRun | undefined;
+      if (prior) {
+        run = await remote.reconcile(intent(binding, prior, input.chapterNumber), { signal: input.signal });
+        if (run.phase !== 'draft') return view(run);
+      }
+      const beforeMutation = async () => {
+        input.signal.throwIfAborted();
+        await input.beforeMutation?.();
+        if (!sameChapterReviewInputs(input.reviewInputs, await readChapterReviewInputs(state.bookDir(input.workId), input.chapterNumber))) {
+          throw publishingError('CHAPTER_REVIEW_INPUTS_CHANGED', 'A current input-bound review is required before a new remote mutation.');
+        }
+        const work = await loadWorkManifest(root, binding.workId);
+        const prefix = `source/chapters/${String(input.chapterNumber).padStart(4, '0')}_`;
+        const revisions = work.artifacts.flatMap(artifact => artifact.revisions.filter(revision =>
+          revision.id === artifact.currentRevisionId && revision.path.startsWith(prefix) && revision.path.endsWith('.md')));
+        const revision = revisions[0];
+        if (revisions.length !== 1 || revision?.id !== input.revisionId || !revision.snapshotPath
+          || !(await readFile(join(root, 'works', binding.workId, revision.path))).equals(
+            await readFile(join(root, 'works', binding.workId, revision.snapshotPath)))) {
+          throw publishingError('CHAPTER_REVISION_CHANGED', 'Chapter changed after review; no new remote mutation was made.');
+        }
+        input.signal.throwIfAborted();
+      };
+      if (!pkg) {
+        if (input.chapterNumber >= binding.firstNewChapter) await beforeMutation();
+        pkg = await freeze(binding, input.chapterNumber, input.revisionId);
+      }
       const selected = pkg.manifest.chapters.find(item => item.number === input.chapterNumber)!;
       const request = intent(binding, pkg, input.chapterNumber);
-      let run = prior || input.chapterNumber < binding.firstNewChapter
-        ? await remote.reconcile(request, { signal: input.signal }) : await remote.saveDraft(request, { signal: input.signal });
       if (selected.revisionId !== input.revisionId) throw publishingError('PUBLISHING_RECONCILIATION_REQUIRED', 'An older frozen revision has a publication attempt; it was read back without sending the edited chapter.');
+      run ??= input.chapterNumber < binding.firstNewChapter
+        ? await remote.reconcile(request, { signal: input.signal })
+        : await remote.saveDraft(request, { signal: input.signal, beforeMutation });
       input.signal.throwIfAborted();
-      if (run.phase === 'draft' && input.chapterNumber >= binding.firstNewChapter) run = await remote.submit(request, { signal: input.signal });
+      if (run.phase === 'draft' && input.chapterNumber >= binding.firstNewChapter) {
+        run = await remote.submit(request, { signal: input.signal, beforeMutation });
+      }
       return view(run);
     },
-    async close() {
-      try { await Promise.all(bindings.map(binding => binding.browser.close?.())); }
-      finally { store.close(); }
-    },
+    close: () => cleanup.close(),
   };
 }
 
@@ -205,6 +244,8 @@ export async function loadMegaNovelSchedulerPublisher(root: string, configuratio
 export async function createMegaNovelSchedulerPublisherFromConfiguration(root: string, input: unknown) {
   const configurations = z.array(MegaNovelSchedulerBindingConfigurationSchema).min(1).parse(input);
   const bindings: SchedulerPublishingBinding[] = [];
+  const unfinishedLoaders = new Set<{ close(): Promise<void> }>();
+  const cleanup = createPublisherCleanup(() => [[...bindings.map(binding => binding.browser), ...unfinishedLoaders]]);
   try {
     for (const config of configurations) {
       const { domBindingModule, dom, workId, targetId, firstNewChapter, historicalChapterIds, requiredStateReplay, aiAssisted, ...transport } = config;
@@ -218,7 +259,11 @@ export async function createMegaNovelSchedulerPublisherFromConfiguration(root: s
     }
     return createMegaNovelSchedulerPublisher(root, bindings);
   } catch (error) {
-    await Promise.all(bindings.map(binding => binding.browser.close?.()));
+    try { await cleanup.close(); }
+    catch (cleanupError) {
+      if (error instanceof PublisherStartupCleanupError) unfinishedLoaders.add(error.cleanup);
+      throw new PublisherStartupCleanupError(error, cleanupError, cleanup);
+    }
     throw error;
   }
 }

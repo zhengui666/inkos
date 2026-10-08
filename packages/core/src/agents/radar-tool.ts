@@ -1,4 +1,5 @@
 import { Type } from "@sinclair/typebox";
+import { ReaderContractToolSchema } from "./reader-contract-tool.js";
 
 export const RadarResultToolSchema = Type.Object({
   recommendations: Type.Array(Type.Object({
@@ -9,6 +10,7 @@ export const RadarResultToolSchema = Type.Object({
     genre: Type.String(),
     concept: Type.String(),
     reasoning: Type.String(),
+    readerContract: ReaderContractToolSchema,
     benchmarkTitles: Type.Array(Type.String()),
   })),
   marketSummary: Type.String(),

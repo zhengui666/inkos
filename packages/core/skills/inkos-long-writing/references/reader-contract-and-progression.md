@@ -2,7 +2,7 @@
 
 ## Opening chapters
 
-For the default commercial web-fiction target, open with a protagonist goal meeting visible resistance. Make the opposing aims, immediate stake, and reason to act now understandable before background explanation. Start the current chapter from its active pressure, not a neutral tour of procedures or setting. An explicit literary or quiet opening remains authoritative when the author chooses it.
+For the selected fast-paced commercial mode, default to a protagonist goal meeting visible resistance before background explanation. Make opposing aims, immediate stakes and the reason to act understandable through the current pressure rather than a neutral tour of procedures or setting. This is a pacing default, not a universal opening order. An explicitly chosen commercial slow-burn, quiet or literary opening can establish interest differently; keep the current event understandable and the promised reader experience intact.
 
 Give the reader a concrete outcome to want. In the current turnaround mode, show a protagonist with limited room to manoeuvre meeting a usable opening, then choosing what to attempt. Demonstrate the leverage through what it makes possible and what it still costs. A power, useful skill or lucky encounter may supply the opening; the protagonist's actions should supply the win. Timing follows the chosen pace and form, not fixed chapter numbers.
 
@@ -34,4 +34,4 @@ A chapter's discovery, decision, cost, relationship shift, and material handoff 
 
 Distinguish a planted seed, a live reader promise, its advancement, a justified delay, and its payoff. Repetition of a clue is not advancement unless its significance changes. Payoff should be supported by prior facts, access, motives, and choices; a resolved promise must affect later behavior. Keep independent long-range threads alive at their own appropriate pace, rather than importing a short story's frequent-turn pattern into every chapter.
 
-Alternate pressure, initiative, reward, and aftermath according to the current arc. A quiet chapter can alter intimacy, suspicion, grief, resolve, or understanding without a new external threat. Keep that change connected to the reader's desired outcome. End when this chapter's movement earns a boundary; neither a timed hook nor a cliffhanger is compulsory. Preserve an explicitly chosen literary pace or deliberate ambiguity; do not use these exceptions to dilute the default web-fiction promise.
+Alternate pressure, initiative, reward, and aftermath according to the current arc. A quiet chapter can alter intimacy, suspicion, grief, resolve, or understanding without a new external threat. Keep that change connected to the reader's desired outcome. End when this chapter's movement earns a boundary; neither a timed hook nor a cliffhanger is compulsory. Preserve an explicitly chosen pace or deliberate ambiguity. Whether fast-paced or slow-burn, keep the current reader promise clear.

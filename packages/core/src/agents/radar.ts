@@ -1,3 +1,4 @@
+import type { ReaderContract } from "../models/reader-contract.js";
 import { BaseAgent } from "./base.js";
 import type { Platform, Genre } from "../models/book.js";
 import type { RadarSource, PlatformRankings } from "./radar-source.js";
@@ -31,6 +32,7 @@ export interface RadarRecommendation {
   readonly genre: Genre;
   readonly concept: string;
   readonly reasoning: string;
+  readonly readerContract?: ReaderContract;
   readonly benchmarkTitles: ReadonlyArray<string>;
 }
 
@@ -99,6 +101,7 @@ export class RadarAgent extends BaseAgent {
 Requested platform: ${options.targetPlatform ?? "the observed source platforms"}.
 Requested writing language: ${options.language ?? "the observed source languages"}.
 For each recommendation, provide a NEW original title, concept and genre, the exact target platform and language,
+a structured readerContract separating a familiar genre promise from an original hook and a causal underdog rise route,
 and evidenceIds referencing the supplied [S...E...] records. benchmarkTitles must exactly name those cited records.
 If source provenance is missing, do not invent evidenceIds. A saved snapshot is not a fresh live fetch.
 Use rankings only for broad market patterns. Create an original premise and characters; do not copy, translate,

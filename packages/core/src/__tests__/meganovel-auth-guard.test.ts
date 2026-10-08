@@ -143,3 +143,31 @@ describe('MegaNovel identity guard using the production binding with synthetic p
     expect(state.accountClosed).toBe(state.accountReads);
   }, 10000);
 });
+
+describe('input-review guard at production DOM effect boundaries with synthetic pages', () => {
+  it.each(['before-new', 'after-new', 'during-typing'] as const)('stops changed authority %s without another effect', async boundary => {
+    const {state, page, binding, input, signal} = fixture();
+    const guard = async () => {
+      if (boundary === 'before-new' || boundary === 'after-new' && !state.url.includes('chapterId=')
+        || boundary === 'during-typing' && state.inputs >= 4) {
+        throw Object.assign(new Error('Author brief changed.'), {code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
+      }
+    };
+    await expect(binding.createDraft(page, {...input, chapterNumber: 3, title: 'Third', content: 'First\nSecond\nThird'}, signal, guard))
+      .rejects.toMatchObject({code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
+    expect(state.inputs).toBe(boundary === 'during-typing' ? 4 : 0);
+    expect(state.saves + state.publishes).toBe(0);
+    if (boundary === 'before-new') expect(state.url).toContain('chapterId=102');
+  });
+  it.each(['before-publish', 'before-now', 'before-confirm'] as const)('stops changed authority %s without publishing', async boundary => {
+    const {state, page, binding, input, signal} = fixture();
+    const guard = async () => {
+      if (boundary === 'before-publish' || boundary === 'before-now' && state.dialog || boundary === 'before-confirm' && state.now) {
+        throw Object.assign(new Error('Author memo changed.'), {code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
+      }
+    };
+    await expect(binding.submit(page, input, signal, guard)).rejects.toMatchObject({code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
+    expect(state.publishes + state.inputs + state.saves).toBe(0);
+    expect(state.dialog).toBe(boundary !== 'before-publish'); expect(state.now).toBe(boundary === 'before-confirm');
+  });
+});
