@@ -14,18 +14,23 @@ const backupPath = join(packageDir, ".package.json.publish-backup");
 
 async function writeAtomic(path, content) {
   const tempPath = `${path}.tmp-${process.pid}-${Date.now()}`;
-  await writeFile(tempPath, content, "utf-8");
+  await writeFile(tempPath, content);
   await rename(tempPath, path);
 }
 
 async function main() {
+  let original;
   try {
-    const original = await readFile(backupPath, "utf-8");
-    await writeAtomic(packageJsonPath, original);
-    await rm(backupPath, { force: true });
-  } catch {
-    // No backup means prepack found nothing to replace — fine.
+    original = await readFile(backupPath);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      // No backup means prepack found nothing to replace — fine.
+      return;
+    }
+    throw error;
   }
+  await writeAtomic(packageJsonPath, original);
+  await rm(backupPath);
 }
 
 await main();

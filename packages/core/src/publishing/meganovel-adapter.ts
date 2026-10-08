@@ -142,6 +142,10 @@ export class MegaNovelPublishingAdapter {
       const failure = comparison.errors[0]!;
       throw publishingError(failure.code, failure.message);
     }
+    if (!snapshot.candidates.length && prior && !['draft_unknown', 'submit_unknown'].includes(prior.phase)) {
+      throw publishingError('MEGANOVEL_READBACK_REQUIRED',
+        'The previously observed chapter is missing from the complete lookup. Reconcile it before further writing or submission.');
+    }
     return snapshot.candidates[0];
   }
 

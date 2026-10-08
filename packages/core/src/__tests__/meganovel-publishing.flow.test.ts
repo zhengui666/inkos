@@ -52,6 +52,63 @@ beforeEach(async () => {
 afterEach(async () => { store.close(); await rm(root, {recursive: true, force: true}); });
 
 describe('MegaNovel durable browser protocol (synthetic port, not live publication)', () => {
+  it.each(['draft', 'submitted', 'reviewing', 'published', 'rejected'] as const)(
+    'requires fresh readback when an observed %s chapter disappears, preserving its run until read-only recovery', async status => {
+    snapshot.candidates = [{...row(), status}];
+    const retained = await adapter.reconcile(intent);
+    const retainedPackage = store.getPackage(intent.packageId);
+    store.close(); store = new PublishingStore(join(root, '.inkos', 'harness.sqlite'));
+    packages = new ManualPublishingAdapter(root, store);
+    adapter = new MegaNovelPublishingAdapter(packages, store, browser);
+    snapshot.candidates = [];
+    for (const entry of ['reconcile', 'saveDraft', 'submit'] as const) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await expect(adapter[entry](intent)).rejects.toMatchObject({code: 'MEGANOVEL_READBACK_REQUIRED'});
+        expect(store.getMegaNovelRun(intent.packageId, 1)).toEqual(retained);
+        expect(store.getPackage(intent.packageId)).toEqual(retainedPackage);
+      }
+    }
+    snapshot.complete = false;
+    await expect(adapter.reconcile(intent)).rejects.toMatchObject({code: 'MEGANOVEL_INCOMPLETE_LOOKUP'});
+    snapshot.complete = true;
+    for (const conflict of [{remoteChapterId: 'different-id'}, {content: 'different body'}]) {
+      snapshot.candidates = [{...row(), status, ...conflict}];
+      for (const entry of ['reconcile', 'saveDraft', 'submit'] as const) {
+        await expect(adapter[entry](intent)).rejects.toMatchObject({code: 'MEGANOVEL_CONTENT_CONFLICT'});
+        expect(store.getMegaNovelRun(intent.packageId, 1)).toEqual(retained);
+        expect(store.getPackage(intent.packageId)).toEqual(retainedPackage);
+      }
+    }
+    const evidence = 'Synthetic independently reopened detail after delayed visibility';
+    snapshot.candidates = [{...row(), status, evidence}];
+    expect(await adapter.reconcile(intent)).toEqual({...retained, evidence});
+    expect(await adapter.saveDraft(intent)).toEqual({...retained, evidence});
+    if (status !== 'draft') expect(await adapter.submit(intent)).toEqual({...retained, evidence});
+    expect(browser.createDraft).not.toHaveBeenCalled();
+    expect(browser.submit).not.toHaveBeenCalled();
+  });
+  it.each(['draft_unknown', 'submit_unknown'] as const)(
+    'keeps a complete negative readback %s at all three entries without retrying mutations', async phase => {
+    browser.createDraft = vi.fn(async () => { throw new Error('Synthetic lost draft response'); });
+    browser.submit = vi.fn(async () => { snapshot.candidates = []; throw new Error('Synthetic lost submit response'); });
+    if (phase === 'submit_unknown') {
+      snapshot.candidates = [row()];
+      await adapter.saveDraft(intent);
+      await adapter.submit(intent);
+    } else await adapter.saveDraft(intent);
+    const retained = store.getMegaNovelRun(intent.packageId, 1)!;
+    const retainedPackage = store.getPackage(intent.packageId);
+    expect(retained.phase).toBe(phase);
+    for (const entry of ['reconcile', 'saveDraft', 'submit'] as const) {
+      for (let attempt = 0; attempt < 2; attempt++) expect(await adapter[entry](intent)).toEqual(retained);
+    }
+    expect(store.getMegaNovelRun(intent.packageId, 1)).toEqual(retained);
+    expect(store.getPackage(intent.packageId)).toEqual(retainedPackage);
+    snapshot.candidates = [{...row(), status: 'published'}];
+    expect((await adapter.reconcile(intent)).phase).toBe('published');
+    expect(browser.createDraft).toHaveBeenCalledTimes(phase === 'draft_unknown' ? 1 : 0);
+    expect(browser.submit).toHaveBeenCalledTimes(phase === 'submit_unknown' ? 1 : 0);
+  });
   it('readiness never creates a remote draft or local run', async () => {
     await adapter.ready(intent.scope);
     expect(browser.createDraft).not.toHaveBeenCalled();
