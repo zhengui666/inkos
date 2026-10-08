@@ -140,7 +140,8 @@ browserFixtures('MegaNovel observed DOM binding in an isolated network-blocked C
       await binding.createDraft(page, input, signal);
       const guard = vi.fn(async () => {
         // The authority changes while the visible final schedule dialog is open.
-        if (await page.getByRole('radio', {name: 'Now', exact: true}).isChecked()) {
+        const nowRadio = page.getByRole('radio', {name: 'Now', exact: true});
+        if (await nowRadio.count() === 1 && await nowRadio.isChecked()) {
           throw Object.assign(new Error('Brief changed before final Confirm'), {code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
         }
       });

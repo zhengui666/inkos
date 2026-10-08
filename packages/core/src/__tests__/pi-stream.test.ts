@@ -3,7 +3,7 @@ import { CodexFixture, bufferedFixtureReply } from "./codex-fixture.js";
 import type { Context, Model } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
 import { guardedPiNonStreaming } from "../agent/pi-stream.js";
-import { createLLMClient } from "../llm/provider.js";
+import { createLLMClient, estimateTextTokens } from "../llm/provider.js";
 import { ShortFictionOutlineAgent, ShortFictionWriterAgent, ShortFictionDraftReviewerAgent } from "../agents/short-fiction.js";
 import {createShortFictionRunTool,createShortFictionReviseTool} from "../agent/agent-tools.js";
 import {runShortFictionStage} from "../pipeline/short-fiction-runner.js";
@@ -12,7 +12,7 @@ import {ArchitectAgent} from '../agents/architect.js';
 import {ReviserAgent} from '../agents/reviser.js';
 import {buildLengthSpec,chapterLengthDelivery} from '../utils/length-metrics.js';
 import {decodeStructuredFields} from '../agent/structured-arguments.js';
-import {mkdtemp,rm,mkdir,writeFile,readFile} from 'node:fs/promises';
+import {cp,mkdtemp,rm,mkdir,readdir,writeFile,readFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {runAgentSession,evictAgentCache} from '../agent/agent-session.js';
@@ -25,6 +25,10 @@ import {createBuiltInWorkProfileRegistry} from '../harness/builtin-profiles.js';
 import {loadWorkManifest, listWorkManifests, createWorkManifest, saveWorkManifest} from '../harness/work-store.js';
 import {createBookFoundationTool} from '../harness/tools/longform-production.js';
 import {WriterAgent} from '../agents/writer.js';
+import { fileURLToPath } from "node:url";
+import { loadBuiltinAgentSkills } from "../skills/builtin-loader.js";
+import { resolveProfileSkillActivations } from "../skills/activations.js";
+import { withExecutionEvidence } from "../harness/execution-evidence.js";
 import {ContinuityAuditor} from '../agents/continuity.js';
 
 const fixtureReaderContract = {mode:'author-directed',familiarPromise:'A quiet evidentiary mystery',distinctiveHook:'A receipt preserves a disputed signature',readingPleasure:'Understanding the handover',openingQuestion:'Who signed?',proseApproach:'Plain English',authorDirection:'The fixture explicitly requests a quiet receipt mystery'};
@@ -70,7 +74,7 @@ describe("guardedPiNonStreaming", () => {
       expect(await listWorkManifests(root)).toHaveLength(0);
     }finally{evictAgentCache('entry');await rm(root,{recursive:true,force:true});}
   });
-  it('initializes a generic long-form Work in place and preserves a composed profile without overwriting an initialized book',async()=>{
+  it.each([false, true])('initializes a generic long-form Work in place and preserves a composed profile without overwriting an initialized book (CRLF references: %s)',async(crlfReferences)=>{
     const root=await mkdtemp(join(tmpdir(),'inkos-bound-initialization-'));
     const profile={...createBuiltInWorkProfileRegistry().require('longform-novel'),id:'custom-long',title:'Custom long'};
     const client=createLLMClient({provider:'openai',service:'custom',configSource:'studio',baseUrl:model.baseUrl,model:model.id,apiKey:'fixture',apiFormat:'chat',stream:false,temperature:0,thinkingBudget:0});
@@ -104,21 +108,46 @@ describe("guardedPiNonStreaming", () => {
       // Keep a large protected source while leaving room for the required craft guidance.
       const canonLine="Mara retains the sealed receipt and returns it to its owner. ";
       const canon=canonLine.repeat(1000);
+      // Exercise Windows checkout representation on every host without changing
+      // the canon, required methods, model window, or output reservation.
+      let activatedSkills: ReturnType<typeof resolveProfileSkillActivations> | undefined;
+      if(crlfReferences){
+        const methodsRoot=join(root,"fixture-methods");
+        await cp(fileURLToPath(new URL("../../skills",import.meta.url)),methodsRoot,{recursive:true});
+        for(const relative of await readdir(methodsRoot,{recursive:true})){
+          if(!relative.endsWith(".md"))continue;
+          const path=join(methodsRoot,relative);
+          await writeFile(path,(await readFile(path,"utf8")).replace(/\r?\n/g,"\r\n"));
+        }
+        activatedSkills=resolveProfileSkillActivations((await loadBuiltinAgentSkills(methodsRoot)).skills,profile);
+      }
       const boundedClient={...client,defaults:{...client.defaults,maxTokens:4096},_piModel:{...client._piModel!,contextWindow:30000,maxTokens:4096}};
       const calls:string[]=[];
       const prompts:string[]=[];
       fetchWithProxyMock.mockImplementation(async(_url:string,init:RequestInit)=>{
         const body=JSON.parse(String(init.body)),name=body.tools[0].function.name;calls.push(name);
         prompts.push(body.messages.map((message:{content:string})=>message.content).join("\n\n"));
+        // Message preflight reserves 2048 tokens for the worker/provider envelope.
+        // Check the actual serialized HTTP body, including tool schema and wrappers.
+        expect(estimateTextTokens(String(init.body))+4096).toBeLessThanOrEqual(30000);
+        expect(prompts.at(-1)).not.toContain("\r");
         const args=name==="submit_chapter_draft"?{title:"Return",content:"Mara returns the sealed receipt. The owner checks the seal and accepts it."}:{postSettlement:"Receipt returned.",factOps:{upsert:[],expire:[]},hookOps:{upsert:[],mention:[],resolve:[],defer:[]},newHookCandidates:[],chapterSummary:{title:"Return",characters:"Mara",events:"Receipt returned",stateChanges:"",hookActivity:"",mood:"calm",chapterType:"resolution"}};
         return new Response(JSON.stringify({choices:[{finish_reason:"tool_calls",message:{tool_calls:[{id:name,type:"function",function:{name,arguments:JSON.stringify(args)}}]}}]}));
       });
-      const writeWithCanon=(source:string)=>new WriterAgent({client:boundedClient,model:model.id,projectRoot:root,bookId:"generic"}).writeChapter({book:JSON.parse(original),bookDir:join(root,"works/generic/source"),chapterNumber:1,chapterIntent:"Return the receipt",chapterMemo:{chapter:1,goal:"Return the receipt",body:"The owner accepts the sealed receipt.",threadRefs:[]},contextPackage:{chapter:1,selectedContext:[{source:"story/parent_canon.md",reason:"Original ownership",excerpt:source,protection:"protected"}]}});
+      const writeWithCanon=(source:string)=>new WriterAgent({client:boundedClient,model:model.id,projectRoot:root,bookId:"generic",activatedSkills}).writeChapter({book:JSON.parse(original),bookDir:join(root,"works/generic/source"),chapterNumber:1,chapterIntent:"Return the receipt",chapterMemo:{chapter:1,goal:"Return the receipt",body:"The owner accepts the sealed receipt.",threadRefs:[]},contextPackage:{chapter:1,selectedContext:[{source:"story/parent_canon.md",reason:"Original ownership",excerpt:source,protection:"protected"}]}});
       // The oversized source alone exceeds the unchanged 23856-token input budget.
       await expect(writeWithCanon(canonLine.repeat(1600))).rejects.toMatchObject({code:"PROTECTED_CONTEXT_OVERFLOW",budgetTokens:23856});
       expect(calls).toEqual([]);expect(prompts).toEqual([]);
       expect(await readFile(path,'utf8')).toBe(original);
-      const chapter=await writeWithCanon(canon);
+      const traces:Array<{finalTokens:number;budgetTokens:number}>=[];
+      const chapter=await withExecutionEvidence((type,payload)=>{
+        if(type==="context-compiled"&&payload.worker==="writer")traces.push(payload.trace as typeof traces[number]);
+      },()=>writeWithCanon(canon));
+      expect(traces).toHaveLength(4); // Draft + settlement, preflight and worker call.
+      for(const trace of traces){
+        expect(trace.budgetTokens).toBe(23856);
+        expect(trace.finalTokens).toBeLessThanOrEqual(trace.budgetTokens);
+      }
       expect(chapter.chapterNumber).toBe(1);
       expect(calls).toEqual(["submit_chapter_draft","submit_runtime_state_delta"]);
       for(const prompt of prompts){expect(prompt).toContain(canon);expect(prompt.split(canon)).toHaveLength(2);}
