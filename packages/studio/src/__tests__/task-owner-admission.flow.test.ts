@@ -590,7 +590,7 @@ describe('Independent ABC cancellation boundary', () => {
       if (value.execution.status === 'completed' && ++completedWrites === 2) { entered.resolve(); await hold.promise; }
     };
     const pending = confirm(app, sessionId);
-    await Promise.race([entered.promise, pending.then(async response => { throw new Error(await response.text()); })]);
+    await Promise.race([entered.promise, pending.then(async response => { throw new Error(await response.clone().text()); })]);
     const before = JSON.parse(await readFile(studioTaskSnapshotPath(root, sessionId), 'utf8'));
     expect(before.execution.status).toBe('running');
     const abort = await app.request(`/api/v1/sessions/${sessionId}/abort`, { method: 'POST' });
@@ -601,6 +601,9 @@ describe('Independent ABC cancellation boundary', () => {
     console.log('INDEPENDENT_FINAL_COMMIT_CANCEL', JSON.stringify({ responseStatus: result.status, savedStatus: saved?.execution.status, modelSignalAborted: fixture.model.mock.calls[0]?.[0].signal.aborted }));
     expect(saved?.execution.status).not.toBe('completed');
     expect(result.status).toBe(409);
+    expect(await result.json()).toMatchObject({ error: { code: 'PRODUCTION_TASK_CANCELLED', message: 'The production task was stopped.' } });
+    expect(saved?.execution.status).toBe('error');
+    expect(saved?.execution.error).toBe('The production task was stopped.');
     expect(saved?.execution.result).toBe('Deterministic fixture tool completed.');
     expect(saved?.execution.details).toMatchObject({ requestedIntent: 'short_run' });
     expect(fixture.tool).toHaveBeenCalledTimes(1);
@@ -615,7 +618,7 @@ describe('Independent ABC cancellation boundary', () => {
     fixture.tool.mockResolvedValue({ ...toolResult, details: { workId } });
     fixture.beforeTransition = async () => { entered.resolve(); await hold.promise; };
     const pending = confirm(app, sessionId);
-    await Promise.race([entered.promise, pending.then(async response => { throw new Error(await response.text()); })]);
+    await Promise.race([entered.promise, pending.then(async response => { throw new Error(await response.clone().text()); })]);
     expect((await loadStudioTaskSnapshot(root, sessionId))?.execution.status).toBe('completed');
     const abort = await app.request(`/api/v1/sessions/${sessionId}/abort`, { method: 'POST' });
     expect(await abort.json()).toMatchObject({ aborted: true });
@@ -626,6 +629,9 @@ describe('Independent ABC cancellation boundary', () => {
     expect(fixture.model).not.toHaveBeenCalled();
     expect(saved?.execution.status).not.toBe('completed');
     expect(result.status).toBe(409);
+    expect(await result.json()).toMatchObject({ error: { code: 'PRODUCTION_TASK_CANCELLED', message: 'The production task was stopped.' } });
+    expect(saved?.execution.status).toBe('error');
+    expect(saved?.execution.error).toBe('The production task was stopped.');
     expect(saved?.execution.result).toBe('Deterministic fixture tool completed.');
     expect(saved?.execution.details).toMatchObject({ requestedIntent: 'short_run' });
     expect(fixture.tool).toHaveBeenCalledTimes(1);
@@ -635,6 +641,64 @@ describe('Independent ABC cancellation boundary', () => {
 
 
 describe('Independent ABC success boundary', () => {
+  it('rejects Stop for an old controller selected before the task settles', async () => {
+    const root = await project(), sessionId = await session(root), app = server(root);
+    const modelEntered = gate(), modelHold = gate(), finderSelected = gate(), finderHold = gate();
+    const responseEntered = gate(), responseHold = gate();
+    fixture.model.mockImplementation(async () => {
+      modelEntered.resolve();
+      await modelHold.promise;
+      return { responseText: 'Deterministic fixture response.' };
+    });
+    const pending = confirm(app, sessionId);
+    await Promise.race([modelEntered.promise, pending.then(async response => { throw new Error(await response.clone().text()); })]);
+    const running = await loadStudioTaskSnapshot(root, sessionId);
+    expect(running?.execution.status).toBe('running');
+
+    // Hold only the async finder's return after it selects the real controller.
+    // Then allow real final persistence and controller settlement to complete
+    // before the abort handler resumes with that stale selection.
+    let selected: AbortController | undefined;
+    const get = Map.prototype.get;
+    const lookup = vi.spyOn(Map.prototype, 'get').mockImplementation(function (this: Map<unknown, unknown>, key: unknown) {
+      const value = get.call(this, key);
+      if (key === running!.execution.id && value instanceof AbortController && !selected) {
+        selected = value;
+        Object.defineProperty(value, 'then', {
+          configurable: true,
+          value: (resolve: (controller: AbortController) => void) => {
+            finderSelected.resolve();
+            void finderHold.promise.then(() => {
+              Reflect.deleteProperty(value, 'then');
+              resolve(value);
+            });
+          },
+        });
+      }
+      return value;
+    });
+    try {
+      const stopping = Promise.resolve(app.request(`/api/v1/sessions/${sessionId}/abort`, { method: 'POST' }));
+      requests.push(stopping);
+      await Promise.race([finderSelected.promise, stopping.then(async response => { throw new Error(await response.clone().text()); })]);
+      lookup.mockRestore();
+      fixture.beforeLoadSession = async () => { responseEntered.resolve(); await responseHold.promise; };
+      modelHold.resolve();
+      await Promise.race([responseEntered.promise, pending.then(async response => { throw new Error(await response.clone().text()); })]);
+      expect((await loadStudioTaskSnapshot(root, sessionId))?.execution.status).toBe('completed');
+      expect(await reserveStudioTaskExecution(root, sessionId, 'stale-controller-still-owned')).toBeNull();
+      finderHold.resolve();
+      expect(await (await stopping).json()).toMatchObject({ aborted: false });
+      expect(selected?.signal.aborted).toBe(false);
+      responseHold.resolve();
+      expect((await pending).status).toBe(200);
+      await assertOwnerReleased(root, sessionId);
+    } finally {
+      lookup.mockRestore();
+      finderHold.resolve();
+    }
+  });
+
   it('reports Stop too late after successful completion selection while retaining owner until response drain', async () => {
     const root = await project(), sessionId = await session(root), app = server(root), entered = gate(), hold = gate();
     let completedWrites = 0;
@@ -644,7 +708,7 @@ describe('Independent ABC success boundary', () => {
       }
     };
     const pending = confirm(app, sessionId);
-    await Promise.race([entered.promise, pending.then(async response => { throw new Error(await response.text()); })]);
+    await Promise.race([entered.promise, pending.then(async response => { throw new Error(await response.clone().text()); })]);
     expect((await loadStudioTaskSnapshot(root, sessionId))?.execution.status).toBe('completed');
     const abort = await app.request(`/api/v1/sessions/${sessionId}/abort`, { method: 'POST' });
     expect(await abort.json()).toMatchObject({ aborted: false });

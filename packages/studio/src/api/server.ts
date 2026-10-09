@@ -4600,8 +4600,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const sessionId = c.req.param("sessionId");
     const chatOnly = c.req.query("scope") === "chat";
     const controller = chatOnly ? undefined : await findRunningTaskController(sessionId);
-    controller?.abort();
-    const taskAborted = Boolean(controller);
+    // The selected task may finish while the async finder returns. Only the
+    // same still-registered controller can accept this Stop.
+    const taskAborted = !!controller && [...activeConfirmedTasks.values()].includes(controller);
+    if (taskAborted) controller.abort();
     const chat = chatRequests.get(sessionId);
     const chatRunning = chat?.snapshot.status === "running";
     const cancellation = await chatRequestStore.cancel(sessionId, chatRunning ? chat.snapshot.requestId : undefined);
@@ -4945,6 +4947,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         const taskController = new AbortController();
         activeConfirmedTasks.set(taskId, taskController);
         let taskLease: StudioTaskLease | null = null;
+        let taskExecution: CollectedToolExec | undefined;
         let pendingBookId: string | null = null;
         try {
           // 内存占位是本实例的快速路径，持久 owner lease 负责跨实例 admission。
@@ -4994,12 +4997,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
             taskId,
             sourceRequestId,
             signal: taskController.signal,
-            onTaskChange: (taskExec) => persistConfirmedTask(
-              reservedSessionId,
-              confirmedIntent,
-              taskExec,
-              sourceRequestId,
-            ),
+            onTaskChange: (taskExec) => {
+              taskExecution = taskExec;
+              return persistConfirmedTask(reservedSessionId, confirmedIntent, taskExec, sourceRequestId);
+            },
             ...(playMode ? { playMode } : {}),
           });
           const exec = confirmedOutcome.execution;
@@ -5135,6 +5136,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
             };
           }
           await persistConfirmedTask(reservedSessionId, confirmedIntent, exec, sourceRequestId);
+          // Select success without yielding: an accepted Stop before this
+          // point wins, and later Stops cannot cancel the completed task.
+          taskController.signal.throwIfAborted();
+          activeConfirmedTasks.delete(taskId);
           const responseText = continuation.responseText
             || exec.result
             || pick(surfaceLanguage, "已完成。", "Done.");
@@ -5152,13 +5157,27 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
             },
           });
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          const failure = formatAgentActionFailure(error, surfaceLanguage);
+          const cancelled = taskController.signal.aborted;
+          const message = cancelled
+            ? pick(surfaceLanguage, "生产任务已停止。", "The production task was stopped.")
+            : error instanceof Error ? error.message : String(error);
+          if (cancelled && taskExecution) {
+            // Keep the actual execution and its tool receipt. FIFO persistence
+            // drains earlier progress before this cancellation state; failure
+            // to save it must surface rather than become a successful Stop.
+            taskExecution.status = "error";
+            taskExecution.completedAt = Date.now();
+            taskExecution.error = message;
+            await persistConfirmedTask(reservedSessionId, confirmedIntent, taskExecution, sourceRequestId);
+          }
+          const failure = cancelled
+            ? { code: "PRODUCTION_TASK_CANCELLED", message, status: 409 as const }
+            : formatAgentActionFailure(error, surfaceLanguage);
           if (pendingBookId) {
             bookCreateStatus.set(pendingBookId, { status: "error", error: message });
             broadcast("book:error", { bookId: pendingBookId, sessionId: streamSessionId, error: message });
           }
-          if (error instanceof ApiError) {
+          if (error instanceof ApiError && !cancelled) {
             broadcast("agent:error", { instruction, activeBookId: agentBookId, sessionId: bookSession.sessionId, sessionKind, error: message });
             return c.json({
               error: { code: error.code, message: error.message },
