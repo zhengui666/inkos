@@ -51,6 +51,7 @@ export function createProgram(hooks: ProgramHooks = {}): Command {
     .description("InkOS — Multi-agent novel production system")
     .version(version)
     .enablePositionalOptions()
+    .showHelpAfterError("Run 'inkos --help' for available commands.")
     .option("--service <service>", "Override LLM service for this CLI run")
     .option("--model <model>", "Override LLM model for this CLI run")
     .option("--api-key-env <envVar>", "Read LLM API key from this environment variable for this CLI run")
