@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentSessionConfig } from "@actalk/inkos-core";
 import type { StudioTaskSnapshot } from "../api/task-store.js";
@@ -299,7 +299,7 @@ async function ownerChild(root: string, sessionId: string, executionId: string, 
   roots.push(directory);
   const script = join(directory, "owner.mts"), config = join(directory, "tsconfig.json");
   const core = fileURLToPath(new URL("../../../core/src/index.ts", import.meta.url));
-  const store = fileURLToPath(new URL("../api/task-store.ts", import.meta.url));
+  const store = new URL("../api/task-store.ts", import.meta.url).href;
   await writeFile(config, JSON.stringify({ compilerOptions: { baseUrl: "/", paths: { "@actalk/inkos-core": [core] } } }));
   await writeFile(script, `
 import { reserveStudioTaskExecution, saveStudioTaskSnapshot } from ${JSON.stringify(store)};
@@ -322,7 +322,7 @@ try {
 }
 `);
   const child = fork(script, [root, sessionId, executionId, persist ? "yes" : "no"], {
-    execArgv: ["--import", createRequire(import.meta.url).resolve("tsx")], silent: true,
+    execArgv: ["--import", pathToFileURL(createRequire(import.meta.url).resolve("tsx")).href], silent: true,
     cwd: fileURLToPath(new URL("../..", import.meta.url)),
     env: { ...process.env, TSX_TSCONFIG_PATH: config },
   });
