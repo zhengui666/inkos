@@ -564,9 +564,16 @@ describe("Studio owner guard at real Agent tool admission", () => {
 
   it("allows an initially suppressed chat to execute read tools without taking the owner's lock", async () => {
     const root = await project(), sessionId = await session(root), first = server(root), second = server(root), hold = gate();
-    fixture.beforeAppend = async () => { await hold.promise; };
+    const entered = gate();
+    fixture.beforeAppend = async () => { entered.resolve(); await hold.promise; };
     const confirmed = confirm(first, sessionId);
-    await vi.waitFor(() => expect(fixture.appendCalls).toBe(1));
+    await Promise.race([
+      entered.promise,
+      confirmed.then(async response => {
+        throw new Error(`Confirmed request ended before append: HTTP ${response.status}: ${await response.clone().text()}`);
+      }),
+    ]);
+    expect(fixture.appendCalls).toBe(1);
     const read = vi.fn().mockResolvedValue(toolResult);
     fixture.model.mockImplementationOnce(config => {
       expect(config.suppressProductionTools).toBe(true);
