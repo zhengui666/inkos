@@ -43,9 +43,11 @@ it("retains a failed submission across server recreation and exposes an interrup
     const restoredUser = restoredTranscript.find(event => event.type === "message" && event.role === "user");
     expect(JSON.stringify(restoredUser?.type === "message" ? restoredUser.message : null)).toBe(rawUserMessage);
 
-    // A process can disappear after saving its submission but before terminal persistence.
+    // Simulate the snapshot persisted before its process disappeared.
+    // Keep its kernel owner identity; store.save must not revive a released token.
     const store = new ChatRequestStore(root);
-    await store.save({ ...detail.chatRequest, status: "running", completedAt: undefined, error: undefined });
+    await writeFile(join(root, ".inkos", "chat-requests", `${encodeURIComponent(session.sessionId)}.json`),
+      JSON.stringify({ ...detail.chatRequest, status: "running", completedAt: undefined, error: undefined }), { mode: 0o600 });
     const restarted = createStudioServer({} as never, root);
     const interrupted = await (await restarted.request(`/api/v1/sessions/${session.sessionId}`)).json();
     expect(interrupted.chatRequest).toMatchObject({ status: "failed", error: { code: "CHAT_REQUEST_INTERRUPTED" }, retry: detail.chatRequest.retry });
