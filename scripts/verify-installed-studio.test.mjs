@@ -1,7 +1,7 @@
 // Synthetic installed-package fixtures only; this is not acceptance of an npm release.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, mkdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +10,7 @@ import { verifyInstalledStudio } from './verify-installed-studio.mjs';
 
 const verifier = fileURLToPath(new URL('./verify-installed-studio.mjs', import.meta.url));
 const releaseVerifier = fileURLToPath(new URL('./verify-installed-release.mjs', import.meta.url));
+const sourceSkillsRoot = fileURLToPath(new URL('../packages/core/skills/', import.meta.url));
 const html = '<!DOCTYPE html><html><head><link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\'><text>Fixture</text></svg>"><script type="module" src="/assets/app.js"></script><link rel="stylesheet" href="/assets/app.css"></head><body><a href="/settings">Settings</a><div data-src="/assets/ignored.js">Fixture</div></body></html>';
 
 async function fixture(t, mode = 'ok') {
@@ -27,19 +28,67 @@ async function fixture(t, mode = 'ok') {
   await mkdir(join(core, 'dist'), { recursive: true });
   await mkdir(join(cli, 'dist'), { recursive: true });
   await writeFile(join(cli, 'package.json'), JSON.stringify({ name: '@actalk/inkos', version: '2.0.0', type: 'module', bin: { inkos: 'dist/actual-bin.js' } }));
-  await writeFile(bin, 'if (process.argv.includes("--version")) console.log("2.0.0"); else throw new Error("Fixture CLI bin must only be resolved, not run");');
+  await writeFile(bin, String.raw`
+    import assert from 'node:assert/strict';
+    assert.equal(process.argv.length, 3);
+    switch (process.argv[2]) {
+      case '--version': console.log('2.0.0'); break;
+      case '--help': console.log('Usage: inkos [options] [command]\nOptions:\n  --help  display help\nCommands:\n  init  Initialize a project'); break;
+      case '__inkos_release_missing_command__':
+        console.error("error: unknown command '__inkos_release_missing_command__'");
+        process.exitCode = 1;
+        break;
+      default: assert.fail('Fixture CLI must not run command actions');
+    }
+  `);
   await writeFile(join(studio, 'package.json'), JSON.stringify({ name: '@actalk/inkos-studio', version: '2.0.0', type: 'module', main: 'dist/api/index.js' }));
   await writeFile(join(core, 'package.json'), JSON.stringify({ name: '@actalk/inkos-core', version: '2.0.0', type: 'module', main: 'dist/index.js',
     exports: { '.': { types: './dist/index.d.ts', import: './dist/index.js' } } }));
   await writeFile(join(core, 'dist/index.d.ts'), 'export declare class SchedulerStore {}');
-  // The fixture uses JSON instead of SQLite, exposing exactly the scheduling API used by setup.
-  await writeFile(join(core, 'dist/index.js'), `
-    import { mkdirSync, writeFileSync } from 'node:fs';
-    import { dirname } from 'node:path';
+  // Real resource bytes and synthetic runtime modules satisfy the release gate;
+  // this is not acceptance of a built Core package or its production skill loader.
+  await cp(sourceSkillsRoot, join(core, 'skills'), { recursive: true });
+  // The fixture uses JSON instead of SQLite for the scheduling API used by setup.
+  await writeFile(join(core, 'dist/index.js'), String.raw`
+    import assert from 'node:assert/strict';
+    import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+    import { dirname, join } from 'node:path';
+    import { fileURLToPath } from 'node:url';
     export class SchedulerStore {
       constructor(path) { this.path = path; this.timers = {}; mkdirSync(dirname(path), { recursive: true }); }
       schedule(name, nextAt) { this.timers[name] = nextAt; }
       close() { writeFileSync(this.path, JSON.stringify(this.timers)); }
+    }
+    const skillsRoot = fileURLToPath(new URL('../skills', import.meta.url));
+    export function parseAgentSkillDocument(raw, { skillPath, source }) {
+      const frontmatter = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
+      assert(frontmatter, 'Synthetic fixture requires skill frontmatter');
+      const id = frontmatter[1].match(/^name: (.+)$/m)[1].trim();
+      const description = frontmatter[1].match(/^description: (.+)$/m)[1].trim();
+      return { id, name: id, description, source, baseDir: dirname(skillPath), body: frontmatter[2] };
+    }
+    export async function loadBuiltinAgentSkills() {
+      return { diagnostics: [], skills: readdirSync(skillsRoot).sort().map(id => {
+        const skillPath = join(skillsRoot, id, 'SKILL.md');
+        return parseAgentSkillDocument(readFileSync(skillPath, 'utf8'), { skillPath, source: 'builtin' });
+      }) };
+    }
+    export function builtInWorkProfiles() { return [{ id: 'synthetic-fixture-profile', requiredSkillIds: ['inkos-long-writing'] }]; }
+  `);
+  await mkdir(join(core, 'dist/agent'));
+  await writeFile(join(core, 'dist/agent/skill-tool.js'), String.raw`
+    import { readFileSync } from 'node:fs';
+    import { join } from 'node:path';
+    export async function loadLinkedSkillResources(skill) {
+      const paths = new Set();
+      for (const match of skill.body.matchAll(/\x60((?:references|examples)\/[^\x60\n]+)\x60|\[[^\]\n]*\]\(((?:references|examples)\/[^)\n]+)\)/g)) {
+        const path = match[1] ?? match[2];
+        if (/\.(?:md|txt)$/i.test(path)) paths.add(path);
+      }
+      return [...paths].sort().map(path => {
+        const body = readFileSync(join(skill.baseDir, path), 'utf8');
+        return { path, body, charStart: 0, charEnd: body.length };
+      });
     }
   `);
   await writeFile(join(studio, 'dist/index.html'), pageHtml);
