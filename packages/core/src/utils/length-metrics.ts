@@ -18,7 +18,8 @@ export function countChapterLength(
   const normalized = stripMarkdownMetadata(content);
 
   if (countingMode === "en_words") {
-    const words = normalized.match(/[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?/g);
+    // NFC unifies canonical spellings; marks that remain must stay attached to Latin letters.
+    const words = normalized.normalize("NFC").match(/(?:\p{Script=Latin}\p{M}*|[0-9])+(?:['’](?:\p{Script=Latin}\p{M}*|[0-9])+)?/gu);
     return words?.length ?? 0;
   }
 

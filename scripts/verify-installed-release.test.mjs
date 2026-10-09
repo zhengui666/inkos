@@ -1,19 +1,37 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+  cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import { BUILTIN_SKILL_IDS } from "./verify-installed-skills.mjs";
 
 const script = fileURLToPath(new URL("./verify-installed-release.mjs", import.meta.url));
+const sourceSkillsRoot = fileURLToPath(new URL("../packages/core/skills/", import.meta.url));
+const skillReference = "inkos-short-writing/references/production-checklist.md";
 const version = "2.3.4-test.1";
 const CLI = "@actalk/inkos";
 const CORE = "@actalk/inkos-core";
 const STUDIO = "@actalk/inkos-studio";
+const unknownCommand = "__inkos_release_missing_command__";
+const help = "Usage: inkos [options] [command]\nOptions:\n  --help  display help for command\nCommands:\n  init  Initialize a project";
+const WINDOWS_RUNTIME_ENV = ["HOMEDRIVE", "HOMEPATH", "SYSTEMROOT", "TEMP", "TMP"];
+
+function assertIsolatedChildEnvironment(env, home, platform = process.platform) {
+  const normalized = Object.fromEntries(Object.entries(env).map(([key, value]) => [key.toUpperCase(), value]));
+  const windows = platform === "win32";
+  assert.equal(normalized.HOME, home, "CLI child must use its fresh HOME");
+  if (windows) assert.equal(normalized.USERPROFILE, home, "CLI child must use its fresh USERPROFILE");
+  assert.equal(normalized.INKOS_API_KEY, undefined, "InkOS API key must be stripped from CLI child");
+  assert.equal(normalized.NODE_OPTIONS, undefined, "Node options must be stripped from CLI child");
+  const runtimeVars = new Set(WINDOWS_RUNTIME_ENV);
+  const keys = Object.keys(normalized).filter((key) => !windows || !runtimeVars.has(key)).sort();
+  assert.deepEqual(keys, windows ? ["HOME", "PATH", "USERPROFILE"] : ["HOME", "PATH"]);
+}
 
 function write(path, content) {
   mkdirSync(dirname(path), { recursive: true });
@@ -40,7 +58,49 @@ function makeCore(parent, installedVersion = version) {
       "./llm/api-format": { types: "./dist/llm/api-format.d.ts", import: "./dist/llm/api-format.js" },
     },
   });
-  write(join(dir, "dist/index.js"), `export const version = ${JSON.stringify(installedVersion)};\n`);
+  // Real resource bytes, synthetic runtime modules: this tests the release gate,
+  // not a built Core tarball or its production loader/parser implementation.
+  cpSync(sourceSkillsRoot, join(dir, "skills"), { recursive: true });
+  write(join(dir, "dist/index.js"), `export const version = ${JSON.stringify(installedVersion)};\n` + String.raw`
+import assert from "node:assert/strict";
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+assert.equal(process.cwd(), process.env.HOME, "Synthetic Core probe must use its isolated HOME");
+assert.equal(process.env.INKOS_API_KEY, undefined);
+assert.equal(process.env.NODE_OPTIONS, undefined);
+if (process.platform === "win32") assert.equal(process.env.USERPROFILE, process.env.HOME);
+const root = fileURLToPath(new URL("../skills", import.meta.url));
+export function parseAgentSkillDocument(raw, { skillPath, source }) {
+  const frontmatter = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
+  assert(frontmatter, "Synthetic fixture requires skill frontmatter");
+  const id = frontmatter[1].match(/^name: (.+)$/m)[1].trim();
+  const description = frontmatter[1].match(/^description: (.+)$/m)[1].trim();
+  return { id, name: id, description, source, baseDir: dirname(skillPath), body: frontmatter[2] };
+}
+export async function loadBuiltinAgentSkills() {
+  return { diagnostics: [], skills: readdirSync(root).sort().map(id => {
+    const skillPath = join(root, id, "SKILL.md");
+    return parseAgentSkillDocument(readFileSync(skillPath, "utf8"), { skillPath, source: "builtin" });
+  }) };
+}
+export function builtInWorkProfiles() { return [{ id: "synthetic-fixture-profile", requiredSkillIds: ["inkos-long-writing"] }]; }
+`);
+  write(join(dir, "dist/agent/skill-tool.js"), String.raw`
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+export async function loadLinkedSkillResources(skill) {
+  const paths = new Set();
+  for (const match of skill.body.matchAll(/\x60((?:references|examples)\/[^\x60\n]+)\x60|\[[^\]\n]*\]\(((?:references|examples)\/[^)\n]+)\)/g)) {
+    const path = match[1] ?? match[2];
+    if (/\.(?:md|txt)$/i.test(path)) paths.add(path);
+  }
+  return [...paths].sort().map(path => {
+    const body = readFileSync(join(skill.baseDir, path), "utf8");
+    return { path, body, charStart: 0, charEnd: body.length };
+  });
+}
+`);
   write(join(dir, "dist/index.d.ts"), "export declare const version: string;\n");
   write(join(dir, "dist/llm/api-format.js"), "export const format = 'fixture';\n");
   write(join(dir, "dist/llm/api-format.d.ts"), "export declare const format: string;\n");
@@ -62,12 +122,27 @@ function makeCli(parent, probe) {
   manifest(dir, { name: CLI, version, type: "module", bin: { inkos: "dist/index.js" } });
   write(join(dir, "dist/index.js"), `#!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
-assert.deepEqual(Object.keys(process.env).sort(), ['HOME', 'PATH']);
+import { appendFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+const childEnv = Object.fromEntries(Object.entries(process.env).map(([key, value]) => [key.toUpperCase(), value]));
+const windowsRuntimeVars = new Set(${JSON.stringify(WINDOWS_RUNTIME_ENV)});
+const childEnvKeys = Object.keys(childEnv).filter(key => process.platform !== 'win32' || !windowsRuntimeVars.has(key)).sort();
+assert.deepEqual(childEnvKeys, process.platform === 'win32' ? ['HOME', 'PATH', 'USERPROFILE'] : ['HOME', 'PATH']);
+assert.equal(childEnv.INKOS_API_KEY, undefined, 'InkOS API key must be stripped from CLI child');
+assert.equal(childEnv.NODE_OPTIONS, undefined, 'Node options must be stripped from CLI child');
+if (process.platform === 'win32') assert.equal(childEnv.USERPROFILE, childEnv.HOME);
 assert.equal(process.cwd(), process.env.HOME);
-assert.deepEqual(process.argv.slice(2), ['--version']);
-writeFileSync(${JSON.stringify(probe)}, JSON.stringify({ env: process.env, cwd: process.cwd(), argv: process.argv }));
-console.log('  ${version}  ');
+assert.equal(process.argv.length, 3);
+appendFileSync(${JSON.stringify(probe)}, JSON.stringify({ env: process.env, cwd: process.cwd(), argv: process.argv }) + '\\n');
+switch (process.argv[2]) {
+  case '--version': console.log('  ${version}  '); break;
+  case '--help': console.log(${JSON.stringify(help)}); break;
+  case '${unknownCommand}':
+    console.error("error: unknown command '${unknownCommand}'");
+    process.exitCode = 1;
+    break;
+  default: assert.fail('Verifier must not invoke a command action');
+}
 `);
   return dir;
 }
@@ -116,6 +191,81 @@ function item(result, id) {
   return found;
 }
 
+function assertSkillsReport(result, id, coreRoot) {
+  const check = item(result, id);
+  assert.equal(check.status, "pass", check.error);
+  assert.equal(check.path, coreRoot);
+  assert.equal(check.version, version);
+  assert.equal(check.exit, 0);
+  assert.equal(check.skillsReport.coreRoot, coreRoot);
+  assert.equal(check.skillsReport.passed, true);
+  assert.equal(check.skillsReport.exit, 0);
+  assert.deepEqual(check.skillsReport.skills.map(skill => skill.id), BUILTIN_SKILL_IDS);
+  assert.ok(check.skillsReport.profiles.length > 0);
+  const expectedFiles = [];
+  function inventory(path = "") {
+    for (const entry of readdirSync(join(sourceSkillsRoot, path), { withFileTypes: true })) {
+      const relativePath = path ? `${path}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) inventory(relativePath);
+      else expectedFiles.push({ path: relativePath, bytes: readFileSync(join(sourceSkillsRoot, relativePath)).length });
+    }
+  }
+  inventory();
+  expectedFiles.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  assert.deepEqual(check.skillsReport.files, expectedFiles, "Release evidence must retain the complete resource inventory");
+}
+
+test("allows Node's Windows runtime variables without leaking app configuration or a parent home", () => {
+  const home = "C:\\Temp\\inkos-release-home";
+  const env = {
+    HOME: home, PATH: "C:\\node", USERPROFILE: home,
+    SystemRoot: "C:\\Windows", TEMP: "C:\\Temp", HOMEDRIVE: "C:", HOMEPATH: "\\Temp\\inkos-release-home",
+  };
+  assert.doesNotThrow(() => assertIsolatedChildEnvironment(env, home, "win32"));
+  assert.throws(() => assertIsolatedChildEnvironment({ ...env, INKOS_API_KEY: "mock-only" }, home, "win32"), /API key must be stripped/);
+  assert.throws(() => assertIsolatedChildEnvironment({ ...env, USERPROFILE: "C:\\Users\\parent" }, home, "win32"), /fresh USERPROFILE/);
+});
+
+test("synthetic parser preserves actual manifest names, descriptions and LF/CRLF bodies", t => {
+  const f = fixture(t);
+  const raw = readFileSync(join(sourceSkillsRoot, BUILTIN_SKILL_IDS[0], "SKILL.md"), "utf8").replace(/\r\n/g, "\n");
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", `
+import assert from 'node:assert/strict';
+import { parseAgentSkillDocument } from ${JSON.stringify(pathToFileURL(join(f.core, "dist/index.js")).href)};
+const raw = ${JSON.stringify(raw)};
+const options = { skillPath: ${JSON.stringify(join(f.core, "skills", BUILTIN_SKILL_IDS[0], "SKILL.md"))}, source: 'builtin' };
+const lf = parseAgentSkillDocument(raw, options);
+const crlf = parseAgentSkillDocument(raw.replace(/\\n/g, '\\r\\n'), options);
+assert.equal(lf.id, ${JSON.stringify(BUILTIN_SKILL_IDS[0])});
+assert.equal(lf.name, lf.id);
+assert.equal(lf.description, raw.match(/^description: (.+)$/m)[1]);
+assert.equal(crlf.description, lf.description);
+assert.equal(crlf.id, lf.id);
+assert.equal(crlf.body, lf.body.replace(/\\n/g, '\\r\\n'));
+`], {
+    cwd: f.parentHome,
+    env: { PATH: process.env.PATH ?? "", HOME: f.parentHome,
+      ...(process.platform === "win32" ? { USERPROFILE: f.parentHome } : {}) },
+    encoding: "utf8", timeout: 10_000,
+  });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+});
+
+for (const flag of ["--source-skills-root", "--skip-skills"]) {
+  test(`release command rejects the unsupported ${flag} bypass`, t => {
+    const f = fixture(t);
+    const result = spawnSync(process.execPath, [
+      script, "--root", f.root, "--version", version, "--output", f.output, flag, f.core,
+    ], { encoding: "utf8", timeout: 10_000 });
+    assert.ifError(result.error);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Usage:/);
+    assert.equal(existsSync(f.output), false);
+    assert.equal(existsSync(f.probe), false);
+  });
+}
+
 test("flat install follows ESM-only Core exports and isolates CLI environment", (t) => {
   const f = fixture(t);
   const require = createRequire(join(f.cli, "dist/index.js"));
@@ -127,13 +277,72 @@ test("flat install follows ESM-only Core exports and isolates CLI environment", 
   assert.equal(item(result, "cli.core.package").path, join(f.core, "package.json"));
   assert.equal(item(result, "cli.studio.package").path, join(f.studio, "package.json"));
   assert.equal(item(result, "studio.core.package").path, join(f.core, "package.json"));
-  assert.equal(item(result, "cli.version").exit, 0);
-  const probe = JSON.parse(readFileSync(f.probe, "utf8"));
-  assert.deepEqual(Object.keys(probe.env).sort(), ["HOME", "PATH"]);
-  assert.notEqual(probe.env.HOME, f.parentHome);
-  assert.equal(probe.cwd, probe.env.HOME);
-  assert.equal(probe.argv[1], join(f.cli, "dist/index.js"));
-  assert.equal(existsSync(probe.env.HOME), false, "Temporary HOME must be removed");
+  assertSkillsReport(result, "cli.core.skills", f.core);
+  assertSkillsReport(result, "studio.core.skills", f.core);
+  assert.deepEqual(item(result, "cli.core.skills").skillsReport, item(result, "studio.core.skills").skillsReport);
+  for (const [id, exit] of [["cli.version", 0], ["cli.help", 0], ["cli.unknown-command", 1]]) {
+    assert.equal(item(result, id).exit, exit);
+  }
+  const probes = readFileSync(f.probe, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(probes.map((probe) => probe.argv.slice(2)), [["--version"], ["--help"], [unknownCommand]]);
+  for (const probe of probes) {
+    assertIsolatedChildEnvironment(probe.env, probe.env.HOME);
+    assert.notEqual(probe.env.HOME, f.parentHome);
+    assert.equal(probe.cwd, probe.env.HOME);
+    assert.equal(probe.argv[1], join(f.cli, "dist/index.js"));
+    assert.equal(existsSync(probe.env.HOME), false, "Temporary HOME must be removed");
+  }
+  assert.deepEqual(readdirSync(f.parentHome), []);
+});
+
+for (const [label, replacement] of [
+  ["nonzero exit", `console.log(${JSON.stringify(help)}); process.exitCode = 7;`],
+  ["empty output", ""],
+  ["version output instead of help", `console.log('${version}');`],
+  ["service-start output instead of help", "console.log('Starting InkOS Studio');"],
+  ["missing commands", "console.log('Usage: inkos [options]\\n  --help display help');"],
+  ["project creation", `writeFileSync(join(process.env.HOME, 'inkos.json'), '{}'); console.log(${JSON.stringify(help)});`],
+]) {
+  test(`rejects installed CLI help with ${label}`, (t) => {
+    const f = fixture(t);
+    const bin = join(f.cli, "dist/index.js");
+    write(bin, readFileSync(bin, "utf8").replace(`console.log(${JSON.stringify(help)});`, replacement));
+    const result = run(f);
+    assertReport(result, 1);
+    assert.equal(item(result, "cli.version").status, "pass");
+    assert.equal(item(result, "cli.help").status, "fail");
+  });
+}
+
+for (const [label, before, replacement] of [
+  ["successful exit", "process.exitCode = 1;", "process.exitCode = 0;"],
+  ["empty error", `console.error("error: unknown command '${unknownCommand}'");`, ""],
+  ["unrelated startup crash", `console.error("error: unknown command '${unknownCommand}'");`, "throw new Error('Synthetic startup failure');"],
+  ["argument error without help guidance", `console.error("error: unknown command '${unknownCommand}'");`, "console.error('error: too many arguments. Expected 0 arguments but got 1.');"],
+  ["wrong command in error", `console.error("error: unknown command '${unknownCommand}'");`, "console.error(\"error: unknown command 'other-command'\");"],
+  ["state creation", "process.exitCode = 1;", "writeFileSync(join(process.env.HOME, '.inkos-state'), '{}'); process.exitCode = 1;"],
+]) {
+  test(`rejects installed CLI unknown command with ${label}`, (t) => {
+    const f = fixture(t);
+    const bin = join(f.cli, "dist/index.js");
+    write(bin, readFileSync(bin, "utf8").replace(before, replacement));
+    const result = run(f);
+    assertReport(result, 1);
+    assert.equal(item(result, "cli.version").status, "pass");
+    assert.equal(item(result, "cli.help").status, "pass");
+    assert.equal(item(result, "cli.unknown-command").status, "fail");
+  });
+}
+
+test("accepts Commander root argument rejection with actionable help guidance", (t) => {
+  const f = fixture(t);
+  const bin = join(f.cli, "dist/index.js");
+  const stderr = "error: too many arguments. Expected 0 arguments but got 1.\nRun 'inkos --help' for available commands.";
+  write(bin, readFileSync(bin, "utf8").replace(`console.error("error: unknown command '${unknownCommand}'");`, `console.error(${JSON.stringify(stderr)});`));
+  const result = run(f);
+  assertReport(result, 0);
+  assert.equal(item(result, "cli.unknown-command").exit, 1);
+  assert.equal(item(result, "cli.unknown-command").stderr, `${stderr}\n`);
 });
 
 test("nested install resolves CLI and Studio dependencies instead of hoisted decoys", (t) => {
@@ -146,7 +355,57 @@ test("nested install resolves CLI and Studio dependencies instead of hoisted dec
   assert.equal(item(result, "cli.core.package").path, join(f.core, "package.json"));
   assert.equal(item(result, "cli.studio.package").path, join(f.studio, "package.json"));
   assert.equal(item(result, "studio.core.package").path, join(f.studioCore, "package.json"));
+  assertSkillsReport(result, "cli.core.skills", f.core);
+  assertSkillsReport(result, "studio.core.skills", f.studioCore);
 });
+
+for (const [key, id, otherId] of [
+  ["core", "cli.core.skills", "studio.core.skills"],
+  ["studioCore", "studio.core.skills", "cli.core.skills"],
+]) {
+  for (const [label, mutate, error] of [
+    ["missing skills directory", dir => rmSync(join(dir, "skills"), { recursive: true }), /ENOENT/],
+    ["missing linked reference", dir => rmSync(join(dir, "skills", skillReference)), /inventory/],
+    ["truncated linked reference", dir => {
+      const path = join(dir, "skills", skillReference);
+      const bytes = readFileSync(path);
+      write(path, bytes.subarray(0, bytes.length - 1));
+    }, /Packaged resource bytes differ/],
+    ["runtime-truncated linked reference", dir => {
+      const path = join(dir, "dist/agent/skill-tool.js");
+      write(path, readFileSync(path, "utf8").replace("return { path, body,", "return { path, body: body.slice(0, -1),"));
+    }, /Linked reference bytes differ/],
+  ]) {
+    test(`nested release rejects ${key} ${label} despite a complete hoisted Core`, t => {
+      const f = fixture(t, "nested");
+      makeCore(f.root);
+      mutate(f[key]);
+      const result = run(f);
+      assertReport(result, 1);
+      const check = item(result, id);
+      assert.equal(check.status, "fail");
+      assert.equal(check.path, f[key]);
+      assert.equal(check.exit, 1);
+      assert.equal(check.skillsReport.coreRoot, f[key]);
+      assert.equal(check.skillsReport.passed, false);
+      assert.equal(check.skillsReport.exit, 1);
+      assert.match(check.skillsReport.error, error);
+      assert.match(check.error, error);
+      assert.equal(item(result, otherId).status, "pass", "The other actual Core must be checked independently");
+      for (const command of ["version", "help", "unknown-command"]) assert.equal(item(result, `cli.${command}`).status, "pass");
+    });
+  }
+  test(`records a mandatory ${id} failure when the actual Core entry is unavailable`, t => {
+    const f = fixture(t, "nested");
+    rmSync(join(f[key], "dist/index.js"));
+    const result = run(f);
+    assertReport(result, 1);
+    assert.equal(item(result, id).status, "fail");
+    assert.equal(item(result, id).skillsReport, null);
+    assert.match(item(result, id).error, /Core package is unavailable/);
+    assert.equal(item(result, otherId).status, "pass");
+  });
+}
 
 test("resolves Studio Core from its actual main entry", (t) => {
   const f = fixture(t, "nested");

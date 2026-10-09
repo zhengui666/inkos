@@ -1,13 +1,14 @@
-// Verify a fresh installation without importing Core/Studio or starting services.
+// Verify a fresh installation's packaged skills and read-only CLI entrypoints without starting services.
 // Usage: node scripts/verify-installed-release.mjs --root <install-root> --version <expected> --output <new-json>
 import { spawnSync } from "node:child_process";
 import {
-  closeSync, mkdtempSync, openSync, readFileSync, realpathSync,
+  closeSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync,
   rmSync, statSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { verifyInstalledSkills } from "./verify-installed-skills.mjs";
 
 const CLI = "@actalk/inkos";
 const CORE = "@actalk/inkos-core";
@@ -108,7 +109,8 @@ function verify(options) {
 
   const home = mkdtempSync(join(tmpdir(), "inkos-release-home-"));
   const childOptions = {
-    env: { PATH: process.env.PATH ?? "", HOME: home },
+    env: { PATH: process.env.PATH ?? "", HOME: home,
+      ...(process.platform === "win32" ? { USERPROFILE: home } : {}) },
     cwd: home, encoding: "utf8", timeout: 10_000, maxBuffer: 1024 * 1024,
   };
 
@@ -169,6 +171,23 @@ function verify(options) {
     for (const target of targets ?? []) fileCheck(`${id}.export:${target}`, pkg, target);
   }
 
+  const skillsReports = new Map();
+  function coreSkills(id, pkg) {
+    check(`${id}.skills`, {
+      path: pkg?.dir ?? null, version: pkg?.manifest.version ?? null, skillsReport: null,
+    }, (item) => {
+      if (!pkg) throw new Error("Core package is unavailable");
+      const dir = realpathSync(pkg.dir);
+      item.path = dir;
+      // CLI and Studio may resolve distinct nested copies. Reuse only the same
+      // canonical package, and always retain a check for each actual consumer.
+      if (!skillsReports.has(dir)) skillsReports.set(dir, verifyInstalledSkills({ coreRoot: dir }));
+      item.skillsReport = skillsReports.get(dir);
+      item.exit = item.skillsReport.exit;
+      if (!item.skillsReport.passed) throw new Error(item.skillsReport.error ?? "Installed Core skills verification failed");
+    });
+  }
+
   try {
     // CLI has a bin but no main; Core's exports hide its package.json.
     const cli = packageCheck("cli.package", `${CLI}/package.json`, join(root, "release-probe.mjs"), CLI);
@@ -182,21 +201,42 @@ function verify(options) {
     fileCheck("studio.assets", studio, "dist/assets", "directory");
     const studioCore = packageCheck("studio.core.package", CORE, studio?.entry, CORE);
     coreFiles("studio.core", studioCore);
+    coreSkills("cli.core", core);
+    coreSkills("studio.core", studioCore);
 
-    check("cli.version", { path: bin ?? null, version: cli?.manifest.version ?? null }, (item) => {
-      if (!bin) throw new Error("CLI bin is unavailable; refusing to execute");
-      item.command = [process.execPath, bin, "--version"];
-      const result = spawnSync(process.execPath, [bin, "--version"], { ...childOptions, cwd: home });
-      item.exit = result.status;
-      item.signal = result.signal;
-      item.stdout = result.stdout ?? "";
-      item.stderr = result.stderr ?? "";
-      if (result.error) throw result.error;
-      if (result.status !== 0) throw new Error(`CLI exited ${result.status}`);
-      if (result.stdout.trim() !== options.version) {
-        throw new Error(`Expected CLI stdout ${options.version}; found ${JSON.stringify(result.stdout.trim())}`);
-      }
-    });
+    const unknownCommand = "__inkos_release_missing_command__";
+    for (const [id, arg] of [["version", "--version"], ["help", "--help"], ["unknown-command", unknownCommand]]) {
+      check(`cli.${id}`, { path: bin ?? null, version: cli?.manifest.version ?? null }, (item) => {
+        if (!bin) throw new Error("CLI bin is unavailable; refusing to execute");
+        item.command = [process.execPath, bin, arg];
+        const result = spawnSync(process.execPath, [bin, arg], childOptions);
+        item.exit = result.status;
+        item.signal = result.signal;
+        item.stdout = result.stdout ?? "";
+        item.stderr = result.stderr ?? "";
+        if (result.error) throw result.error;
+        const created = readdirSync(home);
+        if (created.length) throw new Error(`CLI ${arg} created files in temporary HOME: ${created.join(", ")}`);
+        if (result.status === null || result.signal) throw new Error(`CLI terminated by ${result.signal ?? "unknown signal"}`);
+        if (id === "unknown-command") {
+          if (result.status === 0) throw new Error("CLI accepted a nonexistent subcommand");
+          // A root action makes Commander reject unknown operands as excess arguments.
+          if (!item.stderr.includes(`unknown command '${unknownCommand}'`)
+            && !(item.stderr.includes("error: too many arguments.") && item.stderr.includes("inkos --help"))) {
+            throw new Error("CLI must identify the nonexistent subcommand or provide argument-error help guidance in stderr");
+          }
+        } else {
+          if (result.status !== 0) throw new Error(`CLI exited ${result.status}`);
+          if (id === "version" && item.stdout.trim() !== options.version) {
+            throw new Error(`Expected CLI stdout ${options.version}; found ${JSON.stringify(item.stdout.trim())}`);
+          }
+          if (id === "help" && (!/Usage:\s+inkos\b/.test(item.stdout)
+            || !item.stdout.includes("--help") || !item.stdout.includes("Commands:"))) {
+            throw new Error("CLI help must include usage, --help and available commands");
+          }
+        }
+      });
+    }
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

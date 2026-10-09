@@ -267,12 +267,15 @@ async function loadCompletedShortRun(
   const outline = await tryReadProjectText(root, join(baseDir, "outline", "v001.md"));
   const inputHash = shortInputHash({ draft, outline, intent: state?.intent ?? "" });
   if (state && (state.stages.review?.inputHash !== inputHash || state.stages.package?.inputHash !== inputHash)) return null;
-  if (state?.stages.review?.status === "completed" && state.stages.review.requestHash !== shortReviewRequestHash({
+  if (state?.stages.review?.status === "completed" && state.stages.review.targetHash !== shortInputHash(state.target)) return null;
+  if (state?.stages.review && (state.target || state.stages.review.status === "completed") && state.stages.review.requestHash !== shortReviewRequestHash({
     ...options,
     chapterCount: options.chapterCount ?? state.target?.chapterCount,
     charsPerChapter: options.charsPerChapter ?? state.target?.charsPerChapter,
     language: options.language ?? state.target?.language,
   })) return null;
+  if (state?.target && (!state.delivery || state.delivery.inputHash !== inputHash
+    || shortInputHash(state.delivery.target) !== shortInputHash(state.target))) return null;
   if(state?.delivery&&state.stages.package?.reviewHash!==shortInputHash(state.delivery))return null;
   const observations: Observation[] = state
     ? Object.values(state.stages).flatMap(stage => stage?.observations ?? [])
@@ -289,7 +292,7 @@ function shortReviewRequestHash(options: ShortFictionRunOptions): string {
     reviewScope: options.reviewScope ?? "whole-story",
     chapterCount: options.chapterCount,
     charsPerChapter: options.charsPerChapter,
-    language: options.language ?? "zh",
+    ...shortDraftMinimum(options),
     model: options.runtimes.draftReview.model,
     activatedSkills: options.runtimes.draftReview.activatedSkills,
   });
@@ -411,7 +414,7 @@ async function produceShort(
   async function refreshDelivery(){
     const inputHash=shortInputHash({draft:finalDraft,outline:outlineMarkdown,intent:productionState.intent});
     const review=productionState.stages.review;
-    const verified=review?.status==='completed'&&review.inputHash===inputHash;
+    const verified=review?.status==='completed'&&review.inputHash===inputHash&&review.targetHash===shortInputHash(productionState.target);
     const lengthIssues:Observation[]=findIncompleteShortFictionChapters(finalDraft,minimum).map(number=>({
       code:'SHORT_CHAPTER_CONTRACT',category:'quality',assessment:'issue',scope:`chapter:${number}`,targetHash:inputHash,
       summary:`Chapter ${number} does not satisfy the configured manuscript length or text contract.`,evidence:[projectPath(join(baseDir,'final','chapters',String(number).padStart(4,'0')+'.md'))],
@@ -508,6 +511,7 @@ async function produceShort(
     try {
       const cachedReview = productionState.stages.review;
       const reuseReview = cachedReview?.status === "completed" && cachedReview.inputHash === inputHash
+        && cachedReview.targetHash === shortInputHash(productionState.target)
         && cachedReview.requestHash === requestHash && !options.retryStages?.includes("review");
       const draftReview = reuseReview
         ? { summary: "", observations: cachedReview.observations }
@@ -538,7 +542,7 @@ async function produceShort(
     }
 
     productionState = { ...productionState, stages: { ...productionState.stages, review: {
-      status: draftReviewWarning ? "failed" : "completed", inputHash, requestHash, updatedAt: new Date().toISOString(),
+      status: draftReviewWarning ? "failed" : "completed", inputHash, requestHash, targetHash:shortInputHash(productionState.target),updatedAt: new Date().toISOString(),
       error: draftReviewWarning,
       observations: draftReviewWarning ? [{ code: "draft-review", category: "execution", assessment: "unavailable",
         summary: draftReviewWarning, evidence: [projectPath(join(baseDir, "reviews", "draft-warning.md"))], scope: productionState.reviewScope, targetHash: inputHash }] : [...draftReviewObservations],
