@@ -149,3 +149,61 @@ it('rejects ambiguous native defaults instead of choosing whichever catalog row 
   await expect(service.updateSettings({ model: null })).rejects.toMatchObject({ code: 'CODEX_MODEL_UNAVAILABLE' });
   await service.dispose();
 });
+
+
+it('settles the original pending login ticket on dispose, fences late success, and allows fresh reconciliation', async () => {
+  const { service, request, client, notify } = await fixture();
+  const owner = new CodexAuthenticationOwner(client);
+  await service.startDeviceLogin();
+  const pending = owner.snapshot()!;
+  expect(pending.localState).toBe('transitioning');
+  await service.dispose();
+  const disposed = owner.snapshot()!;
+  expect(disposed).toMatchObject({ localState: 'unknown', operationId: null, authGeneration: pending.authGeneration });
+  notify('account/login/completed', { loginId: 'l1', success: true });
+  expect(owner.snapshot()).toEqual(disposed);
+  expect(request.mock.calls.some(([method]) => method === 'account/logout')).toBe(false);
+  request.mockImplementation(async method => method === 'account/read' ? { account: { type: 'chatgpt', email: 'fresh@example.test' } } : {});
+  const fresh = createCodexAccountService({ projectDir: client.cwd, clientFactory: async () => client });
+  expect((await fresh.readAccount()).connected).toBe(true);
+  expect((await owner.admit(client)).ready).toBe(true);
+  await fresh.dispose();
+});
+
+it('does not let disposing an old pending login overwrite a newer operation', async () => {
+  const { service, client, notify } = await fixture();
+  const owner = new CodexAuthenticationOwner(client);
+  await service.startDeviceLogin();
+  const newer = owner.begin(true), before = owner.snapshot()!;
+  await service.dispose();
+  notify('account/login/completed', { loginId: 'l1', success: true });
+  expect(owner.snapshot()).toEqual(before);
+  expect(owner.complete(newer, 'unknown')).toBe(true);
+});
+
+it('keeps a completed account ready when its service is disposed', async () => {
+  const { service, request, client, notify } = await fixture();
+  const original = request.getMockImplementation()!;
+  request.mockImplementation(async method => method === 'account/read' ? { account: { type: 'chatgpt', email: 'ready@example.test' } } : original(method));
+  await service.startDeviceLogin();
+  notify('account/login/completed', { loginId: 'l1', success: true });
+  await service.readAccount();
+  const owner = new CodexAuthenticationOwner(client), ready = owner.snapshot()!;
+  expect(ready.localState).toBe('ready');
+  await service.dispose();
+  expect(owner.snapshot()).toEqual(ready);
+  expect(request.mock.calls.some(([method]) => method === 'account/logout')).toBe(false);
+});
+
+it('fences a pending success as soon as dispose starts, while it is still awaiting its queue', async () => {
+  const { service, request, client, notify } = await fixture();
+  await service.startDeviceLogin();
+  const owner = new CodexAuthenticationOwner(client), pending = owner.snapshot()!;
+  request.mockImplementation(async method => method === 'account/read' ? { account: { type: 'chatgpt', email: 'late@example.test' } } : {});
+  const closing = service.dispose();
+  // dispose has marked itself closed, but its first await has not resumed yet.
+  notify('account/login/completed', { loginId: 'l1', success: true });
+  await closing;
+  expect(owner.snapshot()).toMatchObject({ localState: 'unknown', operationId: null, authGeneration: pending.authGeneration });
+  expect(request.mock.calls.filter(([method]) => method === 'account/read')).toHaveLength(0);
+});

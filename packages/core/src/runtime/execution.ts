@@ -8,7 +8,7 @@ import { AgentSettingsSchema, type AgentSettings, type HarnessDescriptor } from 
 import { AgentSettingsConflictError, readAgentSettings, updateAgentSettings } from './settings.js';
 import { resolveRuntimeSelection } from './selection.js';
 import { CodexAuthenticationOwner, RuntimeAuthenticationError, type CodexOwnerObservation } from './auth/codex-owner.js';
-import { CodexRuntimeAdapter, type CodexNativeDefaultsEvidence } from './adapters/codex/adapter.js';
+import { CodexRuntimeAdapter, codexServiceTierRequestValue, type CodexNativeDefaultsEvidence } from './adapters/codex/adapter.js';
 import { currentCodexRun, runWithCodexContext, type CodexRunContext } from './run-context.js';
 import { appendRunDispatch, appendRunObservation, type RunHistoryBinding } from './run-history.js';
 import type { AgentModelCallTrace } from '../llm/agent-trajectory.js';
@@ -118,24 +118,39 @@ export async function withCodexExecution<T>(projectRoot: string, task: () => Pro
       catch (error) { owner.disconnect(); throw error; }
     };
     let historyFailure: Error | undefined;
+    const checkHistory = () => { if (historyFailure) throw historyFailure; };
     const context: CodexRunContext = {
       projectRoot: resolve(projectRoot), saved, selection, owner,
       onHistoryFailure(failure) { historyFailure ??= failure; },
       async takeClient() {
-        if (historyFailure) throw historyFailure;
+        checkHistory();
         if (!leased) { leased = true; peers.add(client); client.onClose(() => peers.delete(client)); return client; }
-        const peer = await createCodexClient(projectRoot);
-        try { await owner.guard(selection, peer, options.signal); peers.add(peer); peer.onClose(() => peers.delete(peer)); return peer; }
-        catch (error) { await peer.close(); throw error; }
+        let peer: CodexClient | undefined;
+        try {
+          peer = await createCodexClient(projectRoot);
+          checkHistory();
+          await owner.guard(selection, peer, options.signal);
+          checkHistory();
+          const leasedPeer = peer;
+          peers.add(leasedPeer); leasedPeer.onClose(() => peers.delete(leasedPeer)); return leasedPeer;
+        } catch (error) {
+          try { await peer?.close(); } catch (cleanupError) { if (!historyFailure) throw cleanupError; }
+          throw historyFailure ?? error;
+        }
       },
       async guard(peer, signal) {
-        if (historyFailure) throw historyFailure;
+        checkHistory();
         assertTrustedContext();
-        if (peer) { await owner.guard(selection, peer, signal, assertTrustedContext); return; }
-        const active = [...peers].find(peer => !peer.closed);
-        if (active) { await owner.guard(selection, active, signal, assertTrustedContext); return; }
-        const probe = await createCodexClient(projectRoot);
-        try { await owner.guard(selection, probe, signal, assertTrustedContext); } finally { await probe.close(); }
+        try {
+          const active = peer ?? [...peers].find(peer => !peer.closed);
+          if (active) await owner.guard(selection, active, signal, assertTrustedContext);
+          else {
+            const probe = await createCodexClient(projectRoot);
+            try { await owner.guard(selection, probe, signal, assertTrustedContext); } finally { await probe.close(); }
+          }
+        } catch (error) { throw historyFailure ?? error; }
+        // The successful recheck grants permission. Later failure does not recall an admitted operation.
+        checkHistory();
       },
     };
     await context.guard(client, options.signal);
@@ -224,7 +239,7 @@ export async function startCodexRuntimeThread(client: CodexClient, parameters: R
   });
   if (effective.modelId !== undefined && effective.modelId !== selection.modelId) throw new Error('Codex acknowledged an incompatible model');
   if (selection.serviceTier !== null && selection.serviceTier !== 'default' && typeof effective.serviceTier === 'string'
-    && effective.serviceTier !== selection.serviceTier) throw new Error('Codex acknowledged an incompatible service tier');
+    && codexServiceTierRequestValue(effective.serviceTier) !== codexServiceTierRequestValue(selection.serviceTier)) throw new Error('Codex acknowledged an incompatible service tier');
   let peers = admittedThreads.get(runtime);
   if (!peers) { peers = new WeakMap(); admittedThreads.set(runtime, peers); }
   const threads = peers.get(client) ?? new Set<string>();
@@ -245,7 +260,7 @@ export async function startCodexRuntimeTurn(client: CodexClient, parameters: Rec
   await runtime.guard(client, signal);
   const wire = { model: selection.modelId,
     ...(selection.effort !== null ? { effort: selection.effort } : {}),
-    ...(selection.serviceTier !== null ? { serviceTierForTurn: selection.serviceTier } : {}),
+    ...(selection.serviceTier !== null ? { serviceTierForTurn: codexServiceTierRequestValue(selection.serviceTier) } : {}),
   };
   if (history) persistHistory(() => appendRunDispatch(history.binding, { ...historyCall(history), kind: 'dispatch',
     operation: 'codex-turn-start', threadId: parameters.threadId as string, wire }));

@@ -5,6 +5,10 @@ import { HarnessDescriptorSchema, type HarnessDescriptor, type HarnessPreference
 import type { HarnessAdapter } from '../../registry.js';
 
 export const CODEX_ADAPTER_VERSION = `codex-app-server-${CODEX_APP_SERVER_VERSION}-v1`;
+/** 0.159.2 ServiceTier::Fast accepts either spelling; its request value is priority. */
+export function codexServiceTierRequestValue(tier: string): string {
+  return CODEX_APP_SERVER_VERSION === '0.159.2' && tier === 'fast' ? 'priority' : tier;
+}
 export interface CodexNativeDefaultsEvidence {
   readonly model: 'config/read' | 'model/list-default';
   readonly effort: 'config/read' | 'model/list-default';
@@ -39,12 +43,17 @@ export class CodexRuntimeAdapter implements HarnessAdapter {
       runtimeVersion: CODEX_APP_SERVER_VERSION, installation: 'installed', deployment: 'supported', ready: true, readyReasons: [],
       capabilities: { harnessId: 'codex', adapterVersion: this.adapterVersion,
         supportsChatGptOauth: true, supportsTools: true, supportsStreaming: true,
-        models: [...new Map(this.models.map(model => [model.model, model])).values()].map(model => ({ modelId: model.model,
-          efforts: model.supportedReasoningEfforts.map(option => option.reasoningEffort),
-          // Standard is explicitly specified by the pinned turn protocol, not a guessed Fast tier.
-          serviceTiers: [...new Set(['default', ...model.serviceTiers.map(option => option.id)])],
-          defaultEffort: model.defaultReasoningEffort || null, defaultServiceTier: model.defaultServiceTier,
-        })), nativeDefaults: { modelId: native.model, effort, serviceTier: tier },
+        models: [...new Map(this.models.map(model => [model.model, model])).values()].map(model => {
+          const tiers = model.serviceTiers.map(option => option.id);
+          // An alias does not establish availability: require this model's own catalog evidence.
+          if (CODEX_APP_SERVER_VERSION === '0.159.2' && tiers.some(tier => tier === 'fast' || tier === 'priority')) tiers.push('fast', 'priority');
+          return { modelId: model.model,
+            efforts: model.supportedReasoningEfforts.map(option => option.reasoningEffort),
+            // Standard is explicitly specified by the pinned turn protocol, not a guessed Fast tier.
+            serviceTiers: [...new Set(['default', ...tiers])],
+            defaultEffort: model.defaultReasoningEffort || null, defaultServiceTier: model.defaultServiceTier,
+          };
+        }), nativeDefaults: { modelId: native.model, effort, serviceTier: tier },
       },
     });
   }

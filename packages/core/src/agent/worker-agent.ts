@@ -16,7 +16,7 @@ import { decodeWorkerOutput, workerOutputSchema } from "./worker-output.js";
 import { decodeStructuredFields } from "./structured-arguments.js";
 import { preserveToolArgumentTypes, toolArgumentIssues } from "./tool-arguments.js";
 import { isUnboundedWorkerExecution } from "./worker-execution-policy.js";
-import { guardCodexExecution, withCodexExecution } from "../runtime/execution.js";
+import { RuntimeHistoryWriteError, guardCodexExecution, withCodexExecution } from "../runtime/execution.js";
 import { currentCodexRun } from "../runtime/run-context.js";
 import { RuntimeAuthenticationError } from "../runtime/auth/codex-owner.js";
 
@@ -103,9 +103,10 @@ class WorkerResultUncertainError extends Error {
 
 function throwIfWorkerAborted(signal?: AbortSignal, failure?: unknown): void {
   if (failure instanceof CodexCleanupError || failure instanceof CodexHostError) return;
-  // A late deadline cannot replace a retained native failure, including an
+  // A late deadline cannot replace a retained runtime/native failure, including an
   // unconfirmed turn or uncertain tool outcome. Explicit caller cancellation wins.
-  if ((failure instanceof CodexModelError || failure instanceof CodexTurnIdentityError || failure instanceof WorkerResultUncertainError)
+  if ((failure instanceof RuntimeHistoryWriteError || failure instanceof RuntimeAuthenticationError
+    || failure instanceof CodexModelError || failure instanceof CodexTurnIdentityError || failure instanceof WorkerResultUncertainError)
     && signal?.aborted && (signal.reason as { code?: unknown })?.code === "WORKER_TIMEOUT") return;
   signal?.throwIfAborted();
 }

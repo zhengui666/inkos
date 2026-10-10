@@ -131,7 +131,7 @@ class AccountService implements CodexAccountService {
       const factory = this.options.clientFactory ?? createCodexClient;
       const promise = factory(this.options.projectDir).then(client => {
         client.onNotification((method, params) => {
-          if (this.clientPromise === promise) this.notification(method, params);
+          if (!this.disposed && this.clientPromise === promise) this.notification(method, params);
         });
         client.onClose(() => {
           if (this.clientPromise === promise) {
@@ -276,6 +276,11 @@ class AccountService implements CodexAccountService {
     // Let already-started login/logout operations settle before stopping the polling process.
     try { await this.queue; } catch { /* Operation errors are returned to their callers. */ }
     try { await this.ownerSettlement; } catch { /* The owner retains its non-ready state. */ }
+    const pending = this.ownerLogin;
+    this.ownerLogin = undefined;
+    // Closing fences callbacks, so settle our original ticket before dropping the peer.
+    // complete's ticket check cannot overwrite a newer operation or a completed account.
+    if (pending) pending.owner.complete(pending.operation, 'unknown');
     const promise = this.clientPromise;
     this.clientPromise = undefined;
     if (promise) await (await promise).close();

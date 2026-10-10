@@ -6,7 +6,12 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CodexFixture, type FixtureReply, type FixtureTurn } from '../../__tests__/codex-fixture.js';
 import { runAgentSession, abortAgentSession } from '../../agent/agent-session.js';
-import { runWorkerAgent } from '../../agent/worker-agent.js';
+import { Type } from '@sinclair/typebox';
+import type { CodexClient } from '../../codex/app-server.js';
+import { isCreationTransientFailure } from '../../creation/transient.js';
+import { CodexAuthenticationOwner } from '../auth/codex-owner.js';
+import { dispatchCodexHostEffect } from '../execution.js';
+import { runWorkerAgentTool, runWorkerAgent } from '../../agent/worker-agent.js';
 import { CreativeEpisodeStore } from '../../harness/episode-store.js';
 import { readTranscriptEvents } from '../../interaction/session-transcript.js';
 import { loadBookSession } from '../../interaction/book-session-store.js';
@@ -69,6 +74,192 @@ afterEach(async () => {
 });
 
 describe('actual core queue / Agent / worker / durable runtime history', () => {
+  it('blocks the actual Agent host action when its final permit waits across a sibling ACK failure', async () => {
+    let entered!: () => void, release!: () => void, poison!: () => Promise<unknown>;
+    const began = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let armed = false, reads = 0, ackCount = 0, failureB: unknown;
+    const append = CreativeEpisodeStore.prototype.append;
+    vi.spyOn(CreativeEpisodeStore.prototype, 'append').mockImplementation(function (this: CreativeEpisodeStore, input) {
+      if (input.type === RUN_HISTORY_EVENT_TYPE && input.payload.source === 'codex-turn-start-ack' && ++ackCount === 2) throw new Error('Sibling ACK poison before actual host action');
+      return append.call(this, input);
+    });
+    const action = vi.spyOn(CreativeHarnessRuntime.prototype, 'executeAction');
+    const fixture = install(turn => {
+      if (!turn.thread.dynamicTools?.length) return { text: 'Worker response' };
+      armed = true; return { calls: [{ name: 'workspace__list_work_profiles', args: {} }] };
+    });
+    const create = factory.getMockImplementation()!;
+    factory.mockImplementationOnce(async (projectRoot: string) => {
+      const peer: CodexClient = await create(projectRoot), request = peer.request.bind(peer);
+      peer.request = async (method, params, options) => {
+        if (method === 'account/read' && armed && ++reads === 2) {
+          const resume = AsyncLocalStorage.snapshot();
+          poison = () => resume(() => runWorkerAgent({ _codex: { projectRoot: root } } as never, 'ignored', [{ role: 'user', content: 'Sibling B' }]));
+          entered(); await gate;
+        }
+        return request(method, params, options);
+      };
+      return peer;
+    });
+    const running = runAgentSession(configuration('actual-host-race'), 'List profiles').catch(error => error);
+    try { await began; try { await poison(); } catch (error) { failureB = error; } }
+    finally { release(); }
+    expect(await running).toBe(failureB);
+    expect(failureB).toMatchObject({ code: 'RUNTIME_HISTORY_WRITE_FAILED' });
+    expect(action).not.toHaveBeenCalled();
+    expect(fixture.requests.filter(r => r.method === 'turn/start')).toHaveLength(2);
+    expect(fixture.toolResponses).toHaveLength(0);
+  });
+
+  it.each(['legacy-fast', 'canonical-priority'] as const)('records saved Fast, actual canonical turn wire and raw thread ACK for a %s catalog', async advertised => {
+    const capabilities = catalog('codex'); capabilities.models[0]!.serviceTiers.push('fast');
+    await updateAgentSettings(root, { harnessPreferences: { codex: { model: 'gpt-6.1-sol', effort: 'ultra', speed: 'fast' } } },
+      { expectedRevision: 1, catalogs: { codex: capabilities } });
+    const fixture = install(() => answered('Fast request accepted'));
+    const create = factory.getMockImplementation()!;
+    factory.mockImplementation(async (projectRoot: string) => {
+      const peer: CodexClient = await create(projectRoot), request = peer.request.bind(peer);
+      peer.request = async (method, params, options) => {
+        const result: any = await request(method, params, options);
+        if (method === 'model/list') return { ...result, data: result.data.map((model: any) => ({ ...model,
+          serviceTiers: advertised === 'canonical-priority' ? [{ id: 'priority' }] : [],
+          additionalSpeedTiers: advertised === 'legacy-fast' ? ['fast'] : [],
+        })) };
+        return (method === 'thread/start' ? { ...result, serviceTier: 'priority' } : result) as never;
+      };
+      return peer;
+    });
+    await expect(runAgentSession(configuration(advertised), 'Answer with Fast')).resolves.toMatchObject({ responseText: 'Fast request accepted' });
+    expect((await readAgentSettings(root)).harnessPreferences.codex.speed).toBe('fast');
+    expect(fixture.requests.find(r => r.method === 'thread/start')?.params.serviceTier).toBe('fast');
+    expect(fixture.requests.find(r => r.method === 'turn/start')?.params.serviceTierForTurn).toBe('priority');
+    const request = (await reopened(advertised)).projected.requests[0]!;
+    expect(request.selection?.saved.speed).toBe('fast');
+    expect(request.selection?.selection.serviceTier).toBe('fast');
+    expect(request.dispatches.find(d => d.operation === 'codex-thread-start')?.wire.serviceTier).toBe('fast');
+    expect(request.dispatches.find(d => d.operation === 'codex-turn-start')?.wire.serviceTierForTurn).toBe('priority');
+    expect(request.observations.find(o => o.scope === 'thread')?.effective.serviceTier).toBe('priority');
+    expect(request.observations.find(o => o.scope === 'turn')?.fields.serviceTier).toEqual({ state: 'unknown' });
+  });
+
+
+  it.each(['thread', 'turn', 'lease', 'host', 'active'] as const)('blocks a %s permit held across a sibling worker ACK persistence failure', async boundary => {
+    let failureA: unknown, failureB: unknown, startsBefore = 0, startsAfter = 0, effects = 0, leasedClosed: boolean | undefined;
+    let mainPeer: CodexClient, target: CodexClient | undefined;
+    const append = CreativeEpisodeStore.prototype.append, execute = CreativeHarnessRuntime.prototype.executeAction;
+    let ackCount = 0;
+    vi.spyOn(CreativeEpisodeStore.prototype, 'append').mockImplementation(function (this: CreativeEpisodeStore, input) {
+      if (input.type === RUN_HISTORY_EVENT_TYPE && input.payload.source === 'codex-turn-start-ack' && ++ackCount === 2) {
+        throw new Error('Sibling B ACK persistence failed');
+      }
+      return append.call(this, input);
+    });
+    let step = 0;
+    const fixture = install(turn => !turn.thread.dynamicTools?.length ? { text: 'Worker response' }
+      : ++step === 1 ? { calls: [{ name: 'workspace__list_work_profiles', args: {} }] } : answered());
+    const create = factory.getMockImplementation()!;
+    factory.mockImplementation(async (projectRoot: string) => { const peer: CodexClient = await create(projectRoot); mainPeer ??= peer; return peer; });
+    vi.spyOn(CreativeHarnessRuntime.prototype, 'executeAction').mockImplementation(async function (this: CreativeHarnessRuntime, input) {
+      if (input.actionId !== 'list_work_profiles') return execute.call(this, input);
+      const result = await execute.call(this, input);
+      let entered!: () => void, release!: () => void;
+      const began = new Promise<void>(resolve => { entered = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const hold = (peer: CodexClient, readNumber: number) => {
+        const request = peer.request.bind(peer); let reads = 0;
+        peer.request = async (method, params, options) => {
+          if (method === 'account/read' && ++reads === readNumber) { entered(); await gate; }
+          return request(method, params, options);
+        };
+      };
+      if (boundary === 'host' || boundary === 'active') hold(mainPeer, 1);
+      else {
+        factory.mockImplementationOnce(async (projectRoot: string) => {
+          target = await create(projectRoot);
+          hold(target!, boundary === 'thread' ? 3 : boundary === 'turn' ? 5 : 1);
+          return target;
+        });
+      }
+      const pending = boundary === 'lease' ? currentCodexRun()!.takeClient()
+        : boundary === 'host' ? dispatchCodexHostEffect(mainPeer, async () => ++effects)
+        : boundary === 'active' ? currentCodexRun()!.guard().then(() => ++effects)
+        : runWorkerAgent({ _codex: { projectRoot: root } } as never, 'ignored', [{ role: 'user', content: 'Held worker A' }]);
+      const a = pending.catch(error => { failureA = error; });
+      try {
+        await began;
+        try { await runWorkerAgent({ _codex: { projectRoot: root } } as never, 'ignored', [{ role: 'user', content: 'Poisoning worker B' }]); }
+        catch (error) { failureB = error; }
+        startsBefore = fixture.requests.filter(r => r.method === 'thread/start' || r.method === 'turn/start').length;
+      } finally { release(); }
+      await a;
+      startsAfter = fixture.requests.filter(r => r.method === 'thread/start' || r.method === 'turn/start').length;
+      leasedClosed = target?.closed;
+      return result; // Domain wrappers cannot turn the poison into a new permit.
+    });
+    await expect(runAgentSession(configuration(`held-${boundary}`), 'List profiles')).rejects.toMatchObject({ code: 'RUNTIME_HISTORY_WRITE_FAILED' });
+    expect(failureB).toMatchObject({ code: 'RUNTIME_HISTORY_WRITE_FAILED', cause: { message: 'Sibling B ACK persistence failed' } });
+    expect(failureA).toBe(failureB);
+    expect(isCreationTransientFailure(failureA)).toBe(false);
+    expect(startsAfter).toBe(startsBefore);
+    expect(effects).toBe(0);
+    if (boundary === 'lease') expect(leasedClosed).toBe(true);
+  });
+
+  it.each([['text', 'history', 'deadline'], ['structured', 'history', 'deadline'], ['text', 'auth', 'deadline'], ['structured', 'auth', 'deadline'], ['text', 'history', 'cancel'], ['structured', 'history', 'cancel']] as const)('preserves %s worker %s error priority with late %s during peer close', async (kind, fault, abort) => {
+    const append = CreativeEpisodeStore.prototype.append, execute = CreativeHarnessRuntime.prototype.executeAction;
+    let ackCount = 0, failure: unknown, interrupted = false;
+    vi.spyOn(CreativeEpisodeStore.prototype, 'append').mockImplementation(function (this: CreativeEpisodeStore, input) {
+      if (fault === 'history' && input.type === RUN_HISTORY_EVENT_TYPE && input.payload.source === 'codex-turn-start-ack' && ++ackCount === 2) throw new Error('Worker ACK failed before deadline');
+      return append.call(this, input);
+    });
+    let step = 0;
+    const fixture = install(turn => !turn.thread.dynamicTools?.some((t: { name: string }) => t.name === 'workspace__list_work_profiles') ? { text: 'Worker output' }
+      : ++step === 1 ? { calls: [{ name: 'workspace__list_work_profiles', args: {} }] } : answered());
+    const create = factory.getMockImplementation()!;
+    vi.spyOn(CreativeHarnessRuntime.prototype, 'executeAction').mockImplementation(async function (this: CreativeHarnessRuntime, input) {
+      if (input.actionId !== 'list_work_profiles') return execute.call(this, input);
+      const result = await execute.call(this, input);
+      let entered!: () => void, release!: () => void;
+      const began = new Promise<void>(resolve => { entered = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      factory.mockImplementationOnce(async (projectRoot: string) => {
+        const peer: CodexClient = await create(projectRoot), close = peer.close.bind(peer), request = peer.request.bind(peer);
+        peer.request = async (method, params, options) => {
+          const result = await request(method, params, options);
+          if (fault === 'auth' && method === 'thread/start') new CodexAuthenticationOwner(peer).disconnect();
+          return result as never;
+        };
+        peer.close = async () => { entered(); await gate; await close(); };
+        return peer;
+      });
+      // Start the clock only after admission; hold cleanup until the actual budget fires.
+      vi.useFakeTimers();
+      const client = { _codex: { projectRoot: root } } as never;
+      const messages = [{ role: 'user' as const, content: 'Worker request' }];
+      const caller = new AbortController();
+      const options = { timeoutMs: 1000, signal: caller.signal };
+      const pending = kind === 'text' ? runWorkerAgent(client, 'ignored', messages, options)
+        : runWorkerAgentTool(client, 'ignored', messages, { name: 'result', label: 'Result', description: 'Result', parameters: Type.Object({ value: Type.String() }) }, options);
+      const settled = pending.catch(error => { failure = error; });
+      try {
+        await began;
+        if (abort === 'cancel') caller.abort(Object.assign(new Error('Explicit caller cancellation'), { code: 'USER_CANCELLED' }));
+        else await vi.advanceTimersByTimeAsync(1000);
+        interrupted = true;
+      }
+      finally { vi.useRealTimers(); release(); }
+      await settled;
+      return result;
+    });
+    await expect(runAgentSession(configuration(`deadline-${kind}-${fault}-${abort}`), 'List profiles')).rejects.toMatchObject({ code: fault === 'history' ? 'RUNTIME_HISTORY_WRITE_FAILED' : 'RUNTIME_AUTH_REVOKED' });
+    expect(interrupted).toBe(true);
+    expect(failure).toMatchObject({ code: abort === 'cancel' ? 'USER_CANCELLED' : fault === 'history' ? 'RUNTIME_HISTORY_WRITE_FAILED' : 'RUNTIME_AUTH_REVOKED' });
+    if (fault === 'history' && abort === 'deadline') expect(failure).toMatchObject({ cause: { message: 'Worker ACK failed before deadline' } });
+    expect(isCreationTransientFailure(failure)).toBe(false);
+    expect(fixture.requests.filter(r => r.method === 'turn/start')).toHaveLength(fault === 'history' ? 2 : 1);
+  });
+
   it('freezes the queued request and nested worker; the next queued request rereads saved preferences', async () => {
     let entered!: () => void, release!: () => void;
     const started = new Promise<void>(resolve => { entered = resolve; });

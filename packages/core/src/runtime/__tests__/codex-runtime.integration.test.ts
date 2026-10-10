@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CodexClient } from '../../codex/app-server.js';
 import { CodexAuthenticationOwner } from '../auth/codex-owner.js';
 import { CodexRuntimeAdapter } from '../adapters/codex/adapter.js';
-import { bindCodexModelConnection, dispatchCodexHostEffect, observeCodexRuntime, startCodexRuntimeThread, startCodexRuntimeTurn, withCodexExecution } from '../execution.js';
+import { RuntimeHistoryWriteError, bindCodexModelConnection, dispatchCodexHostEffect, observeCodexRuntime, startCodexRuntimeThread, startCodexRuntimeTurn, withCodexExecution } from '../execution.js';
 import { currentCodexRun } from '../run-context.js';
 import { readAgentSettings, updateAgentSettings } from '../settings.js';
 
@@ -202,7 +202,7 @@ describe('Codex runtime core boundary (authenticated protocol fixture)', () => {
     await updateAgentSettings(root, { harnessPreferences: { codex: { speed } } }, { expectedRevision: 1, catalogs: { codex: harness.capabilities! } });
     await withCodexExecution(root, async () => {
       const { peer, turn } = await executeBoundary();
-      expect(peer.calls.find(call => call.method === 'turn/start')!.params.serviceTierForTurn).toBe(speed === null ? 'fast' : 'default');
+      expect(peer.calls.find(call => call.method === 'turn/start')!.params.serviceTierForTurn).toBe(speed === null ? 'priority' : 'default');
       expect(turn.requested.serviceTier).toBe(speed === null ? 'fast' : 'default');
     });
     expect((await readAgentSettings(root)).harnessPreferences.codex.speed).toBe(speed);
@@ -279,6 +279,104 @@ describe('Codex runtime core boundary (authenticated protocol fixture)', () => {
     await updateAgentSettings(root, { selectedHarnessId: 'codex' }, { expectedRevision: 2 });
     await withCodexExecution(root, async () => {
       await expect(withCodexExecution(join(root, 'other-project'), executeBoundary)).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+    });
+  });
+});
+
+
+describe('pinned Codex Fast aliases and permit linearization', () => {
+  function catalogPeer(tiers: string[], rawTier?: string, threadTier?: string) {
+    const peer = new Peer(root), request = peer.request.bind(peer);
+    peer.request = async <T = unknown>(method: string, params?: unknown): Promise<T> => {
+      const result = await request<any>(method, params);
+      if (method === 'model/list') return { ...result, data: result.data.map((model: any) => ({ ...model, serviceTiers: tiers.map(id => ({ id })) })) } as T;
+      if (method === 'config/read') return { config: rawTier === undefined ? {} : { service_tier: rawTier } } as T;
+      if (method === 'thread/start' && threadTier !== undefined) return { ...result, serviceTier: threadTier } as T;
+      return result;
+    };
+    peers.push(peer); return peer;
+  }
+
+  it('admits raw native Fast with a canonical-only catalog and sends a canonical turn override', async () => {
+    mocks.create.mockImplementation(async () => catalogPeer(['priority'], 'fast', 'priority'));
+    await withCodexExecution(root, async () => {
+      const boundary = await executeBoundary();
+      expect(boundary.context.saved.speed).toBeNull();
+      expect(boundary.context.selection.serviceTier).toBe('fast');
+      expect(boundary.thread.effective.serviceTier).toBe('priority');
+      expect(boundary.turn.requested.serviceTier).toBe('fast');
+      expect(boundary.peer.calls.find(c => c.method === 'turn/start')?.params.serviceTierForTurn).toBe('priority');
+    });
+  });
+
+  it('does not invent Fast capability when neither alias is advertised', async () => {
+    const descriptor = await new CodexRuntimeAdapter(catalogPeer(['flex'])).describe();
+    expect(descriptor.capabilities?.models[0]?.serviceTiers).toEqual(['default', 'flex']);
+    mocks.create.mockImplementation(async () => catalogPeer(['flex'], 'fast'));
+    await expect(withCodexExecution(root, executeBoundary)).rejects.toThrow();
+    expect(peers.flatMap(p => p.calls).filter(c => c.method === 'thread/start')).toHaveLength(0);
+  });
+
+  it('rejects a Flex ACK for requested Priority and does not send a turn', async () => {
+    mocks.create.mockImplementation(async () => catalogPeer(['priority', 'flex'], 'priority', 'flex'));
+    await expect(withCodexExecution(root, executeBoundary)).rejects.toThrow('incompatible service tier');
+    expect(peers.flatMap(p => p.calls).filter(c => c.method === 'turn/start')).toHaveLength(0);
+  });
+
+  it.each(['default', 'flex'] as const)('keeps explicit %s wire values outside the Fast alias pair', async tier => {
+    mocks.create.mockImplementation(async () => catalogPeer(['priority', 'flex'], tier));
+    await withCodexExecution(root, async () => {
+      const { peer, turn } = await executeBoundary();
+      expect(turn.requested.serviceTier).toBe(tier);
+      expect(peer.calls.find(c => c.method === 'turn/start')?.params.serviceTierForTurn).toBe(tier);
+    });
+  });
+
+  it.each(['guard', 'close'] as const)('checks poison after the last inactive-peer probe (%s)', async stage => {
+    await withCodexExecution(root, async () => {
+      const runtime = currentCodexRun()!, initial = await runtime.takeClient(); await initial.close();
+      const failure = new RuntimeHistoryWriteError(new Error('poison during probe close'));
+      mocks.create.mockImplementationOnce(async () => {
+        const probe = new Peer(root), close = probe.close.bind(probe), request = probe.request.bind(probe);
+        probe.request = async <T = unknown>(method: string, params?: unknown): Promise<T> => {
+          const result = await request<T>(method, params);
+          if (stage === 'guard' && method === 'account/read') runtime.onHistoryFailure!(failure);
+          return result;
+        };
+        probe.close = async () => { await Promise.resolve(); if (stage === 'close') runtime.onHistoryFailure!(failure); await close(); };
+        peers.push(probe); return probe;
+      });
+      await expect(runtime.guard()).rejects.toBe(failure);
+      expect(peers.at(-1)?.closed).toBe(true);
+    });
+  });
+
+  it('closes a poisoned new lease and retains the original failure even if closing rejects', async () => {
+    await withCodexExecution(root, async () => {
+      const runtime = currentCodexRun()!; await runtime.takeClient();
+      const failure = new RuntimeHistoryWriteError(new Error('poison during lease guard'));
+      mocks.create.mockImplementationOnce(async () => {
+        const peer = new Peer(root), request = peer.request.bind(peer), close = peer.close.bind(peer);
+        peer.request = async <T = unknown>(method: string, params?: unknown): Promise<T> => {
+          const response = await request<T>(method, params);
+          if (method === 'account/read') runtime.onHistoryFailure!(failure);
+          return response;
+        };
+        peer.close = async () => { await close(); throw new Error('late close failure'); };
+        peers.push(peer); return peer;
+      });
+      await expect(runtime.takeClient()).rejects.toBe(failure);
+      expect(peers.at(-1)?.closed).toBe(true);
+    });
+  });
+
+  it('does not recall a host effect already permitted before poison', async () => {
+    await withCodexExecution(root, async () => {
+      const runtime = currentCodexRun()!, peer = await runtime.takeClient(); let effects = 0;
+      const failure = new RuntimeHistoryWriteError(new Error('later poison'));
+      await expect(dispatchCodexHostEffect(peer, async () => { ++effects; runtime.onHistoryFailure!(failure); return 'already admitted'; })).resolves.toBe('already admitted');
+      await expect(dispatchCodexHostEffect(peer, async () => ++effects)).rejects.toBe(failure);
+      expect(effects).toBe(1);
     });
   });
 });
