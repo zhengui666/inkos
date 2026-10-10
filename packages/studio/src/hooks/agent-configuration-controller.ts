@@ -60,6 +60,7 @@ export interface AgentConfigurationSnapshot {
   readonly authBusy: "login" | "cancel" | "logout" | "bind" | null;
   readonly authDetail?: TextView;
   readonly authCloseResult?: DeviceLoginAttemptCloseResult;
+  readonly authCloseScope?: "connection" | "attempt";
   readonly canCloseConnection: boolean;
 }
 class RequestTimeout extends Error {}
@@ -78,6 +79,8 @@ function describePreferences(value: HarnessPreferences, isZh: boolean) {
     : `Model ${value.model ?? native}, reasoning ${value.effort ?? native}, speed ${value.speed ?? native}`;
 }
 
+type AttemptGeneration = { readonly source: "verified-reservation" | "matching-login"; readonly value: number | null }
+  | { readonly source: "unobserved-reservation" | "unobserved-start" };
 interface LoginAttempt {
   readonly target: TargetView;
   reservation?: DeviceLoginAttemptReservation;
@@ -86,8 +89,7 @@ interface LoginAttempt {
   detached: boolean;
   closeRequested: boolean;
   closeToken?: { readonly lifetime: number; readonly target: TargetView; readonly ownerGeneration: number | null };
-  // Receipt recovery stays within the generation of the explicit Close.
-  closeGeneration?: number | null;
+  generation: AttemptGeneration;
   closePromise?: Promise<void>;
   closeResult?: DeviceLoginAttemptCloseResult;
   closeUncertain?: boolean;
@@ -110,6 +112,9 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   let target = Object.freeze({ ...(initialTarget ?? { harness: "codex", contextKey: "unobserved" }) });
   let followSavedHarness = initialTarget === undefined;
   let ownerGeneration: number | null = null;
+  // Unlike the cleared UI sentinel, this value came from a validated observation.
+  let observedScope: { target: TargetView; generation: number | null } | undefined;
+  let contextInvalid = false;
   let baseline: AgentSettings | null = null;
   let state: HarnessState | null = null;
   let submitted: SubmittedConfiguration | null = null;
@@ -132,13 +137,17 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   const attempts = knownAttempts.get(transport) ?? new Map<string, LoginAttempt>();
   knownAttempts.set(transport, attempts);
   const knownAttempt = () => authentication?.attempt ?? attempts.get(key(target));
+  function projectsConnection(attempt: LoginAttempt) {
+    return "value" in attempt.generation && observedScope && sameTarget(observedScope.target, attempt.target)
+      && attempt.generation.value === observedScope.generation;
+  }
   function matchesAttempt(attempt: LoginAttempt | undefined) {
-    if (!attempt || !sameTarget(attempt.target, target)) return false;
+    if (contextInvalid || !attempt || !sameTarget(attempt.target, target)) return false;
     if (authentication && authentication.attempt !== attempt) return false;
     if (knownAttempt() !== attempt) return false;
     const observed = state?.connection?.login;
     if (attempt.loginId && observed && observed.loginId !== attempt.loginId) return false;
-    if (attempt.closeGeneration !== undefined && attempt.closeGeneration !== ownerGeneration) return false;
+    if ("value" in attempt.generation && !projectsConnection(attempt)) return false;
     return true;
   }
   function canCloseAttempt(attempt: LoginAttempt | undefined) {
@@ -165,8 +174,10 @@ export function createAgentConfigurationController(transport: AgentConfiguration
       };
     }
     const hasChanges = baseline !== null && (baseline.selectedHarnessId !== target.harness || !samePreferences(currentDraft.preferences, baseline.harnessPreferences[target.harness]));
+    const closeAttempt = closeReceiptOwner?.attempt ?? (closing && current(closing.token) ? closing.attempt : undefined);
     snapshot = Object.freeze({ target, ownerGeneration, baseline, revision: currentDraft.baselineRevision, draft: currentDraft.preferences, retainedDrafts: currentDraft.retained ?? Object.freeze([]), state, submitted, loading, savePhase, detail, hasChanges, reviewable,
-      authBusy: closing && current(closing.token) ? "cancel" : authentication?.action ?? null, authDetail, authCloseResult, canCloseConnection: canCloseAttempt(knownAttempt()),
+      authBusy: closing && current(closing.token) ? "cancel" : authentication?.action ?? null, authDetail, authCloseResult,
+      authCloseScope: closeAttempt ? projectsConnection(closeAttempt) ? "connection" : "attempt" : undefined, canCloseConnection: canCloseAttempt(knownAttempt()),
       canSave: baseline !== null && currentDraft.baselineRevision !== null && !["saving", "conflict", "uncertain"].includes(savePhase) });
     for (const listener of listeners) listener();
   }
@@ -197,7 +208,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   function receiveSettings(value: AgentSettings, reconcile = false) {
     if (baseline && value.revision < baseline.revision) return;
     if (!baseline && followSavedHarness && !draft().dirty && value.selectedHarnessId !== target.harness) {
-      invalidate(); target = Object.freeze({ harness: value.selectedHarnessId, contextKey: "unobserved" }); state = null; ownerGeneration = null;
+      invalidate(); target = Object.freeze({ harness: value.selectedHarnessId, contextKey: "unobserved" }); state = null; ownerGeneration = null; observedScope = undefined; contextInvalid = false;
     }
     const currentDraft = draft();
     baseline = freezeSettings(value);
@@ -229,12 +240,13 @@ export function createAgentConfigurationController(transport: AgentConfiguration
       if (!current(token) || epoch !== stateEpoch) return;
       if (value.harnessId !== target.harness || (value.scope && (!validScope(value.scope) || value.scope.harnessId !== target.harness
         || (target.contextKey !== "unobserved" && value.scope.authContextRef !== target.contextKey)))) {
-        invalidate(); state = null; ownerGeneration = null;
+        invalidate(); state = null; ownerGeneration = null; observedScope = undefined; contextInvalid = true;
         if (savePhase !== "uncertain") detail = { zh: "观察目标或上下文不匹配，旧连接状态已失效。", en: "Observation target or context does not match. Previous connection evidence is invalidated." };
         publish(); return;
       }
       if (value.scope && ownerGeneration !== null && value.scope.ownerGeneration !== null && value.scope.ownerGeneration < ownerGeneration) return;
       if (value.availability === "available" && value.scope) {
+        contextInvalid = false;
         if (target.contextKey === "unobserved") {
           const previous = draft(); const entryKey = key(target);
           target = Object.freeze({ harness: target.harness, contextKey: value.scope.authContextRef });
@@ -248,6 +260,14 @@ export function createAgentConfigurationController(transport: AgentConfiguration
           // Move the entry draft so a later unobserved entry cannot revive stale edits.
           drafts.delete(entryKey); entryEdits = draft().edits;
         }
+        const attempt = knownAttempt();
+        // A returned provider ID plus the exact local attempt can establish its
+        // generation. A numeric GET alone cannot associate an unknown start.
+        if (attempt && sameTarget(attempt.target, target) && attempt.generation.source === "unobserved-start"
+          && attempts.get(key(attempt.target)) === attempt && attempt.loginId && value.connection?.login?.loginId === attempt.loginId) {
+          attempt.generation = { source: "matching-login", value: value.scope.ownerGeneration };
+        }
+        observedScope = { target, generation: value.scope.ownerGeneration };
         if (ownerGeneration !== value.scope.ownerGeneration || !sameTarget(token.target, target)) invalidate();
         ownerGeneration = value.scope.ownerGeneration;
       }
@@ -262,7 +282,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   function selectTarget(next: TargetView) {
     followSavedHarness = false;
     if (disposed || sameTarget(target, next)) return;
-    invalidate(); target = Object.freeze({ ...next }); ownerGeneration = null; state = null;
+    invalidate(); target = Object.freeze({ ...next }); ownerGeneration = null; state = null; observedScope = undefined; contextInvalid = false;
     authDetail = undefined; authCloseResult = undefined;
     submitted = null;
     const currentDraft = draft();
@@ -333,7 +353,11 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   function displayCloseReceipt(attempt: LoginAttempt) {
     closeReceiptOwner = { attempt, token: capture() };
     authCloseResult = attempt.closeUncertain ? undefined : attempt.closeResult;
-    authDetail = attempt.closeUncertain ? closeUncertainDescription : attempt.closeResult ? closeDescription(attempt.closeResult) : undefined;
+    const receipt = attempt.closeUncertain ? closeUncertainDescription : attempt.closeResult ? closeDescription(attempt.closeResult) : undefined;
+    authDetail = projectsConnection(attempt) || !receipt ? receipt : {
+      zh: `原尝试的结算结果；其世代尚未与当前连接关联，当前连接观察独立，本回执不证明当前连接已取消。${receipt.zh}`,
+      en: `${attempt.closeUncertain ? "Close outcome is uncertain for the original attempt. " : "Original attempt settlement only. "}Its generation is not correlated with the current connection; this receipt does not confirm cancellation of the current connection. ${receipt.en}`,
+    };
   }
   function observeClose(attempt: LoginAttempt, token = capture(), fenceRead = false) {
     if (!current(token) || !matchesAttempt(attempt) || attempts.get(key(attempt.target)) !== attempt) return;
@@ -345,9 +369,10 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     if (closing?.attempt === attempt && closing.promise === promise && currentCloseObservation(closing)) return closing.completion;
     const operation: CloseObservation = { attempt, token, promise };
     closing = operation; closeReceiptOwner = null;
-    if (fenceRead) { stateEpoch++; state = null; }
+    if (fenceRead) { stateEpoch++; if (projectsConnection(attempt)) state = null; }
     authCloseResult = undefined;
-    authDetail = { zh: "正在结算本次关闭请求…", en: "Settling Close for this attempt…" }; publish();
+    authDetail = projectsConnection(attempt) ? { zh: "正在结算本次关闭请求…", en: "Settling Close for this attempt…" }
+      : { zh: "正在结算原尝试的关闭请求；当前连接观察独立，尚不能确认当前连接已取消…", en: "Settling Close for the original attempt only. Current connection observation is separate; cancellation of the current connection is not confirmed…" }; publish();
     // Each controller observes with its own lifetime; the shared promise owns
     // only network settlement and remains independent of navigation/disposal.
     operation.completion = promise.then(async () => {
@@ -380,12 +405,14 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     return observeClose(attempt, attempt.closeToken ?? { ...capture(), target: attempt.target }, true) ?? attempt.closePromise;
   }
   async function accountAction(action: "login" | "logout") {
-    if (disposed || authentication || (closing && current(closing.token)) || target.harness !== "codex") return;
+    if (disposed || authentication || (closing && current(closing.token) && projectsConnection(closing.attempt)) || target.harness !== "codex") return;
     if ((action === "login" && (!transport.reserveLogin || !transport.startLogin || !transport.closeLogin)) || (action === "logout" && !transport.logout)) {
       authDetail = { zh: "认证接口不可用，请核对连接状态。", en: "Authentication endpoints are unavailable. Check connection status." }; publish(); return;
     }
+    const generation: AttemptGeneration = observedScope && sameTarget(observedScope.target, target)
+      ? { source: "verified-reservation", value: observedScope.generation } : { source: "unobserved-reservation" };
     invalidate(); state = null; ownerGeneration = null;
-    const attempt: LoginAttempt | undefined = action === "login" ? { target, started: false, detached: false, closeRequested: false } : undefined;
+    const attempt: LoginAttempt | undefined = action === "login" ? { target, started: false, detached: false, closeRequested: false, generation } : undefined;
     // A newer login intent supersedes local receipt correlation even while its
     // reservation is pending; an older reply cannot become this attempt's view.
     if (attempt) attempts.set(key(attempt.target), attempt);
@@ -410,11 +437,11 @@ export function createAgentConfigurationController(transport: AgentConfiguration
         if (attempt.closeRequested) { await settleClose(attempt); return; }
         if (attempt.detached || !current(operation.token) || authentication !== operation) return;
         attempts.set(key(attempt.target), attempt);
-        attempt.started = true;
+        attempt.started = true; attempt.generation = { source: "unobserved-start" }; observedScope = undefined;
         const login = await request(signal => transport.startLogin!(reservation.attemptHandle, signal));
         attempt.loginId = login.loginId;
         if (attempt.closeRequested) { await settleClose(attempt); return; }
-      } else await request(signal => transport.logout!(signal));
+      } else { observedScope = undefined; await request(signal => transport.logout!(signal)); }
       if (!current(operation.token) || authentication !== operation) return;
       authDetail = { zh: "操作已返回，请以当前连接观察为准。执行仍尚未验证。", en: "The operation returned. Check the current connection observation; execution remains unverified." };
       await refreshState();
@@ -429,7 +456,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     if (disposed || authentication || target.harness !== "codex" || !transport.bindConnection || !snapshot.canSave || !baseline
       || baseline.selectedHarnessId !== "codex" || !state?.account || state.scope?.authContextRef !== target.contextKey) return;
     const expectedRevision = draft().baselineRevision!;
-    invalidate(); state = null; ownerGeneration = null;
+    invalidate(); state = null; ownerGeneration = null; observedScope = undefined;
     const operation = { action: "bind" as const, token: capture(), closeRequested: false };
     authentication = operation; authDetail = undefined; publish();
     try {
@@ -470,8 +497,8 @@ export function createAgentConfigurationController(transport: AgentConfiguration
       authDetail = { zh: "当前页面没有本次尝试的已知标识；无法确认关闭，请刷新连接状态。", en: "This page has no known handle for this attempt. Close cannot be confirmed; refresh connection status." }; publish(); return;
     }
     attempt.closeRequested = true; attempt.closeToken = capture();
-    if (attempt.closeGeneration === undefined) attempt.closeGeneration = ownerGeneration;
     if (!attempt.reservation) {
+      closeReceiptOwner = { attempt, token: capture() };
       authDetail = { zh: "关闭请求已记录；收到本次标识后仅关闭，不启动登录。", en: "Close requested. If this attempt's handle returns, it will only be closed; sign-in will not start." }; publish(); return;
     }
     // The handle is retained before starting so a lost start response never

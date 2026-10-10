@@ -10,7 +10,7 @@ const handle = "server-reserved-attempt";
 const login = { loginId: "provider-login-one", status: "pending" as const, verificationUrl: "https://auth.openai.com/codex/device", userCode: "PUBLIC-CODE" };
 const closed = { attemptHandle: handle, state: "closed" as const, cleanup: "cancel-acknowledged" as const };
 type Action = "reserve" | "start" | "close";
-interface Call { action: Action; body: unknown; signal: AbortSignal; keepalive: boolean | undefined; aborted: boolean; reply(value: unknown): void; reject(error: unknown): void }
+interface Call { action: Action; body: unknown; signal: AbortSignal; keepalive: boolean | undefined; aborted: boolean; rejection?: unknown; reply(value: unknown): void; reject(error: unknown): void }
 function observed(phase: NonNullable<HarnessState["connection"]>["phase"] = "signed-out", generation: number | null = null): HarnessState {
   return { ...unavailableHarnessState("codex"), availability: "available", installation: "installed",
     scope: { harnessId: "codex", authContextRef: target.contextKey, ownerGeneration: generation, adapterVersion: "1", catalogVersion: "1" },
@@ -42,7 +42,7 @@ function setup(timeout = 15_000) {
     const pending = new Promise<Response>((yes, no) => { resolve = yes; reject = no; });
     const call: Call = { action, body: JSON.parse(String(init?.body)), signal, keepalive: init?.keepalive, aborted: signal.aborted,
       reply: value => { signal.removeEventListener("abort", abort); resolve(Response.json(value)); },
-      reject: reason => { signal.removeEventListener("abort", abort); reject(reason); } };
+      reject: reason => { call.rejection = reason; signal.removeEventListener("abort", abort); reject(reason); } };
     const abort = () => { call.aborted = true; if (!ignoreAbort.has(action)) call.reject(new DOMException("The request was aborted", "AbortError")); };
     signal.addEventListener("abort", abort, { once: true }); calls.push(call);
     const automatic = action === "reserve" ? reserveResponse : action === "start" ? startResponse : { result: closed };
@@ -181,5 +181,153 @@ describe("shared Close receipt recovery has a current-page observer", () => {
       returned.closeConnection(); await flush(); expect(returned.getSnapshot().authDetail?.en).not.toMatch(/no known handle/i);
     }
     expect(returned.getSnapshot().authCloseResult).toEqual(expected); expect(mutationCounts(value)).toEqual([1, 1, 1]);
+  });
+});
+
+async function beginUnknownStartClose(value: ReturnType<typeof setup>) {
+  value.held.add("start"); value.held.add("close"); value.state(observed("signed-out", 3)); await value.controller.refresh(); value.edit("unknown-start-draft");
+  value.connect(); await flush(); expect(value.action("start")).toHaveLength(1); value.controller.closeConnection(); await flush();
+  expect(mutationCounts(value)).toEqual([1, 1, 1]);
+}
+function expectAttemptScope(current: ReturnType<typeof createAgentConfigurationController>) {
+  expect(current.getSnapshot().authCloseScope).toBe("attempt");
+  expect(current.getSnapshot().authDetail?.en).toMatch(/original.*attempt/i);
+  expect(current.getSnapshot().authDetail?.en).toMatch(/current connection/i);
+  expect(current.getSnapshot().authDetail?.zh).toMatch(/原.*尝试/);
+  expect(current.getSnapshot().authDetail?.zh).toMatch(/当前.*连接/);
+}
+function expectRealStartAbort(value: ReturnType<typeof setup>) {
+  const start = value.action("start")[0]!; expect(start.aborted).toBe(true);
+  expect(start.rejection).toBeInstanceOf(DOMException); expect((start.rejection as DOMException).name).toBe("AbortError");
+}
+
+describe("unknown-start Close receipts describe an attempt independently of the current connection", () => {
+  it.each(["context", "harness"] as const)("an actual %s mismatch invalidates unknown-start recovery and prevents another Close POST", async mismatch => {
+    const value = setup(); await beginUnknownStartClose(value); const actual = observed("signed-in", 4);
+    value.state(mismatch === "context" ? { ...actual, scope: { ...actual.scope!, authContextRef: "different-server-context" } }
+      : { ...actual, harnessId: "pi", scope: { ...actual.scope!, harnessId: "pi" } });
+    await value.controller.refreshState(); await flush(); expectRealStartAbort(value);
+    expect(value.controller.getSnapshot().state).toBeNull(); expect(value.controller.getSnapshot().authCloseResult).toBeUndefined();
+    expect(value.controller.getSnapshot().authCloseScope).toBeUndefined(); value.controller.closeConnection(); await flush();
+    expect(mutationCounts(value)).toEqual([1, 1, 1]);
+    value.action("close")[0]!.reply({ result: { ...closed, cleanup: "unconfirmed" } }); await flush();
+    expect(value.controller.getSnapshot().target).toEqual(target); expect(value.controller.getSnapshot().state).toBeNull();
+    expect(value.controller.getSnapshot().authCloseResult).toBeUndefined(); expect(value.controller.getSnapshot().authCloseScope).toBeUndefined();
+    expect(value.controller.getSnapshot().draft.model).toBe("unknown-start-draft"); expect(value.controller.getSnapshot().revision).toBe(0);
+    value.controller.closeConnection(); value.controller.closeConnection(); await flush(); expect(mutationCounts(value)).toEqual([1, 1, 1]);
+    expect(value.controller.getSnapshot().state).toBeNull(); expect(value.controller.getSnapshot().authCloseResult).toBeUndefined();
+    expect(value.controller.getSnapshot().authCloseScope).toBeUndefined();
+  });
+  it("a newer local login intent replaces the unknown-start correlation before its held reservation returns", async () => {
+    const value = setup(); await beginUnknownStartClose(value);
+    value.state(observed("signed-out", 4)); await value.controller.refreshState(); await flush(); expectRealStartAbort(value);
+    value.held.add("reserve"); value.reservation("new-reserved-attempt"); value.controller.connectionIntent({ action: "connect", target: value.controller.getSnapshot().target }); await flush();
+    value.edit("new-login-draft"); expect(mutationCounts(value)).toEqual([2, 1, 1]); expect(value.controller.getSnapshot().authBusy).toBe("login");
+    const before = value.controller.getSnapshot(); value.action("close")[0]!.reply({ result: closed }); await flush();
+    expect(value.controller.getSnapshot().authCloseResult).toBeUndefined(); expect(value.controller.getSnapshot().authBusy).toBe("login");
+    expect(value.controller.getSnapshot().authDetail).toEqual(before.authDetail); expect(value.controller.getSnapshot().target).toEqual(before.target);
+    expect(value.controller.getSnapshot().ownerGeneration).toBe(before.ownerGeneration); expect(value.controller.getSnapshot().state).toEqual(before.state);
+    expect(value.controller.getSnapshot().draft.model).toBe("new-login-draft"); expect(value.controller.getSnapshot().revision).toBe(0);
+    expect(mutationCounts(value)).toEqual([2, 1, 1]);
+  });
+  it("a generation-three reservation closed before start keeps its not-started receipt when GET still observes three", async () => {
+    const value = setup(); value.held.add("reserve"); value.held.add("close"); value.state(observed("signed-out", 3)); await value.controller.refresh(); value.edit("reserved-draft");
+    value.connect(); await flush(); value.controller.closeConnection();
+    value.action("reserve")[0]!.reply({ reservation: { attemptHandle: handle, expiresAt: Date.now() + 120_000 } }); await flush();
+    const result = { attemptHandle: handle, state: "closed", cleanup: "not-started" };
+    value.action("close")[0]!.reply({ result }); await flush(); await value.controller.refreshState(); await flush();
+    expect(value.controller.getSnapshot().ownerGeneration).toBe(3); expect(value.controller.getSnapshot().authCloseResult).toEqual(result);
+    expect(value.controller.getSnapshot().state).toEqual(observed("signed-out", 3)); expect(value.controller.getSnapshot().draft.model).toBe("reserved-draft");
+    expect(value.controller.getSnapshot().revision).toBe(0); expect(mutationCounts(value)).toEqual([1, 0, 1]);
+  });
+  it.each([
+    ["return", "success"], ["return", "rejection"], ["return", "timeout"],
+    ["remount", "success"], ["remount", "rejection"], ["remount", "timeout"],
+    ["refresh", "success"], ["refresh", "rejection"], ["refresh", "timeout"],
+  ] as const)("%s observes independent owner four while the original unknown-start Close settles with %s", async (boundary, outcome) => {
+    if (outcome === "timeout") vi.useFakeTimers(); const value = setup(outcome === "timeout" ? 25 : 15_000); await beginUnknownStartClose(value);
+    const currentState = observed("signed-in", 4); value.state(currentState); let current = value.controller;
+    if (boundary === "return") { value.controller.selectTarget(piTarget); await returnThroughContextAdoption(value); }
+    else if (boundary === "remount") {
+      value.controller.dispose(); current = createAgentConfigurationController(value.transport, { harness: "codex", contextKey: "unobserved" }); controllers.push(current);
+      await current.refresh(); current.edit({ action: "choose-option", target: current.getSnapshot().target, field: "model", choiceKey: "remounted-unknown-draft" });
+    } else await current.refreshState();
+    await flush(); expectRealStartAbort(value); expect(current.getSnapshot().ownerGeneration).toBe(4); expect(current.getSnapshot().state).toEqual(currentState);
+    const retainedDraft = current.getSnapshot().draft; await current.refreshState(); await flush(); expect(mutationCounts(value)).toEqual([1, 1, 1]);
+    if (outcome === "success") value.action("close")[0]!.reply({ result: closed });
+    else if (outcome === "rejection") value.action("close")[0]!.reject(new TypeError("Close response lost"));
+    else await vi.advanceTimersByTimeAsync(26);
+    await flush(); expectAttemptScope(current); expect(current.getSnapshot().ownerGeneration).toBe(4); expect(current.getSnapshot().state).toEqual(currentState);
+    expect(current.getSnapshot().state?.account).toEqual(currentState.account); expect(current.getSnapshot().draft).toEqual(retainedDraft); expect(current.getSnapshot().revision).toBe(0);
+    if (outcome === "success") expect(current.getSnapshot().authCloseResult).toEqual(closed);
+    else { expect(current.getSnapshot().authCloseResult).toBeUndefined(); expect(current.getSnapshot().authDetail?.en).toMatch(/uncertain/i); }
+    expect(mutationCounts(value)).toEqual([1, 1, 1]); current.closeConnection(); current.closeConnection(); await flush();
+    expect(value.action("reserve")).toHaveLength(1); expect(value.action("start")).toHaveLength(1); expect(value.action("close").length).toBeLessThanOrEqual(2);
+    expect(current.getSnapshot().state).toEqual(currentState); expect(current.getSnapshot().draft).toEqual(retainedDraft);
+    if (outcome === "success") {
+      expect(value.action("close")).toHaveLength(1); expect(current.getSnapshot().authCloseResult).toEqual(closed);
+      expect(current.getSnapshot().authDetail?.en).not.toMatch(/no known handle/i);
+    } else {
+      expect(value.action("close")).toHaveLength(2); expect(value.action("close")[1]!.body).toEqual({ attemptHandle: handle });
+      value.action("close")[1]!.reply({ result: closed }); await flush(); expect(current.getSnapshot().authCloseResult).toEqual(closed); expectAttemptScope(current);
+      expect(current.getSnapshot().ownerGeneration).toBe(4); expect(current.getSnapshot().state).toEqual(currentState); expect(current.getSnapshot().draft).toEqual(retainedDraft);
+    }
+  });
+  it.each([
+    { state: "closed" as const, cleanup: "not-started" as const },
+    { state: "closed" as const, cleanup: "cancel-acknowledged" as const },
+    { state: "closed" as const, cleanup: "unconfirmed" as const },
+    { state: "already-terminal" as const, cleanup: "not-applicable" as const },
+    { state: "unknown-or-expired" as const, cleanup: "not-applicable" as const },
+    { state: "superseded" as const, cleanup: "not-applicable" as const },
+  ])("remount recovers unknown-start cached $state/$cleanup only as the original attempt's receipt", async result => {
+    const value = setup(); await beginUnknownStartClose(value); value.controller.dispose(); await flush(); expectRealStartAbort(value);
+    const expected = { attemptHandle: handle, ...result }; value.action("close")[0]!.reply({ result: expected }); await flush();
+    const currentState = observed("signed-in", 4); value.state(currentState);
+    const returned = createAgentConfigurationController(value.transport, { harness: "codex", contextKey: "unobserved" }); controllers.push(returned); await returned.refresh();
+    returned.edit({ action: "choose-option", target: returned.getSnapshot().target, field: "model", choiceKey: "independent-remount-draft" }); await returned.refreshState(); await flush();
+    expectAttemptScope(returned); expect(returned.getSnapshot().authCloseResult).toEqual(expected); expect(returned.getSnapshot().ownerGeneration).toBe(4);
+    expect(returned.getSnapshot().state).toEqual(currentState); expect(returned.getSnapshot().draft.model).toBe("independent-remount-draft");
+    expect(returned.getSnapshot().revision).toBe(0); expect(mutationCounts(value)).toEqual([1, 1, 1]);
+    if (result.cleanup !== "unconfirmed") {
+      returned.closeConnection(); await flush(); expect(returned.getSnapshot().authCloseResult).toEqual(expected);
+      expect(returned.getSnapshot().authDetail?.en).not.toMatch(/no known handle/i); expect(mutationCounts(value)).toEqual([1, 1, 1]);
+    }
+  });
+  it("only explicit same-handle checks retry unknown-start unconfirmed cleanup, leaving owner four's connection intact", async () => {
+    const value = setup(); await beginUnknownStartClose(value); value.controller.selectTarget(piTarget); await flush(); expectRealStartAbort(value);
+    const result = { attemptHandle: handle, state: "closed", cleanup: "unconfirmed" }; value.action("close")[0]!.reply({ result }); await flush();
+    const currentState = observed("signed-in", 4); value.state(currentState); await returnThroughContextAdoption(value); await flush();
+    expectAttemptScope(value.controller); expect(value.controller.getSnapshot().authCloseResult).toEqual(result);
+    await value.controller.refreshState(); await flush(); expect(mutationCounts(value)).toEqual([1, 1, 1]);
+    value.controller.closeConnection(); value.controller.closeConnection(); await flush(); expect(mutationCounts(value)).toEqual([1, 1, 2]);
+    expect(value.action("close")[1]!.body).toEqual({ attemptHandle: handle }); expect(value.controller.getSnapshot().state).toEqual(currentState);
+    value.action("close")[1]!.reply({ result: closed }); await flush(); expectAttemptScope(value.controller);
+    expect(value.controller.getSnapshot().authCloseResult).toEqual(closed); expect(value.controller.getSnapshot().ownerGeneration).toBe(4);
+    expect(value.controller.getSnapshot().state).toEqual(currentState); expect(value.controller.getSnapshot().draft.model).toBe("unknown-start-draft");
+    expect(value.controller.getSnapshot().revision).toBe(0); expect(mutationCounts(value)).toEqual([1, 1, 2]);
+  });
+  it("a lost start response does not turn the original handle's receipt into evidence about owner four", async () => {
+    const value = setup(); value.held.add("start"); value.held.add("close"); value.state(observed("signed-out", 3)); await value.controller.refresh(); value.edit("lost-start-draft");
+    value.connect(); await flush(); value.action("start")[0]!.reject(new TypeError("provider start response lost")); await flush(); value.controller.closeConnection(); await flush();
+    const currentState = observed("signed-in", 4); value.state(currentState); await value.controller.refreshState();
+    const result = { attemptHandle: handle, state: "already-terminal", cleanup: "not-applicable" }; value.action("close")[0]!.reply({ result }); await flush();
+    expectAttemptScope(value.controller); expect(value.controller.getSnapshot().authCloseResult).toEqual(result); expect(value.controller.getSnapshot().ownerGeneration).toBe(4);
+    expect(value.controller.getSnapshot().state).toEqual(currentState); expect(value.controller.getSnapshot().draft.model).toBe("lost-start-draft");
+    expect(value.controller.getSnapshot().revision).toBe(0); expect(mutationCounts(value)).toEqual([1, 1, 1]);
+  });
+  it.each(["rejection", "timeout"] as const)("returning after the unknown-start Close's %s restores uncertainty without mutating owner four", async failure => {
+    if (failure === "timeout") vi.useFakeTimers(); const value = setup(failure === "timeout" ? 25 : 15_000); await beginUnknownStartClose(value);
+    value.controller.selectTarget(piTarget); await flush(); expectRealStartAbort(value);
+    if (failure === "rejection") value.action("close")[0]!.reject(new TypeError("Close receipt lost while away")); else await vi.advanceTimersByTimeAsync(26);
+    await flush(); const currentState = observed("signed-in", 4); value.state(currentState); await returnThroughContextAdoption(value); await flush();
+    expectAttemptScope(value.controller); expect(value.controller.getSnapshot().authDetail?.en).toMatch(/uncertain/i); expect(value.controller.getSnapshot().authCloseResult).toBeUndefined();
+    expect(value.controller.getSnapshot().ownerGeneration).toBe(4); expect(value.controller.getSnapshot().state).toEqual(currentState);
+    expect(value.controller.getSnapshot().draft.model).toBe("unknown-start-draft"); expect(value.controller.getSnapshot().revision).toBe(0);
+    expect(mutationCounts(value)).toEqual([1, 1, 1]); value.controller.closeConnection(); value.controller.closeConnection(); await flush();
+    expect(mutationCounts(value)).toEqual([1, 1, 2]); expect(value.action("close")[1]!.body).toEqual({ attemptHandle: handle });
+    expect(value.controller.getSnapshot().state).toEqual(currentState); value.action("close")[1]!.reply({ result: closed }); await flush();
+    expectAttemptScope(value.controller); expect(value.controller.getSnapshot().authCloseResult).toEqual(closed);
+    expect(value.controller.getSnapshot().ownerGeneration).toBe(4); expect(value.controller.getSnapshot().state).toEqual(currentState);
   });
 });

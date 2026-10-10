@@ -52,7 +52,7 @@ type Action = "reserve" | "start" | "close";
 interface HttpCall {
   readonly url: string; readonly method: string; readonly body: unknown; readonly signal: AbortSignal;
   readonly keepalive: boolean | undefined; readonly action?: Action;
-  aborted: boolean; reply(value: unknown): void; reject(error: unknown): void;
+  aborted: boolean; rejection?: unknown; reply(value: unknown): void; reject(error: unknown): void;
 }
 function observed(phase: NonNullable<HarnessState["connection"]>["phase"] = "signed-out", generation: number | null = null): HarnessState {
   return { ...unavailableHarnessState("codex"), availability: "available", installation: "installed",
@@ -81,7 +81,7 @@ async function setup() {
     const call: HttpCall = { url, method, signal, action, body: init?.body ? JSON.parse(String(init.body)) : undefined,
       keepalive: init?.keepalive, aborted: signal.aborted,
       reply: value => { signal.removeEventListener("abort", abort); resolve(Response.json(value)); },
-      reject: error => { signal.removeEventListener("abort", abort); reject(error); } };
+      reject: error => { call.rejection = error; signal.removeEventListener("abort", abort); reject(error); } };
     const abort = () => { call.aborted = true; call.reject(new DOMException("The offline fetch was aborted", "AbortError")); };
     signal.addEventListener("abort", abort, { once: true }); calls.push(call);
     const automatic = url.endsWith("/settings") ? { settings: initial }
@@ -185,5 +185,130 @@ describe("offline default React-hook singleton recovery across cleanup/remount (
     fixture.action("close")[1]!.reply({ result: closed }); await flush();
     expect(returned.snapshot().authCloseResult).toEqual(closed); expect(fixture.action("reserve")).toHaveLength(1); expect(fixture.action("start")).toHaveLength(1);
     expect(fixture.mutations()).toHaveLength(4);
+  });
+});
+
+// An origin generation is captured by a real mount's validated GET before the
+// explicit connect intent. A later numeric GET alone cannot correlate a start
+// whose provider response was never observed with the current connection.
+async function beginOriginThreeUnknownStartClose() {
+  const fixture = await setup(); fixture.state(observed("signed-out", 3)); fixture.held.add("start"); fixture.held.add("close");
+  const first = fixture.mount(); await flush();
+  expect(first.snapshot().ownerGeneration).toBe(3); expect(first.snapshot().state?.scope?.ownerGeneration).toBe(3);
+  expect(fixture.mutations()).toHaveLength(0); fixture.connect(first); await flush();
+  expect(fixture.action("reserve")).toHaveLength(1); expect(fixture.action("start")).toHaveLength(1);
+  const start = fixture.action("start")[0]!;
+  expect(start.body).toEqual({ attemptHandle: handle }); expect(start.signal.aborted).toBe(false);
+  first.controller().closeConnection(); await flush(); const closing = fixture.action("close")[0]!;
+  expect(fixture.action("close")).toHaveLength(1); expect(closing.body).toEqual({ attemptHandle: handle });
+  expect(closing.signal).not.toBe(start.signal); expect(closing.keepalive).toBe(true);
+  first.unmount(); await flush();
+  expect(start.signal.aborted).toBe(true); expect(start.aborted).toBe(true);
+  expect(start.rejection).toBeInstanceOf(DOMException); expect((start.rejection as DOMException).name).toBe("AbortError");
+  expect(closing.signal.aborted).toBe(false);
+  return { fixture, closing };
+}
+
+function generationFourCurrentObservation(): HarnessState {
+  // Deliberately preserve a current account and a different observed pending
+  // login. The unknown start's original handle supplies no authority over it.
+  return { ...observed("signing-in", 4), account: { type: "chatgpt", label: "Current generation four account" },
+    connection: { phase: "signing-in", login: { ...login, loginId: "current-generation-four-provider-id" }, connectionRef: null } };
+}
+async function observeGenerationFourWithoutMutation(fixture: Awaited<ReturnType<typeof setup>>) {
+  const current = generationFourCurrentObservation(), mutationCount = fixture.mutations().length;
+  fixture.state(current); const returned = fixture.mount(); await flush(); await returned.controller().refresh(); await flush();
+  expect(returned.snapshot().ownerGeneration).toBe(4); expect(returned.snapshot().state).toEqual(current);
+  expect(returned.snapshot().state?.account?.label).toBe("Current generation four account");
+  expect(returned.snapshot().authCloseScope).toBe("attempt"); expect(returned.snapshot().state?.execution).toBeNull();
+  expect(fixture.mutations()).toHaveLength(mutationCount);
+  const readsBeforePoll = fixture.stateReads().length; await vi.advanceTimersByTimeAsync(2_001); await flush();
+  expect(fixture.stateReads().length).toBeGreaterThan(readsBeforePoll); expect(fixture.mutations()).toHaveLength(mutationCount);
+  expect(returned.snapshot().ownerGeneration).toBe(4); expect(returned.snapshot().state).toEqual(current);
+  expect(returned.snapshot().authCloseScope).toBe("attempt");
+  return { returned, current };
+}
+
+describe("offline default hook preserves numeric origin evidence without correlating unknown starts", () => {
+  it("origin generation 3 survives a reserve-only Close and readback 3 without starting the provider", async () => {
+    const fixture = await setup(); fixture.state(observed("signed-out", 3)); fixture.held.add("reserve"); fixture.held.add("close");
+    const first = fixture.mount(); await flush(); expect(first.snapshot().ownerGeneration).toBe(3); expect(fixture.mutations()).toHaveLength(0);
+    fixture.connect(first); await flush(); expect(fixture.action("reserve")).toHaveLength(1); expect(fixture.action("start")).toHaveLength(0);
+    first.controller().closeConnection(); await flush(); expect(fixture.action("close")).toHaveLength(0);
+    fixture.action("reserve")[0]!.reply({ reservation: { attemptHandle: handle, expiresAt: Date.now() + 120_000 } }); await flush();
+    expect(fixture.action("start")).toHaveLength(0); expect(fixture.action("close")).toHaveLength(1);
+    expect(fixture.action("close")[0]!.body).toEqual({ attemptHandle: handle });
+    const result: DeviceLoginAttemptCloseResult = { attemptHandle: handle, state: "closed", cleanup: "not-started" };
+    fixture.action("close")[0]!.reply({ result }); await flush();
+    expect(first.snapshot().authCloseResult).toEqual(result); expect(first.snapshot().authCloseScope).toBe("connection");
+    expect(first.snapshot().ownerGeneration).toBe(3); expect(first.snapshot().state).toEqual(observed("signed-out", 3));
+    first.unmount(); const returned = fixture.mount(); await flush(); await returned.controller().refresh(); await flush();
+    expect(returned.snapshot().authCloseResult).toEqual(result); expect(returned.snapshot().authCloseScope).toBe("connection");
+    expect(returned.snapshot().ownerGeneration).toBe(3); expect(returned.snapshot().state?.execution).toBeNull();
+    returned.controller().closeConnection(); returned.controller().closeConnection(); await flush();
+    expect(fixture.action("reserve")).toHaveLength(1); expect(fixture.action("start")).toHaveLength(0); expect(fixture.action("close")).toHaveLength(1);
+    expect(fixture.mutations()).toHaveLength(2);
+  });
+
+  it("unknown origin-3 start remounts into GET4 while its original Close is settling without clearing the current observation", async () => {
+    const { fixture, closing } = await beginOriginThreeUnknownStartClose();
+    const current = generationFourCurrentObservation(); fixture.state(current);
+    const returned = fixture.mount(); await flush(); await returned.controller().refresh(); await flush();
+    expect(returned.snapshot().authBusy).toBe("cancel"); expect(returned.snapshot().authDetail?.en).toMatch(/settling.*original attempt/i);
+    expect(returned.snapshot().authCloseScope).toBe("attempt"); expect(returned.snapshot().authCloseResult).toBeUndefined();
+    expect(returned.snapshot().ownerGeneration).toBe(4); expect(returned.snapshot().state).toEqual(current);
+    returned.controller().closeConnection(); returned.controller().closeConnection(); await flush();
+    expect(fixture.action("close")).toHaveLength(1); expect(closing.signal.aborted).toBe(false); expect(fixture.mutations()).toHaveLength(3);
+    const readsBeforeReceipt = fixture.stateReads().length; closing.reply({ result: closed }); await flush();
+    expect(returned.snapshot().authCloseResult).toEqual(closed); expect(returned.snapshot().authCloseScope).toBe("attempt");
+    expect(returned.snapshot().authBusy).toBeNull(); expect(returned.snapshot().ownerGeneration).toBe(4);
+    expect(returned.snapshot().state).toEqual(current); expect(fixture.stateReads().length).toBeGreaterThan(readsBeforeReceipt);
+    expect(fixture.action("reserve")).toHaveLength(1); expect(fixture.action("start")).toHaveLength(1); expect(fixture.action("close")).toHaveLength(1);
+    expect(fixture.mutations()).toHaveLength(3);
+  });
+
+  it.each([
+    { state: "closed" as const, cleanup: "cancel-acknowledged" as const },
+    { state: "already-terminal" as const, cleanup: "not-applicable" as const },
+    { state: "closed" as const, cleanup: "unconfirmed" as const },
+    { state: "unknown-or-expired" as const, cleanup: "not-applicable" as const },
+  ])("unknown origin-3 start restores cached $state/$cleanup as attempt-only beside GET generation 4", async receipt => {
+    const { fixture, closing } = await beginOriginThreeUnknownStartClose();
+    const result: DeviceLoginAttemptCloseResult = { attemptHandle: handle, ...receipt };
+    closing.reply({ result }); await flush();
+    const { returned, current } = await observeGenerationFourWithoutMutation(fixture);
+    expect(returned.snapshot().authCloseResult).toEqual(result); expect(returned.snapshot().authDetail?.en).toMatch(/original attempt|not correlated/i);
+    expect(returned.snapshot().authDetail?.zh).toBeTruthy(); expect(fixture.mutations()).toHaveLength(3);
+    returned.controller().closeConnection(); returned.controller().closeConnection(); await flush();
+    expect(returned.snapshot().ownerGeneration).toBe(4); expect(returned.snapshot().state).toEqual(current);
+    expect(returned.snapshot().authCloseScope).toBe("attempt");
+    if (receipt.cleanup === "unconfirmed") {
+      expect(fixture.action("close")).toHaveLength(2); expect(fixture.action("close")[1]!.body).toEqual({ attemptHandle: handle });
+      fixture.action("close")[1]!.reply({ result: closed }); await flush();
+      expect(returned.snapshot().authCloseResult).toEqual(closed); expect(fixture.mutations()).toHaveLength(4);
+    } else {
+      // Terminal receipt clicks are read-only and do not check a newer login.
+      expect(fixture.action("close")).toHaveLength(1); expect(returned.snapshot().authCloseResult).toEqual(result);
+      expect(returned.snapshot().canCloseConnection).toBe(false); expect(fixture.mutations()).toHaveLength(3);
+    }
+    expect(returned.snapshot().authCloseScope).toBe("attempt"); expect(returned.snapshot().ownerGeneration).toBe(4);
+    expect(returned.snapshot().state).toEqual(current); expect(fixture.action("reserve")).toHaveLength(1); expect(fixture.action("start")).toHaveLength(1);
+  });
+
+  it.each(["reject", "timeout"] as const)("unknown origin-3 start restores away Close %s at GET4 and only explicitly checks the original handle", async failure => {
+    const { fixture, closing } = await beginOriginThreeUnknownStartClose();
+    if (failure === "reject") closing.reject(new TypeError("offline original Close response lost"));
+    else { await vi.advanceTimersByTimeAsync(15_001); expect(closing.signal.aborted).toBe(true); expect((closing.rejection as DOMException).name).toBe("AbortError"); }
+    await flush(); const { returned, current } = await observeGenerationFourWithoutMutation(fixture);
+    expect(returned.snapshot().authCloseResult).toBeUndefined(); expect(returned.snapshot().authDetail?.en).toMatch(/uncertain/i);
+    expect(returned.snapshot().authDetail?.zh).toBeTruthy(); expect(returned.snapshot().authBusy).toBeNull();
+    expect(returned.snapshot().canCloseConnection).toBe(true); expect(fixture.mutations()).toHaveLength(3);
+    returned.controller().closeConnection(); returned.controller().closeConnection(); await flush();
+    expect(fixture.action("close")).toHaveLength(2); expect(fixture.action("close")[1]!.body).toEqual({ attemptHandle: handle });
+    expect(returned.snapshot().authCloseScope).toBe("attempt"); expect(returned.snapshot().state).toEqual(current);
+    fixture.action("close")[1]!.reply({ result: closed }); await flush();
+    expect(returned.snapshot().authCloseResult).toEqual(closed); expect(returned.snapshot().authCloseScope).toBe("attempt");
+    expect(returned.snapshot().ownerGeneration).toBe(4); expect(returned.snapshot().state).toEqual(current);
+    expect(fixture.action("reserve")).toHaveLength(1); expect(fixture.action("start")).toHaveLength(1); expect(fixture.mutations()).toHaveLength(4);
   });
 });
