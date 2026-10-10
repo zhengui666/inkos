@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 
@@ -59,4 +60,26 @@ export function sameChapterReviewInputs(expected: unknown, current: ChapterRevie
     && parsed.data.authorIntent === current.authorIntent && parsed.data.currentFocus === current.currentFocus
     && parsed.data.styleGuide === current.styleGuide && parsed.data.parentCanon === current.parentCanon
     && parsed.data.fanficCanon === current.fanficCanon;
+}
+
+/** Final host authorization only: no event-loop yield before issuing submission.
+ * This does not make filesystem reads atomic with other processes or remote UI. */
+export function readChapterReviewInputsSync(bookDir: string, chapter: number): ChapterReviewInputs {
+  if (!Number.isSafeInteger(chapter) || chapter < 1) throw new Error('Invalid review chapter number.');
+  const read = (path: string): string | null => {
+    try {
+      const bytes = readFileSync(join(bookDir, path));
+      const text = bytes.toString('utf8');
+      if (!Buffer.from(text, 'utf8').equals(bytes)) {
+        throw Object.assign(new Error(`Review input is not lossless UTF-8: ${path}`), { code: 'CHAPTER_REVIEW_INPUTS_UNREADABLE' });
+      }
+      return text;
+    } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
+  };
+  const slug = `story/runtime/chapter-${String(chapter).padStart(4, '0')}`;
+  return { version: 2, plan: read(`${slug}.plan.json`),
+    authorBrief: read(`${slug}.user-brief.md`), bookRules: read('story/book_rules.md'),
+    bookRulesJson: read('story/book_rules.json'), authorIntent: read('story/author_intent.md'),
+    currentFocus: read('story/current_focus.md'), styleGuide: read('story/style_guide.md'),
+    parentCanon: read('story/parent_canon.md'), fanficCanon: read('story/fanfic_canon.md') };
 }

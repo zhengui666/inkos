@@ -288,11 +288,12 @@ export class PublishingStore {
   }
 
   writeMegaNovelRun(input: {expectedVersion: number; eventId: string; run: MegaNovelRun;
-    reconcileExistingManual?: boolean; readOnlyRebind?: boolean}): PublishingPackage {
+    reconcileExistingManual?: boolean; readOnlyRebind?: boolean; submissionNotStarted?: boolean}): PublishingPackage {
     const run = MegaNovelRunSchema.parse(input.run);
     return this.change({...input, packageId: run.packageId, chapterNumber: run.chapterNumber},
       {type: 'meganovel', run, reconcileExistingManual: input.reconcileExistingManual === true,
-        readOnlyRebind: input.readOnlyRebind === true}, (pkg, chapter) => {
+        readOnlyRebind: input.readOnlyRebind === true,
+        ...(input.submissionNotStarted === true ? {submissionNotStarted: true} : {})}, (pkg, chapter) => {
         const selected = pkg.manifest.chapters.find(c => c.number === run.chapterNumber)!;
         const target = pkg.manifest.target;
         if (target.platform !== 'meganovel' || target.accountLabel !== run.scope.accountLabel
@@ -321,7 +322,12 @@ export class PublishingStore {
             || existing.revisionId !== run.revisionId || existing.remoteChapterId && existing.remoteChapterId !== run.remoteChapterId) {
             throw publishingError('MEGANOVEL_RUN_CONFLICT', 'Cannot change the browser target, declaration, revision or remote identity of this attempt.');
           }
-          if (!megaNovelTransitions[existing.phase].includes(run.phase)) throw publishingError('MEGANOVEL_RUN_CONFLICT', 'Cannot reset a possibly submitted chapter to allow another write.');
+          // The adapter supplies this only with invocation-local no-submit proof,
+          // independently observed original draft and the reservation's CAS version.
+          const blockedBeforeSubmit = input.submissionNotStarted === true && !input.readOnlyRebind && !input.reconcileExistingManual
+            && existing.phase === 'submit_unknown' && run.phase === 'draft'
+            && Boolean(existing.remoteChapterId) && existing.remoteChapterId === run.remoteChapterId;
+          if (!megaNovelTransitions[existing.phase].includes(run.phase) && !blockedBeforeSubmit) throw publishingError('MEGANOVEL_RUN_CONFLICT', 'Cannot reset a possibly submitted chapter to allow another write.');
         }
         if (run.remoteChapterId) {
           const otherRuns = this.db.prepare(`SELECT run_json FROM publishing_meganovel_runs

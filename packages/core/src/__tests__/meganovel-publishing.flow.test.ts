@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createInitialWorkManifestWrite, syncWorkSourceArtifacts } from '../harness/source-sync.js';
 import { loadWorkManifest } from '../harness/work-store.js';
 import { commitAtomicFileSet } from '../utils/atomic-file-set.js';
-import { ManualPublishingAdapter, PublishingStore, MegaNovelPublishingAdapter,
+import { ManualPublishingAdapter, PublishingStore, MegaNovelPublishingAdapter, MegaNovelSubmissionBlockedError,
   type MegaNovelBrowserPort, type MegaNovelIntent, type MegaNovelSnapshot } from '../publishing/index.js';
 
 let root: string;
@@ -50,6 +50,171 @@ beforeEach(async () => {
   adapter = new MegaNovelPublishingAdapter(packages, store, browser);
 });
 afterEach(async () => { store.close(); await rm(root, {recursive: true, force: true}); });
+
+function reopenPublishing() {
+  store.close(); store = new PublishingStore(join(root, '.inkos', 'harness.sqlite'));
+  packages = new ManualPublishingAdapter(root, store);
+  adapter = new MegaNovelPublishingAdapter(packages, store, browser);
+}
+
+describe('MegaNovel evidence that submission did not start', () => {
+  it('restores only the same independently reopened draft and propagates the original guard cause across restart', async () => {
+    const draft = await adapter.saveDraft(intent);
+    const original = store.getPackage(intent.packageId);
+    const cause = Object.assign(new Error('Authority changed before Confirm'), {code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
+    let reservedVersion = -1, independentReadbacks = 0;
+    browser.snapshot = vi.fn(async input => {
+      if (store.getMegaNovelRun(intent.packageId, 1)?.phase === 'submit_unknown') {
+        independentReadbacks++;
+        expect(input.remoteChapterId).toBe(draft.remoteChapterId);
+      }
+      return structuredClone(snapshot);
+    });
+    browser.submit = vi.fn(async () => {
+      reservedVersion = store.getPackage(intent.packageId).version;
+      expect(store.getMegaNovelRun(intent.packageId, 1)).toMatchObject({...draft, phase: 'submit_unknown'});
+      throw new MegaNovelSubmissionBlockedError(cause);
+    });
+    await expect(adapter.submit(intent)).rejects.toBe(cause);
+    const restored = store.getMegaNovelRun(intent.packageId, 1)!;
+    expect(restored).toMatchObject({phase: 'draft', packageId: draft.packageId, revisionId: draft.revisionId,
+      remoteChapterId: draft.remoteChapterId, scope: draft.scope, aiAssisted: draft.aiAssisted});
+    expect(independentReadbacks).toBe(1);
+    expect(store.getPackage(intent.packageId).version).toBe(reservedVersion + 1);
+    expect(store.getPackage(intent.packageId).manifest).toEqual(original.manifest);
+    expect(store.getPackage(intent.packageId).remoteVerified).toBe(false);
+    reopenPublishing();
+    expect(await adapter.reconcile(intent)).toMatchObject(restored);
+    expect(await adapter.saveDraft(intent)).toMatchObject(restored);
+    expect(browser.createDraft).toHaveBeenCalledOnce();expect(browser.submit).toHaveBeenCalledOnce();
+    const confirm = vi.fn();
+    browser.submit = vi.fn(async (_input, options) => {
+      await options?.beforeMutation?.();confirm();snapshot.candidates = [{...row(), status: 'reviewing'}];
+    });
+    const beforeMutation = vi.fn(async () => {});
+    expect((await adapter.submit(intent, {beforeMutation})).phase).toBe('reviewing');
+    expect(confirm).toHaveBeenCalledOnce();expect(beforeMutation).toHaveBeenCalled();
+    expect(store.getMegaNovelRun(intent.packageId, 1)).toMatchObject({packageId: draft.packageId,
+      revisionId: draft.revisionId, remoteChapterId: draft.remoteChapterId});
+    expect(store.listPackages()).toHaveLength(1);expect(browser.createDraft).toHaveBeenCalledOnce();
+  });
+
+  it.each(['ordinary-authority-code', 'lookalike-blocked-error', 'effect-started-authority-code', 'timeout'] as const)(
+    'retains unknown across restart for %s even when the exact draft remains visible', async failure => {
+    const draft = await adapter.saveDraft(intent);const effect = vi.fn();
+    const cause = Object.assign(new Error('Authority changed'), {code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
+    browser.submit = vi.fn(async () => {
+      if (failure === 'effect-started-authority-code') effect();
+      if (failure === 'timeout') throw new Error('timeout after the submission request');
+      if (failure === 'lookalike-blocked-error') throw Object.assign(new Error('Untrusted error shape'),
+        {name: 'MegaNovelSubmissionBlockedError', code: 'MEGANOVEL_SUBMISSION_BLOCKED', cause});
+      throw cause;
+    });
+    const retained = await adapter.submit(intent);
+    expect(retained).toMatchObject({...draft, phase: 'submit_unknown'});
+    expect(effect).toHaveBeenCalledTimes(failure === 'effect-started-authority-code' ? 1 : 0);
+    reopenPublishing();
+    for (const entry of ['reconcile', 'saveDraft', 'submit'] as const) {
+      expect(await adapter[entry](intent)).toEqual(retained);
+      expect(await adapter[entry](intent)).toEqual(retained);
+    }
+    expect(browser.submit).toHaveBeenCalledOnce();expect(browser.createDraft).toHaveBeenCalledOnce();
+    snapshot.candidates = [{...row(), status: 'published'}];
+    expect((await adapter.reconcile(intent)).phase).toBe('published');
+    expect(browser.submit).toHaveBeenCalledOnce();
+  });
+
+  it.each(['negative', 'incomplete', 'wrong-id', 'wrong-body', 'readback-failure'] as const)(
+    'keeps the reservation and withholds the guard cause when typed evidence has %s readback', async failure => {
+    const draft = await adapter.saveDraft(intent);
+    const cause = Object.assign(new Error('Authority changed before Confirm'), {code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
+    const readbackError = Object.assign(new Error('Independent readback unavailable'), {code: 'MEGANOVEL_TEST_READBACK_FAILED'});
+    let failReadback = false;
+    browser.snapshot = vi.fn(async () => {
+      if (failReadback) { failReadback = false;throw readbackError; }
+      return structuredClone(snapshot);
+    });
+    browser.submit = vi.fn(async () => {
+      if (failure === 'negative') snapshot.candidates = [];
+      if (failure === 'incomplete') snapshot.complete = false;
+      if (failure === 'wrong-id') snapshot.candidates = [{...row(), remoteChapterId: 'different-remote-id'}];
+      if (failure === 'wrong-body') snapshot.candidates = [{...row(), content: 'Different remote body'}];
+      if (failure === 'readback-failure') failReadback = true;
+      throw new MegaNovelSubmissionBlockedError(cause);
+    });
+    const rejected = await adapter.submit(intent).catch(error => error);
+    expect(rejected).toBeInstanceOf(Error);expect(rejected).not.toBe(cause);
+    expect(rejected.code).not.toBe('CHAPTER_REVIEW_INPUTS_CHANGED');
+    if (failure === 'readback-failure') expect(rejected).toBe(readbackError);
+    if (failure === 'incomplete') expect(rejected.code).toBe('MEGANOVEL_INCOMPLETE_LOOKUP');
+    if (failure === 'wrong-id' || failure === 'wrong-body') expect(rejected.code).toBe('MEGANOVEL_CONTENT_CONFLICT');
+    const retained = store.getMegaNovelRun(intent.packageId, 1)!;
+    expect(retained).toMatchObject({...draft, phase: 'submit_unknown'});
+    snapshot.complete = true;snapshot.candidates = [row()];reopenPublishing();
+    for (const entry of ['reconcile', 'saveDraft', 'submit'] as const) expect(await adapter[entry](intent)).toEqual(retained);
+    expect(browser.submit).toHaveBeenCalledOnce();expect(browser.createDraft).toHaveBeenCalledOnce();
+  });
+
+  it.each(['version-only', 'submitted'] as const)(
+    'cannot restore draft with a stale submission reservation after a concurrent %s write', async changed => {
+    const draft = await adapter.saveDraft(intent);
+    const cause = Object.assign(new Error('Authority changed before Confirm'), {code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
+    let raced = false;
+    browser.snapshot = vi.fn(async () => {
+      const run = store.getMegaNovelRun(intent.packageId, 1);
+      if (run?.phase === 'submit_unknown' && !raced) {
+        raced = true;
+        store.writeMegaNovelRun({run: {...run, phase: changed === 'submitted' ? 'submitted' : 'submit_unknown',
+          evidence: 'Concurrent retained observation'}, expectedVersion: store.getPackage(intent.packageId).version,
+          eventId: 'concurrent-submit-observation'});
+      }
+      return structuredClone(snapshot);
+    });
+    browser.submit = vi.fn(async () => { throw new MegaNovelSubmissionBlockedError(cause); });
+    await expect(adapter.submit(intent)).rejects.toMatchObject({code: 'PUBLISHING_VERSION_CONFLICT'});
+    expect(raced).toBe(true);
+    const retained = store.getMegaNovelRun(intent.packageId, 1)!;
+    expect(retained).toMatchObject({packageId: draft.packageId, revisionId: draft.revisionId,
+      remoteChapterId: draft.remoteChapterId, phase: changed === 'submitted' ? 'submitted' : 'submit_unknown',
+      evidence: 'Concurrent retained observation'});
+    snapshot.candidates = [{...row(), status: changed === 'submitted' ? 'submitted' : 'draft'}];reopenPublishing();
+    expect((await adapter.submit(intent)).phase).toBe(retained.phase);
+    expect(browser.submit).toHaveBeenCalledOnce();expect(browser.createDraft).toHaveBeenCalledOnce();
+  });
+
+  it.each(['no-evidence-flag', 'read-only-rebind', 'manual-reconciliation', 'different-id', 'different-scope',
+    'different-revision', 'different-declaration'] as const)(
+    'does not let the store draft-restoration exception bypass %s', async invalid => {
+    await adapter.saveDraft(intent);
+    browser.submit = vi.fn(async () => { throw new Error('Original submission outcome unknown'); });
+    const retained = await adapter.submit(intent);
+    const version = store.getPackage(intent.packageId).version;
+    const run = {...retained, phase: 'draft' as const};
+    if (invalid === 'different-id') run.remoteChapterId = 'another-remote-id';
+    if (invalid === 'different-scope') run.scope = {...run.scope, sessionId: 'other-tab'};
+    if (invalid === 'different-revision') run.revisionId = 'another-revision';
+    if (invalid === 'different-declaration') run.aiAssisted = false;
+    expect(() => store.writeMegaNovelRun({run, expectedVersion: version, eventId: 'invalid-restore',
+      submissionNotStarted: invalid !== 'no-evidence-flag', readOnlyRebind: invalid === 'read-only-rebind',
+      reconcileExistingManual: invalid === 'manual-reconciliation'})).toThrow();
+    expect(store.getMegaNovelRun(intent.packageId, 1)).toEqual(retained);
+    expect(store.getPackage(intent.packageId).version).toBe(version);
+  });
+
+  it('cannot use the store exception to give an unidentified historical submission a new draft identity', () => {
+    const original = store.getPackage(intent.packageId);
+    const run = {...intent, revisionId: original.manifest.chapters[0]!.revisionId,
+      phase: 'submit_unknown' as const, remoteChapterId: null, evidence: null};
+    store.writeMegaNovelRun({run, expectedVersion: original.version, eventId: 'unidentified-historical-submit'});
+    const version = store.getPackage(intent.packageId).version;
+    expect(() => store.writeMegaNovelRun({run: {...run, phase: 'draft', remoteChapterId: row().remoteChapterId,
+      evidence: row().evidence}, expectedVersion: version, eventId: 'invented-draft-identity',
+      submissionNotStarted: true})).toThrow();
+    expect(store.getMegaNovelRun(intent.packageId, 1)).toEqual(run);
+    expect(store.getPackage(intent.packageId).version).toBe(version);
+    expect(browser.createDraft).not.toHaveBeenCalled();expect(browser.submit).not.toHaveBeenCalled();
+  });
+});
 
 describe('MegaNovel durable browser protocol (synthetic port, not live publication)', () => {
   it.each(['draft', 'submitted', 'reviewing', 'published', 'rejected'] as const)(

@@ -1,9 +1,11 @@
-import { readChapterReviewInputs, sameChapterReviewInputs, sameChapterReviewPolicy, type ChapterReviewInputs, type ChapterReviewPolicy } from "./review-inputs.js";
+import { readChapterReviewInputs, readChapterReviewInputsSync, sameChapterReviewInputs, sameChapterReviewPolicy, type ChapterReviewInputs, type ChapterReviewPolicy } from "./review-inputs.js";
 import { isCreationTransientFailure } from '../creation/transient.js';
 import { readFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { PipelineRunner } from "./runner.js";
 import { StateManager } from "../state/manager.js";
+import { BookConfigSchema } from "../models/book.js";
 import { ChapterGoalService } from "../goals/service.js";
 import { loadWorkManifest } from "../harness/work-store.js";
 import { createBuiltInWorkProfileRegistry } from "../harness/builtin-profiles.js";
@@ -23,7 +25,9 @@ export interface SchedulerPublisher {
   reconcile?(input: { workId: string; chapterNumber: number; signal: AbortSignal }): Promise<NonNullable<ScheduledChapter["publication"]> | { status: "draft" } | { status: "unsupported" } | undefined>;
   /** Reconcile first; invoke beforeMutation immediately before every NEW mutation. */
   publish(input: { workId: string; chapterNumber: number; revisionId: string; signal: AbortSignal;
-    reviewInputs?: ChapterReviewInputs; beforeMutation?: () => Promise<void> }): Promise<NonNullable<ScheduledChapter["publication"]>>;
+    reviewInputs?: ChapterReviewInputs; beforeMutation?: () => Promise<void>;
+    /** Synchronous final host authorization, after all async preparation. */
+    authorizeSubmission?: () => void }): Promise<NonNullable<ScheduledChapter["publication"]>>;
   close?(): Promise<void>;
 }
 
@@ -282,8 +286,21 @@ export class AutonomousChapterRunner {
     }
     job = { ...job, publicationStartedAt: job.publicationStartedAt ?? (this.options.now ?? Date.now)() };
     this.store.save(job, "publication-started", (this.options.now ?? Date.now)());
+    const authorizeSubmission = () => {
+      signal.throwIfAborted();
+      const bookDir = this.state.bookDir(job.workId);
+      const book = BookConfigSchema.parse(JSON.parse(readFileSync(join(bookDir, "book.json"), "utf8")));
+      if (this.options.shouldContinue?.(job.workId) === false || !["active", "outlining"].includes(book.status)) {
+        throw Object.assign(new Error("Publication paused before submission authorization."), { code: "CHAPTER_PUBLICATION_PAUSED" });
+      }
+      if (!sameChapterReviewInputs(job.reviewReceipt?.inputs, readChapterReviewInputsSync(bookDir, job.chapter))
+        || !sameChapterReviewPolicy(job.reviewReceipt?.reviewPolicy, {
+          language: book.language, requireStoryClosure: this.options.requireStoryClosure?.(job.workId, job.chapter) === true })) {
+        throw Object.assign(new Error("Review authority changed before submission authorization."), { code: "CHAPTER_REVIEW_INPUTS_CHANGED" });
+      }
+    };
     const publication = await publisher.publish({ workId: job.workId, chapterNumber: job.chapter,
-      revisionId: job.revisionId!, reviewInputs: job.reviewReceipt!.inputs, beforeMutation, signal });
+      revisionId: job.revisionId!, reviewInputs: job.reviewReceipt!.inputs, beforeMutation, authorizeSubmission, signal });
     return this.recordPublication(job, publication);
   }
 

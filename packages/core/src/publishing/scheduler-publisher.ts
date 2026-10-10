@@ -1,4 +1,4 @@
-import { readChapterReviewInputs, sameChapterReviewInputs } from "../pipeline/review-inputs.js";
+import { readChapterReviewInputs, readChapterReviewInputsSync, sameChapterReviewInputs } from "../pipeline/review-inputs.js";
 import { join, resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
@@ -181,6 +181,13 @@ export function createMegaNovelSchedulerPublisher(root: string, bindings: readon
         }
         input.signal.throwIfAborted();
       };
+      const authorizeSubmission = () => {
+        input.signal.throwIfAborted();
+        if (!sameChapterReviewInputs(input.reviewInputs, readChapterReviewInputsSync(state.bookDir(input.workId), input.chapterNumber))) {
+          throw publishingError('CHAPTER_REVIEW_INPUTS_CHANGED', 'Review authority changed before the final submission request.');
+        }
+        input.authorizeSubmission?.();
+      };
       if (!pkg) {
         if (input.chapterNumber >= binding.firstNewChapter) await beforeMutation();
         pkg = await freeze(binding, input.chapterNumber, input.revisionId);
@@ -193,7 +200,7 @@ export function createMegaNovelSchedulerPublisher(root: string, bindings: readon
         : await remote.saveDraft(request, { signal: input.signal, beforeMutation });
       input.signal.throwIfAborted();
       if (run.phase === 'draft' && input.chapterNumber >= binding.firstNewChapter) {
-        run = await remote.submit(request, { signal: input.signal, beforeMutation });
+        run = await remote.submit(request, { signal: input.signal, beforeMutation, authorizeSubmission });
       }
       return view(run);
     },
