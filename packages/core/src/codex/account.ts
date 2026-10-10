@@ -157,6 +157,8 @@ interface LoginAttempt {
   operation?: CodexAuthOperation;
   originalStamp?: CodexConnectionStamp;
   ownerSettledStamp?: CodexConnectionStamp;
+  /** Separate logout ticket: native ACK and durable disconnected CAS on this exact peer. */
+  logoutTerminalProof?: { readonly peer: CodexClient; readonly stamp: CodexConnectionStamp };
   fenceStamp?: CodexConnectionStamp;
   fenceError?: CodexLoginAttemptError;
   fenceTried?: boolean;
@@ -248,7 +250,7 @@ class AccountService implements CodexAccountService {
     attempt.settlementDone = false;
     if (nativeTerminal) attempt.nativeTerminal = true;
     const failed = () => {
-      if (attempt.closeRequested || this.disposed) return;
+      if (attempt.closeRequested || attempt.logoutTerminalProof || this.disposed) return;
       attempt.phase = 'failed';
       this.login = { loginId: attempt.login!.loginId, status: 'failed', error: error
         ?? 'ChatGPT sign-in did not complete. The code may have expired; start sign-in again.' };
@@ -300,6 +302,7 @@ class AccountService implements CodexAccountService {
       }
     }
     const ended = !attempt.dispatched || attempt.readyCommitted || attempt.cleanupAck || attempt.retired
+      || (!!attempt.logoutTerminalProof && attempt.logoutTerminalProof.peer === attempt.peer)
       || (attempt.nativeTerminal && !!attempt.ownerSettledStamp && (!attempt.closeRequested || attempt.cleanupNotRequired));
     if (!ended) return;
     attempt.settledAt ??= Date.now();
@@ -307,6 +310,7 @@ class AccountService implements CodexAccountService {
   }
   private retireUnsettledTerminal(attempt: LoginAttempt): void {
     if (!attempt.peer || !attempt.nativeTerminal || attempt.readyCommitted || !attempt.settlementDone || !attempt.cleanupDone) return;
+    if (attempt.logoutTerminalProof?.peer === attempt.peer) return;
     if (!attempt.ownerSettledStamp) {
       void this.closePeer(attempt.peer).catch(error => { attempt.cleanupError ??= error; });
     }
@@ -554,8 +558,16 @@ class AccountService implements CodexAccountService {
       try {
         if (pendingId) await client.request('account/login/cancel', { loginId: pendingId });
         await client.request('account/logout', {});
-        owner.complete(operation, 'disconnected');
-        if (attempt) { attempt.nativeTerminal = true; this.releaseAttempt(attempt); }
+        let disconnected: CodexConnectionStamp | undefined;
+        const committed = owner.complete(operation, 'disconnected', stamp => { disconnected = stamp; });
+        if (attempt) {
+          attempt.nativeTerminal = true;
+          if (committed && disconnected && disconnected.localState === 'disconnected' && disconnected.operationId === null
+            && attempt.peer === client && !client.closed && this.clientPromise === attempt.peerPromise) {
+            attempt.logoutTerminalProof = { peer: client, stamp: disconnected };
+          }
+          this.releaseAttempt(attempt);
+        }
       } catch (error) { owner.complete(operation, 'unknown'); throw error; }
       this.login = null; this.earlyCompletions.clear();
     });

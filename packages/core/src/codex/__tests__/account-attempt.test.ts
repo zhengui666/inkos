@@ -84,6 +84,109 @@ async function httpAttempt() {
 }
 
 describe('exact Codex sign-in attempt', () => {
+  it('reuses the healthy peer after durable logout and makes late Close/finish of H1 harmless to H2', async () => {
+    const f = await fixture(), h1 = f.service.reserveDeviceLoginAttempt().attemptHandle;
+    await f.service.startDeviceLogin({ attemptHandle: h1 });
+    const before = f.owner().snapshot()!; await f.service.logout();
+    const disconnected = f.owner().snapshot()!;
+    expect(disconnected).toMatchObject({ localState: 'disconnected', authGeneration: before.authGeneration + 1, operationId: null });
+    expect((await f.service.readAccount()).login).toBeNull();
+    f.notify(true, 'l1'); expect(f.owner().snapshot()).toEqual(disconnected);
+    const h2 = f.service.reserveDeviceLoginAttempt().attemptHandle;
+    expect((await f.service.startDeviceLogin({ attemptHandle: h2 })).loginId).toBe('l2');
+    const current = f.owner().snapshot(), rpcCount = f.request.mock.calls.length;
+    expect(await f.service.closeDeviceLoginAttempt(h1)).toMatchObject({ state: 'superseded', cleanup: 'not-applicable' });
+    f.notify(true, 'l1');
+    expect(f.request).toHaveBeenCalledTimes(rpcCount); expect(f.client.close).not.toHaveBeenCalled();
+    expect(f.owner().snapshot()).toEqual(current); expect((await f.service.readAccount()).login?.loginId).toBe('l2');
+    expect(f.request.mock.calls.filter(([method]) => method === 'account/login/cancel')).toHaveLength(1);
+    expect(f.request.mock.calls.filter(([method]) => method === 'account/logout')).toHaveLength(1);
+    expect(f.factory).toHaveBeenCalledOnce(); await f.service.dispose();
+  });
+
+  it.each(['close-first', 'logout-first'] as const)('preserves exact Close rights around logout: %s', async order => {
+    const f = await fixture(), h1 = f.service.reserveDeviceLoginAttempt().attemptHandle;
+    await f.service.startDeviceLogin({ attemptHandle: h1 });
+    let close: ReturnType<typeof f.service.closeDeviceLoginAttempt>, logout: Promise<void>;
+    if (order === 'close-first') { close = f.service.closeDeviceLoginAttempt(h1); logout = f.service.logout(); }
+    else { logout = f.service.logout(); close = f.service.closeDeviceLoginAttempt(h1); }
+    await logout; const result = await close;
+    expect(result).toMatchObject(order === 'close-first' ? { state: 'closed', cleanup: 'cancel-acknowledged' } : { state: 'superseded', cleanup: 'not-applicable' });
+    expect(f.owner().snapshot()).toMatchObject({ localState: 'disconnected', operationId: null });
+    const h2 = f.service.reserveDeviceLoginAttempt().attemptHandle;
+    await f.service.startDeviceLogin({ attemptHandle: h2 }); const current = f.owner().snapshot(), count = f.request.mock.calls.length;
+    expect(await f.service.closeDeviceLoginAttempt(h1)).toBe(result);
+    expect(f.request).toHaveBeenCalledTimes(count); expect(f.client.close).not.toHaveBeenCalled(); expect(f.owner().snapshot()).toEqual(current);
+    expect(f.request.mock.calls.filter(([method]) => method === 'account/login/cancel')).toHaveLength(1);
+    await f.service.dispose();
+  });
+
+  it('waits for late finishLogin settlement without restoring the logged-out status or retiring its healthy peer', async () => {
+    const f = await fixture(), h1 = f.service.reserveDeviceLoginAttempt().attemptHandle, entered = deferred(), account = deferred<unknown>();
+    await f.service.startDeviceLogin({ attemptHandle: h1 });
+    const native = f.request.getMockImplementation()!; let firstRead = true;
+    f.request.mockImplementation(async (method, params) => {
+      if (method === 'account/read' && firstRead) { firstRead = false; entered.resolve(); return account.promise; }
+      return native(method, params);
+    });
+    f.notify(true, 'l1'); await entered.promise; await f.service.logout(); const disconnected = f.owner().snapshot();
+    const h2 = f.service.reserveDeviceLoginAttempt().attemptHandle;
+    await expect(f.service.startDeviceLogin({ attemptHandle: h2 })).rejects.toMatchObject({ code: 'CODEX_LOGIN_ATTEMPT_BUSY' });
+    account.resolve({ account: { type: 'chatgpt', email: 'fixture@example.test' } });
+    expect((await f.service.readAccount()).login).toBeNull(); expect(f.owner().snapshot()).toEqual(disconnected);
+    await f.service.startDeviceLogin({ attemptHandle: h2 }); const current = f.owner().snapshot(), count = f.request.mock.calls.length;
+    expect(await f.service.closeDeviceLoginAttempt(h1)).toMatchObject({ state: 'superseded', cleanup: 'not-applicable' });
+    expect(f.request).toHaveBeenCalledTimes(count); expect(f.owner().snapshot()).toEqual(current); expect(f.client.close).not.toHaveBeenCalled();
+    await f.service.dispose();
+  });
+
+  it.each(['logout-rpc', 'CAS-lost', 'CAS-error'] as const)('does not grant terminal proof after %s', async mode => {
+    const f = await fixture(), h1 = f.service.reserveDeviceLoginAttempt().attemptHandle;
+    await f.service.startDeviceLogin({ attemptHandle: h1 }); const failure = new Error(mode);
+    if (mode === 'logout-rpc') f.request.mockImplementation(async method => { if (method === 'account/logout') throw failure; return { status: 'canceled' }; });
+    else {
+      const complete = CodexAuthenticationOwner.prototype.complete;
+      vi.spyOn(CodexAuthenticationOwner.prototype, 'complete').mockImplementation(function (this: CodexAuthenticationOwner, ticket, state, written) {
+        if (state === 'disconnected') { if (mode === 'CAS-error') throw failure; return false; }
+        return complete.call(this, ticket, state, written);
+      });
+    }
+    if (mode === 'CAS-lost') await f.service.logout(); else await expect(f.service.logout()).rejects.toBe(failure);
+    expect(f.owner().snapshot()?.localState).not.toBe('disconnected');
+    f.notify(true, 'l1'); const h2 = f.service.reserveDeviceLoginAttempt().attemptHandle;
+    await expect(f.service.startDeviceLogin({ attemptHandle: h2 })).rejects.toMatchObject({ code: 'CODEX_LOGIN_ATTEMPT_BUSY' });
+    expect(f.request.mock.calls.filter(([method]) => method === 'account/login/start')).toHaveLength(1);
+    await f.service.dispose();
+  });
+
+  it.each(['same-pending', 'same-rejected', 'replacement-pending', 'replacement-rejected'] as const)('does not bypass original peer retirement after logout: %s', async mode => {
+    const f = await fixture(), h1 = f.service.reserveDeviceLoginAttempt().attemptHandle, exit = deferred(), failure = new Error('Original close failed');
+    await f.service.startDeviceLogin({ attemptHandle: h1 });
+    vi.mocked(f.client.close).mockImplementation(() => exit.promise);
+    const internals = f.service as unknown as { closePeer(peer: CodexClient): Promise<void> };
+    const retiring = internals.closePeer(f.client); void retiring.catch(() => undefined);
+    const second = f.peer();
+    if (mode.startsWith('replacement')) { f.disconnect(); f.factory.mockResolvedValueOnce(second.client); }
+    await f.service.logout();
+    const h2 = f.service.reserveDeviceLoginAttempt().attemptHandle;
+    await expect(f.service.startDeviceLogin({ attemptHandle: h2 })).rejects.toMatchObject({ code: 'CODEX_LOGIN_ATTEMPT_BUSY' });
+    expect(await f.service.closeDeviceLoginAttempt(h1)).toMatchObject({ state: 'superseded', cleanup: 'not-applicable' });
+    expect(second.client.close).not.toHaveBeenCalled();
+    if (mode.endsWith('rejected')) {
+      exit.reject(failure); await expect(retiring).rejects.toBe(failure);
+      await expect(f.service.startDeviceLogin({ attemptHandle: h2 })).rejects.toMatchObject({ code: 'CODEX_LOGIN_ATTEMPT_BUSY' });
+      await expect(f.service.dispose()).rejects.toBe(failure);
+    } else {
+      if (!mode.startsWith('replacement')) f.factory.mockResolvedValueOnce(second.client);
+      exit.resolve(); await retiring;
+      await f.service.startDeviceLogin({ attemptHandle: h2 }); const current = f.owner().snapshot(), count = second.request.mock.calls.length;
+      await f.service.closeDeviceLoginAttempt(h1);
+      expect(f.owner().snapshot()).toEqual(current); expect(second.request).toHaveBeenCalledTimes(count); expect(second.client.close).not.toHaveBeenCalled();
+      await f.service.dispose();
+    }
+    expect(f.client.close).toHaveBeenCalledOnce();
+  });
+
   it('reserves only bounded metadata and ignores foreign handles without peer/RPC/owner', async () => {
     const f = await fixture();
     const reservation = f.service.reserveDeviceLoginAttempt();
