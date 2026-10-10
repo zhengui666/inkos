@@ -7,7 +7,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { readCodexSettings, updateCodexSettings } from '../../codex/settings.js';
 import { AgentSettingsSchema } from '../contracts.js';
 import { AGENT_CONFIG_FILE, DEFAULT_AGENT_SETTINGS, parseAgentSettings, readAgentSettings, updateAgentSettings } from '../settings.js';
-import { catalog } from './fixtures.js';
+import { resolveRuntimeSelection } from '../selection.js';
+import { admission, authContext, catalog, descriptor } from './fixtures.js';
 
 const roots: string[] = [], children: ChildProcess[] = [];
 async function root() {
@@ -93,7 +94,7 @@ describe('neutral local agent settings', () => {
     expect(initial.harnessPreferences.codex).toEqual({ model: null, effort: 'low', speed: 'default' });
     expect(await readdir(join(directory, '.inkos'))).toEqual(['codex-config.json']);
     expect(await readCodexSettings(directory)).toEqual({ reasoningEffort: 'low', serviceTier: 'default' });
-    const saved = await updateAgentSettings(directory, { selectedHarnessId: 'pi', modelConnectionRef: 'opaque-connection' }, { expectedRevision: 0 });
+    const saved = await updateAgentSettings(directory, { selectedHarnessId: 'pi' }, { expectedRevision: 0 });
     expect(saved.revision).toBe(1); expect(saved.harnessPreferences.codex.model).toBeNull();
     expect(await readFile(legacyPath, 'utf8')).toBe(legacy);
     expect(JSON.parse(await readFile(join(directory, '.inkos', AGENT_CONFIG_FILE), 'utf8'))).toEqual(saved);
@@ -128,9 +129,11 @@ describe('neutral local agent settings', () => {
 
   it('saves an unready Pi with native defaults without requiring capabilities or changing Codex preferences', async () => {
     const directory = await root();
-    const saved = await updateAgentSettings(directory, { selectedHarnessId: 'pi', modelConnectionRef: 'opaque-pi' }, { expectedRevision: 0 });
+    const saved = await updateAgentSettings(directory, { selectedHarnessId: 'pi', modelConnectionRef: null }, { expectedRevision: 0 });
     expect(saved.selectedHarnessId).toBe('pi'); expect(saved.harnessPreferences.pi).toEqual({ model: null, effort: null, speed: null });
+    expect(saved.modelConnectionRef).toBeNull();
     expect(saved.harnessPreferences.codex).toEqual(DEFAULT_AGENT_SETTINGS.harnessPreferences.codex);
+    expect(() => resolveRuntimeSelection({ settings: saved, harness: descriptor('pi'), authContext: authContext('pi'), connection: admission('pi') })).toThrow('matching admission');
   });
 
   it('validates concrete overrides against the matching model-specific capability directory', async () => {
@@ -158,11 +161,12 @@ describe('neutral local agent settings', () => {
   it('keeps the legacy bridge confined to Codex and stores model:null only in the new file', async () => {
     const directory = await root(); await mkdir(join(directory, '.inkos'));
     const legacyPath = join(directory, '.inkos', 'codex-config.json'), legacy = '{"model":null}\n'; await writeFile(legacyPath, legacy);
-    await updateAgentSettings(directory, { selectedHarnessId: 'pi', modelConnectionRef: 'opaque-pi' }, { expectedRevision: 0 });
+    await updateAgentSettings(directory, { selectedHarnessId: 'pi' }, { expectedRevision: 0 });
+    await updateAgentSettings(directory, { modelConnectionRef: 'opaque-pi' }, { expectedRevision: 1 });
     await Promise.all([updateCodexSettings(directory, { reasoningEffort: 'high' }), updateCodexSettings(directory, { serviceTier: 'default' })]);
     expect(await readCodexSettings(directory)).toEqual({ reasoningEffort: 'high', serviceTier: 'default' });
     const saved = await readAgentSettings(directory);
-    expect(saved).toMatchObject({ revision: 3, selectedHarnessId: 'pi', modelConnectionRef: 'opaque-pi' });
+    expect(saved).toMatchObject({ revision: 4, selectedHarnessId: 'pi', modelConnectionRef: 'opaque-pi' });
     expect(saved.harnessPreferences.pi).toEqual({ model: null, effort: null, speed: null });
     expect(saved.harnessPreferences.codex.model).toBeNull(); expect(await readFile(legacyPath, 'utf8')).toBe(legacy);
     const disk = await readFile(join(directory, '.inkos', AGENT_CONFIG_FILE), 'utf8'); expect(disk).not.toMatch(/apiKey|accessToken|refreshToken|synthetic-secret/);
@@ -190,15 +194,17 @@ describe('neutral local agent settings', () => {
   });
 
   it('rejects stale CAS revisions without losing or partially saving either section', async () => {
-    const directory = await root(); const saved = await updateAgentSettings(directory, { selectedHarnessId: 'pi', modelConnectionRef: 'winner' }, { expectedRevision: 0 });
+    const directory = await root();
+    await updateAgentSettings(directory, { selectedHarnessId: 'pi' }, { expectedRevision: 0 });
+    const saved = await updateAgentSettings(directory, { modelConnectionRef: 'winner' }, { expectedRevision: 1 });
     const path = join(directory, '.inkos', AGENT_CONFIG_FILE), bytes = await readFile(path, 'utf8');
-    await expect(updateAgentSettings(directory, { modelConnectionRef: 'loser', harnessPreferences: { pi: { effort: 'low' } } }, { expectedRevision: 0, catalogs: { pi: catalog('pi') } })).rejects.toMatchObject({ code: 'AGENT_SETTINGS_REVISION_CONFLICT', expectedRevision: 0, actualRevision: 1 });
+    await expect(updateAgentSettings(directory, { modelConnectionRef: 'loser', harnessPreferences: { pi: { effort: 'low' } } }, { expectedRevision: 0, catalogs: { pi: catalog('pi') } })).rejects.toMatchObject({ code: 'AGENT_SETTINGS_REVISION_CONFLICT', expectedRevision: 0, actualRevision: 2 });
     expect(await readAgentSettings(directory)).toEqual(saved); expect(await readFile(path, 'utf8')).toBe(bytes);
   });
 
   it('serializes same-process CAS writers so exactly one wins the same revision', async () => {
     const directory = await root();
-    const results = await Promise.allSettled(['first', 'second'].map(modelConnectionRef => updateAgentSettings(directory, { selectedHarnessId: 'pi', modelConnectionRef }, { expectedRevision: 0 })));
+    const results = await Promise.allSettled(['first', 'second'].map(modelConnectionRef => updateAgentSettings(directory, { modelConnectionRef }, { expectedRevision: 0 })));
     expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
     expect(results.filter(result => result.status === 'rejected')).toHaveLength(1);
     expect((await readAgentSettings(directory)).revision).toBe(1);
@@ -206,8 +212,8 @@ describe('neutral local agent settings', () => {
 
   it('arbitrates the same expected revision across independent OS processes', async () => {
     const directory = await root();
-    const first = worker(directory, { selectedHarnessId: 'pi', modelConnectionRef: 'first' }, 0);
-    const second = worker(directory, { selectedHarnessId: 'pi', modelConnectionRef: 'second' }, 0);
+    const first = worker(directory, { modelConnectionRef: 'first' }, 0);
+    const second = worker(directory, { modelConnectionRef: 'second' }, 0);
     await Promise.all([first.ready, second.ready]); first.start(); second.start();
     const results = await Promise.all([first.done, second.done]);
     expect(results.filter(result => result.status === 'saved')).toHaveLength(1);
@@ -219,30 +225,54 @@ describe('neutral local agent settings', () => {
     const directory = await root();
     const prior = await updateAgentSettings(directory, { modelConnectionRef: 'codex' }, { expectedRevision: 0 });
     const path = join(directory, '.inkos', AGENT_CONFIG_FILE), bytes = await readFile(path, 'utf8');
-    const writer = worker(directory, { selectedHarnessId: 'pi', modelConnectionRef: 'pi' }, 1, false, true);
+    const writer = worker(directory, { selectedHarnessId: 'pi', modelConnectionRef: null }, 1, false, true);
     await writer.ready; writer.start(); await writer.staged;
     expect(await readFile(path, 'utf8')).toBe(bytes); await stop(writer.child);
     expect(await readAgentSettings(directory)).toEqual(prior);
-    const recovered = await updateAgentSettings(directory, { selectedHarnessId: 'pi', modelConnectionRef: 'pi' }, { expectedRevision: 1 });
-    expect(recovered.revision).toBe(2); expect(recovered.modelConnectionRef).toBe(recovered.selectedHarnessId);
+    const recovered = await updateAgentSettings(directory, { selectedHarnessId: 'pi', modelConnectionRef: null }, { expectedRevision: 1 });
+    expect(recovered.revision).toBe(2); expect(recovered.selectedHarnessId).toBe('pi'); expect(recovered.modelConnectionRef).toBeNull();
   });
 
   it('keeps both configuration sections atomic while competing processes perform CAS retries', async () => {
     const directory = await root();
-    await updateAgentSettings(directory, { modelConnectionRef: 'codex' }, { expectedRevision: 0 });
-    const first = worker(directory, { selectedHarnessId: 'pi', modelConnectionRef: 'pi' }, 1, true);
-    const second = worker(directory, { selectedHarnessId: 'codex', modelConnectionRef: 'codex' }, 1, true);
+    await updateAgentSettings(directory, { modelConnectionRef: 'priority' }, { expectedRevision: 0 });
+    const first = worker(directory, { modelConnectionRef: 'default', harnessPreferences: { codex: { speed: 'default' } } }, 1, true);
+    const second = worker(directory, { modelConnectionRef: 'priority', harnessPreferences: { codex: { speed: 'priority' } } }, 1, true);
     await Promise.all([first.ready, second.ready]); first.start(); second.start();
     let finished = false; const resultsPromise = Promise.all([first.done, second.done]).then(results => { finished = true; return results; });
     let observations = 0;
     do {
       const snapshot = parseAgentSettings(JSON.parse(await readFile(join(directory, '.inkos', AGENT_CONFIG_FILE), 'utf8')));
-      expect(snapshot.modelConnectionRef).toBe(snapshot.selectedHarnessId); observations++;
+      expect(snapshot.modelConnectionRef).toBe(snapshot.harnessPreferences.codex.speed); observations++;
     } while (!finished);
     expect(observations).toBeGreaterThan(0);
     expect(await resultsPromise).toEqual(expect.arrayContaining([expect.objectContaining({ status: 'saved', writes: 25 })]));
     expect((await resultsPromise).every(result => result.status === 'saved')).toBe(true);
     expect((await readAgentSettings(directory)).revision).toBe(51);
     expect((await readdir(join(directory, '.inkos'))).filter(name => name.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('clears the previous harness connection on each switch while preserving both preferences', async () => {
+    const directory = await root();
+    const connected = await updateAgentSettings(directory, { modelConnectionRef: admission().connection.connectionRef }, { expectedRevision: 0 });
+    const selected = resolveRuntimeSelection({ settings: connected, harness: descriptor('codex'), authContext: authContext(), connection: admission() });
+    const pi = await updateAgentSettings(directory, { selectedHarnessId: 'pi' }, { expectedRevision: 1 });
+    expect(pi.modelConnectionRef).toBeNull(); expect(pi.harnessPreferences).toEqual(connected.harnessPreferences);
+    expect(() => resolveRuntimeSelection({ settings: pi, harness: descriptor('pi'), authContext: authContext('pi'), connection: admission() })).toThrow('different harness');
+    expect(() => resolveRuntimeSelection({ settings: pi, harness: descriptor('pi'), authContext: authContext('pi'), connection: admission('pi') })).toThrow('matching admission');
+    expect(selected).toMatchObject({ harnessId: 'codex', configRevision: 1 });
+    const boundPi = await updateAgentSettings(directory, { modelConnectionRef: admission('pi').connection.connectionRef }, { expectedRevision: 2 });
+    expect(resolveRuntimeSelection({ settings: boundPi, harness: descriptor('pi'), authContext: authContext('pi'), connection: admission('pi') }).harnessId).toBe('pi');
+    const codex = await updateAgentSettings(directory, { selectedHarnessId: 'codex', modelConnectionRef: null }, { expectedRevision: 3, catalogs: { codex: catalog('codex') } });
+    expect(codex.modelConnectionRef).toBeNull(); expect(codex.harnessPreferences).toEqual(connected.harnessPreferences);
+    expect(() => resolveRuntimeSelection({ settings: codex, harness: descriptor('codex'), authContext: authContext(), connection: admission() })).toThrow('matching admission');
+  });
+
+  it.each(['codex-only-reference', 'claimed-pi-reference'])('rejects a connection rebind in the same harness-switch patch atomically (%s)', async modelConnectionRef => {
+    const directory = await root();
+    const saved = await updateAgentSettings(directory, { modelConnectionRef: 'codex-only-reference' }, { expectedRevision: 0 });
+    const path = join(directory, '.inkos', AGENT_CONFIG_FILE), bytes = await readFile(path);
+    await expect(updateAgentSettings(directory, { selectedHarnessId: 'pi', modelConnectionRef, harnessPreferences: { pi: { model: 'pi-native-model', effort: 'low', speed: 'default' } } }, { expectedRevision: 1, catalogs: { pi: catalog('pi') } })).rejects.toMatchObject({ code: 'AGENT_SETTINGS_CONNECTION_REBIND_REQUIRED' });
+    expect(await readFile(path)).toEqual(bytes); expect(await readAgentSettings(directory)).toEqual(saved);
   });
 });

@@ -137,15 +137,25 @@ function commitSettings(projectRoot: string, expectedRevision: number | undefine
   });
 }
 
-/** CAS save. Explicit overrides must be checked against that harness's observed catalog. */
+/** CAS save. Explicit overrides must be checked against that harness's observed catalog.
+ * A harness change clears the connection. Bind the target owner's reference in a later
+ * save; a config patch cannot prove authentication ownership across harnesses.
+ */
 export async function updateAgentSettings(projectRoot: string, value: unknown, options: UpdateAgentSettingsOptions): Promise<AgentSettings> {
   const patch = AgentSettingsPatchSchema.parse(value);
   const expectedRevision = RuntimeRevisionSchema.parse(options.expectedRevision);
   return commitSettings(projectRoot, expectedRevision, current => {
+    const selectedHarnessId = patch.selectedHarnessId ?? current.selectedHarnessId;
+    const harnessChanged = selectedHarnessId !== current.selectedHarnessId;
+    if (harnessChanged && patch.modelConnectionRef !== undefined && patch.modelConnectionRef !== null) {
+      throw Object.assign(new Error('Changing harness must clear modelConnectionRef; bind a connection after selecting the target harness'), {
+        code: 'AGENT_SETTINGS_CONNECTION_REBIND_REQUIRED',
+      });
+    }
     const next: AgentSettings = {
       ...current,
-      selectedHarnessId: patch.selectedHarnessId ?? current.selectedHarnessId,
-      modelConnectionRef: patch.modelConnectionRef === undefined ? current.modelConnectionRef : patch.modelConnectionRef,
+      selectedHarnessId,
+      modelConnectionRef: harnessChanged ? null : (patch.modelConnectionRef === undefined ? current.modelConnectionRef : patch.modelConnectionRef),
       harnessPreferences: {
         codex: mergePreferences(current.harnessPreferences.codex, patch.harnessPreferences?.codex),
         pi: mergePreferences(current.harnessPreferences.pi, patch.harnessPreferences?.pi),

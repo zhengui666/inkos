@@ -99,8 +99,13 @@ export const HarnessDescriptorSchema = z.object({
 });
 export type HarnessDescriptor = z.infer<typeof HarnessDescriptorSchema>;
 
-/** Authentication generation is independent of configuration revision. */
+/** The authentication owner supplies the actual harness/context binding.
+ * These references contain no credentials and cannot establish login by themselves.
+ * Authentication generation is independent of configuration revision.
+ */
 export const ModelConnectionAdmissionSchema = z.object({
+  harnessId: HarnessIdSchema,
+  authContextRef: ConnectionRefSchema,
   connection: ModelConnectionSchema,
   authGeneration: RuntimeRevisionSchema,
   ready: z.boolean(),
@@ -111,6 +116,7 @@ export type ModelConnectionAdmission = z.infer<typeof ModelConnectionAdmissionSc
 export interface RuntimeSelection {
   readonly harnessId: HarnessId;
   readonly adapterVersion: string;
+  readonly authContextRef: string;
   readonly connectionRef: string;
   readonly authGeneration: number;
   readonly modelId: string;

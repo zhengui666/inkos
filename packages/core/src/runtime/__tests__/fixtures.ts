@@ -17,6 +17,11 @@ export function descriptor(harnessId: 'codex' | 'pi'): HarnessDescriptor {
   };
 }
 
-export function admission(): ModelConnectionAdmission {
-  return { connection: { provider: 'chatgpt', authMethod: 'oauth', connectionRef: 'opaque-test-connection' }, authGeneration: 7, ready: true, readyReasons: [] };
+/** Synthetic owner bindings for unit tests only; no production login or Pi adapter. */
+export function authContext(harnessId: 'codex' | 'pi' = 'codex'): Pick<ModelConnectionAdmission, 'harnessId' | 'authContextRef'> {
+  return { harnessId, authContextRef: `fixture-${harnessId}-auth-context` };
+}
+
+export function admission(harnessId: 'codex' | 'pi' = 'codex'): ModelConnectionAdmission {
+  return { ...authContext(harnessId), connection: { provider: 'chatgpt', authMethod: 'oauth', connectionRef: 'opaque-test-connection' }, authGeneration: 7, ready: true, readyReasons: [] };
 }
