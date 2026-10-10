@@ -10,6 +10,8 @@ import { resolveRuntimeSelection } from './selection.js';
 import { CodexAuthenticationOwner, RuntimeAuthenticationError, type CodexOwnerObservation } from './auth/codex-owner.js';
 import { CodexRuntimeAdapter, type CodexNativeDefaultsEvidence } from './adapters/codex/adapter.js';
 import { currentCodexRun, runWithCodexContext, type CodexRunContext } from './run-context.js';
+import { appendRunDispatch, appendRunObservation, type RunHistoryBinding } from './run-history.js';
+import type { AgentModelCallTrace } from '../llm/agent-trajectory.js';
 
 export interface CodexExecutionOptions {
   signal?: AbortSignal;
@@ -115,15 +117,19 @@ export async function withCodexExecution<T>(projectRoot: string, task: () => Pro
       try { assertProjectContext(); }
       catch (error) { owner.disconnect(); throw error; }
     };
+    let historyFailure: Error | undefined;
     const context: CodexRunContext = {
       projectRoot: resolve(projectRoot), saved, selection, owner,
+      onHistoryFailure(failure) { historyFailure ??= failure; },
       async takeClient() {
+        if (historyFailure) throw historyFailure;
         if (!leased) { leased = true; peers.add(client); client.onClose(() => peers.delete(client)); return client; }
         const peer = await createCodexClient(projectRoot);
         try { await owner.guard(selection, peer, options.signal); peers.add(peer); peer.onClose(() => peers.delete(peer)); return peer; }
         catch (error) { await peer.close(); throw error; }
       },
       async guard(peer, signal) {
+        if (historyFailure) throw historyFailure;
         assertTrustedContext();
         if (peer) { await owner.guard(selection, peer, signal, assertTrustedContext); return; }
         const active = [...peers].find(peer => !peer.closed);
@@ -165,16 +171,45 @@ export interface CodexThreadEffective {
   readonly serviceTier?: string | null;
 }
 
+export interface CodexCallHistory {
+  readonly binding: RunHistoryBinding;
+  readonly trace: AgentModelCallTrace;
+}
+function historyIdentity(history: CodexCallHistory) {
+  if (history.trace.runId !== history.binding.coreRequestId) throw new Error('Model call belongs to another core request');
+  return { schemaVersion: 1 as const, sessionId: history.binding.sessionId, coreRequestId: history.binding.coreRequestId,
+    modelCallId: history.trace.modelCallId };
+}
+function historyCall(history: CodexCallHistory) {
+  return { ...historyIdentity(history), agentRole: history.trace.agentRole,
+    ...(history.trace.parentToolCallId ? { parentToolCallId: history.trace.parentToolCallId } : {}) };
+}
+/** A failed durable receipt is a host failure, never permission to replay an acknowledged RPC. */
+export class RuntimeHistoryWriteError extends Error {
+  readonly code = 'RUNTIME_HISTORY_WRITE_FAILED';
+  constructor(cause: unknown) { super('Could not persist runtime history; the RPC outcome must not be retried', { cause }); }
+}
+function persistHistory(write: () => unknown): void {
+  try { write(); } catch (error) {
+    const failure = new RuntimeHistoryWriteError(error);
+    currentCodexRun()?.onHistoryFailure?.(failure);
+    throw failure;
+  }
+}
+
 /** Guarded RPC boundary. General thread options cannot smuggle in routing overrides. */
-export async function startCodexRuntimeThread(client: CodexClient, parameters: Record<string, unknown>, signal?: AbortSignal): Promise<{
+export async function startCodexRuntimeThread(client: CodexClient, parameters: Record<string, unknown>, signal?: AbortSignal, history?: CodexCallHistory): Promise<{
   threadId: string; effective: Readonly<CodexThreadEffective>;
 }> {
   const runtime = admittedRun(), selection = runtime.selection;
   unrouted(parameters);
   await runtime.guard(client, signal);
-  const response = object(await client.request('thread/start', { ...parameters, model: selection.modelId,
+  const wire = { model: selection.modelId,
     ...(selection.serviceTier !== null ? { serviceTier: selection.serviceTier === 'default' ? null : selection.serviceTier } : {}),
-  }, { signal }));
+  };
+  if (history) persistHistory(() => appendRunDispatch(history.binding, { ...historyCall(history), kind: 'dispatch',
+    operation: 'codex-thread-start', wire }));
+  const response = object(await client.request('thread/start', { ...parameters, ...wire }, { signal }));
   const threadId = object(response.thread).id;
   if (typeof threadId !== 'string' || !threadId) throw new Error('Codex did not acknowledge a thread identifier');
   const effective: CodexThreadEffective = Object.freeze({ scope: 'thread',
@@ -182,8 +217,13 @@ export async function startCodexRuntimeThread(client: CodexClient, parameters: R
     ...(typeof response.reasoningEffort === 'string' || response.reasoningEffort === null ? { effort: response.reasoningEffort } : {}),
     ...(typeof response.serviceTier === 'string' || response.serviceTier === null ? { serviceTier: response.serviceTier } : {}),
   });
+  if (history) persistHistory(() => {
+    const { scope: _scope, ...observed } = effective;
+    appendRunObservation(history.binding, { ...historyIdentity(history), kind: 'observation',
+      source: 'codex-thread-start-ack', scope: 'thread', threadId, effective: observed });
+  });
   if (effective.modelId !== undefined && effective.modelId !== selection.modelId) throw new Error('Codex acknowledged an incompatible model');
-  if (selection.serviceTier !== null && selection.serviceTier !== 'default' && effective.serviceTier !== undefined
+  if (selection.serviceTier !== null && selection.serviceTier !== 'default' && typeof effective.serviceTier === 'string'
     && effective.serviceTier !== selection.serviceTier) throw new Error('Codex acknowledged an incompatible service tier');
   let peers = admittedThreads.get(runtime);
   if (!peers) { peers = new WeakMap(); admittedThreads.set(runtime, peers); }
@@ -193,7 +233,7 @@ export async function startCodexRuntimeThread(client: CodexClient, parameters: R
 }
 
 /** turn/start ACK contains only the turn; later overrides remain requested. */
-export async function startCodexRuntimeTurn(client: CodexClient, parameters: Record<string, unknown>, signal?: AbortSignal): Promise<{
+export async function startCodexRuntimeTurn(client: CodexClient, parameters: Record<string, unknown>, signal?: AbortSignal, history?: CodexCallHistory): Promise<{
   turnId: string;
   requested: Readonly<{ scope: 'turn'; modelId: string; effort: string | null; serviceTier: string | null }>;
 }> {
@@ -203,12 +243,18 @@ export async function startCodexRuntimeTurn(client: CodexClient, parameters: Rec
     throw new RuntimeAuthenticationError('The thread was not admitted by this run and peer');
   }
   await runtime.guard(client, signal);
-  const response = object(await client.request('turn/start', { ...parameters, model: selection.modelId,
+  const wire = { model: selection.modelId,
     ...(selection.effort !== null ? { effort: selection.effort } : {}),
     ...(selection.serviceTier !== null ? { serviceTierForTurn: selection.serviceTier } : {}),
-  }, { signal }));
+  };
+  if (history) persistHistory(() => appendRunDispatch(history.binding, { ...historyCall(history), kind: 'dispatch',
+    operation: 'codex-turn-start', threadId: parameters.threadId as string, wire }));
+  const response = object(await client.request('turn/start', { ...parameters, ...wire }, { signal }));
   const turnId = object(response.turn).id;
   if (typeof turnId !== 'string' || !turnId) throw new Error('Codex did not acknowledge a turn identifier');
+  // 0.159.2 TurnStartResponse acknowledges identity only, with no effective routing fields.
+  if (history) persistHistory(() => appendRunObservation(history.binding, { ...historyIdentity(history), kind: 'observation',
+    source: 'codex-turn-start-ack', scope: 'turn', threadId: parameters.threadId as string, turnId, effective: {} }));
   return { turnId, requested: Object.freeze({ scope: 'turn', modelId: selection.modelId,
     effort: selection.effort, serviceTier: selection.serviceTier }) };
 }

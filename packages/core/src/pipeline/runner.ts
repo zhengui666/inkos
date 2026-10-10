@@ -3,6 +3,7 @@ import { captureDraftSources, sameDraftPlanningSources, assertPreparedDraftInput
 import { prepareStateReplay, commitStateReplay } from "../state/state-replay.js";
 import { withWorkMutationScope } from "../utils/work-mutation-scope.js";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { withCodexExecution } from "../runtime/execution.js";
 import {readPinnedParentCanon} from "../harness/parent-canon.js";
 import {renderChapterDocument,chapterDocumentBody} from '../utils/chapter-document.js';
 import {changedSourceRegion} from '../utils/source-text.js';
@@ -244,7 +245,7 @@ export class PipelineRunner {
     merged.signal?.throwIfAborted();
     return this.operationContext.run(merged, async () => {
       merged.signal?.throwIfAborted();
-      return task();
+      return withCodexExecution(this.config.projectRoot, task, { signal: merged.signal });
     });
   }
 

@@ -1,6 +1,9 @@
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { createCodexClient, type CodexClient } from './app-server.js';
 import { readCodexSettings, updateCodexSettings, validateCodexSettingsPatch } from './settings.js';
 import type { CodexAccountStatus, CodexDeviceLogin, CodexLoginState, CodexModel, CodexSettings } from './types.js';
+import { CodexAuthenticationOwner, type CodexAuthOperation } from '../runtime/auth/codex-owner.js';
 
 export type { CodexAccountStatus, CodexDeviceLogin, CodexLoginState, CodexModel } from './types.js';
 export interface CodexAccountService {
@@ -57,9 +60,10 @@ export class CodexConfigurationError extends Error {
 
 /** The runtime, settings editor and health check share the same catalog rules. */
 export function selectCodexModel(models: readonly CodexModel[], settings: CodexSettings): CodexModel {
-  const model = settings.model
-    ? models.find(model => model.model === settings.model || model.id === settings.model)
-    : models.find(model => model.isDefault) ?? models[0];
+  const matches = settings.model
+    ? models.filter(model => model.model === settings.model || model.id === settings.model)
+    : models.filter(model => model.isDefault);
+  const model = matches.length === 1 ? matches[0] : undefined;
   if (!model) throw new CodexConfigurationError("CODEX_MODEL_UNAVAILABLE",
     "The configured Codex model is not available. Refresh Codex settings and choose an available model.");
   if (!model.supportedReasoningEfforts.some(option => option.reasoningEffort === settings.reasoningEffort)) {
@@ -117,6 +121,8 @@ class AccountService implements CodexAccountService {
   private earlyCompletions = new Map<string, boolean>();
   private queue: Promise<unknown> = Promise.resolve();
   private disposed = false;
+  private ownerLogin?: { owner: CodexAuthenticationOwner; operation: CodexAuthOperation; client: CodexClient };
+  private ownerSettlement?: Promise<unknown>;
   constructor(private options: CodexAccountServiceOptions) {}
 
   private async getClient(): Promise<CodexClient> {
@@ -124,10 +130,14 @@ class AccountService implements CodexAccountService {
     if (!this.clientPromise) {
       const factory = this.options.clientFactory ?? createCodexClient;
       const promise = factory(this.options.projectDir).then(client => {
-        client.onNotification((method, params) => this.notification(method, params));
+        client.onNotification((method, params) => {
+          if (this.clientPromise === promise) this.notification(method, params);
+        });
         client.onClose(() => {
-          if (this.clientPromise === promise) this.clientPromise = undefined;
-          if (this.login?.status === 'pending') this.finishLogin(false, 'Codex disconnected before sign-in completed. Start sign-in again.');
+          if (this.clientPromise === promise) {
+            this.clientPromise = undefined;
+            if (this.login?.status === 'pending') this.finishLogin(false, 'Codex disconnected before sign-in completed. Start sign-in again.');
+          }
         });
         return client;
       }).catch(error => { if (this.clientPromise === promise) this.clientPromise = undefined; throw error; });
@@ -137,6 +147,10 @@ class AccountService implements CodexAccountService {
   }
 
   private notification(method: string, params: unknown): void {
+    if (method === 'account/updated') {
+      void this.readAccount().catch(() => undefined);
+      return;
+    }
     if (method !== 'account/login/completed') return;
     const result = object(params);
     const id = text(result.loginId);
@@ -152,6 +166,14 @@ class AccountService implements CodexAccountService {
     if (!this.login) return;
     this.login = { loginId: this.login.loginId, status: success ? 'completed' : 'failed',
       ...(!success ? { error: error ?? 'ChatGPT sign-in did not complete. The code may have expired; start sign-in again.' } : {}) };
+    const pending = this.ownerLogin;
+    this.ownerLogin = undefined;
+    if (pending) {
+      this.ownerSettlement = success ? pending.owner.completeLogin(pending.operation, pending.client)
+        : Promise.resolve(pending.owner.complete(pending.operation, 'unknown'));
+      // A failed completion remains non-ready; never restore the previous generation.
+      void this.ownerSettlement.catch(() => undefined);
+    }
   }
 
   private exclusive<T>(operation: () => Promise<T>): Promise<T> {
@@ -161,8 +183,17 @@ class AccountService implements CodexAccountService {
   }
 
   async readAccount(): Promise<CodexAccountStatus> {
-    const result = object(await (await this.getClient()).request('account/read', { refreshToken: false }));
-    const raw = object(result.account);
+    try { await this.ownerSettlement; } catch { /* A failed settlement stays non-ready; a status read may still diagnose it. */ }
+    const client = await this.getClient(), owner = new CodexAuthenticationOwner(client);
+    const existing = () => existsSync(join(owner.context.home, 'inkos-connection.json')) ? owner.snapshot() : undefined;
+    const before = existing();
+    const result = object(await client.request('account/read', { refreshToken: false }));
+    const after = existing();
+    // A read begun before login/cancel/logout cannot publish or apply its stale account result.
+    const unchanged = before?.authGeneration === after?.authGeneration && before?.operationId === after?.operationId
+      && before?.connectionRef === after?.connectionRef && before?.localState === after?.localState && !client.closed;
+    if (unchanged && before) owner.observe(client, result);
+    const raw = unchanged ? object(result.account) : {};
     const account = raw.type === 'chatgpt' ? {
       type: 'chatgpt' as const, email: typeof raw.email === 'string' ? raw.email : null, planType: text(raw.planType) || 'unknown',
     } : null;
@@ -176,9 +207,13 @@ class AccountService implements CodexAccountService {
         return { type: 'chatgptDeviceCode', loginId: this.login.loginId, verificationUrl: this.login.verificationUrl, userCode: this.login.userCode };
       }
       const client = await this.getClient();
+      this.login = null; this.earlyCompletions.clear();
+      const owner = new CodexAuthenticationOwner(client), operation = owner.begin(true);
+      this.ownerLogin = { owner, operation, client };
       let login: CodexDeviceLogin;
       try { login = projectDeviceLogin(await client.request('account/login/start', { type: 'chatgptDeviceCode' })); }
       catch (error) {
+        owner.complete(operation, 'unknown'); this.ownerLogin = undefined;
         // A timed-out or invalid start response must not leave an untracked login polling.
         await client.close();
         throw error;
@@ -196,17 +231,26 @@ class AccountService implements CodexAccountService {
     return this.exclusive(async () => {
       if (!this.login || loginId !== this.login.loginId) throw new Error('This sign-in attempt is no longer current');
       if (this.login.status !== 'pending') return;
-      await (await this.getClient()).request('account/login/cancel', { loginId });
-      // Completion may race cancellation; never overwrite an observed successful login.
-      if (this.login?.status === 'pending') this.login = { loginId, status: 'cancelled' };
+      const client = await this.getClient(), owner = new CodexAuthenticationOwner(client), operation = owner.begin();
+      this.ownerLogin = undefined; this.earlyCompletions.clear();
+      this.login = { loginId, status: 'cancelled' };
+      try { await client.request('account/login/cancel', { loginId }); owner.complete(operation, 'disconnected'); }
+      catch (error) { owner.complete(operation, 'unknown'); throw error; }
+      // A late completion holds the superseded ticket and cannot restore readiness.
     });
   }
 
   logout(): Promise<void> {
     return this.exclusive(async () => {
       const client = await this.getClient();
-      if (this.login?.status === 'pending') await client.request('account/login/cancel', { loginId: this.login.loginId });
-      await client.request('account/logout', {});
+      const owner = new CodexAuthenticationOwner(client), operation = owner.begin();
+      const pendingId = this.login?.status === 'pending' ? this.login.loginId : undefined;
+      this.ownerLogin = undefined; this.login = null; this.earlyCompletions.clear();
+      try {
+        if (pendingId) await client.request('account/login/cancel', { loginId: pendingId });
+        await client.request('account/logout', {});
+        owner.complete(operation, 'disconnected');
+      } catch (error) { owner.complete(operation, 'unknown'); throw error; }
       this.login = null; this.earlyCompletions.clear();
     });
   }
@@ -231,6 +275,7 @@ class AccountService implements CodexAccountService {
     this.disposed = true;
     // Let already-started login/logout operations settle before stopping the polling process.
     try { await this.queue; } catch { /* Operation errors are returned to their callers. */ }
+    try { await this.ownerSettlement; } catch { /* The owner retains its non-ready state. */ }
     const promise = this.clientPromise;
     this.clientPromise = undefined;
     if (promise) await (await promise).close();

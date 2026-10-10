@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCodexAccountService } from '../account.js';
+import { CodexAuthenticationOwner } from '../../runtime/auth/codex-owner.js';
 import type { CodexClient, CodexNotificationListener } from '../app-server.js';
 
 const roots: string[] = [];
@@ -21,7 +22,7 @@ async function fixture() {
     onClose: (listener: () => void) => { close = listener; return () => undefined; }, close: vi.fn(async () => close()),
     cwd: dir, codexHome: dir, closed: false, onRequest: () => () => undefined } as unknown as CodexClient;
   const service = createCodexAccountService({ projectDir: dir, clientFactory: async () => client });
-  return { service, request, notify: (method: string, params: unknown) => notification(method, params), close: () => close() };
+  return { service, request, client, notify: (method: string, params: unknown) => notification(method, params), close: () => close() };
 }
 describe('Codex account service', () => {
   it('projects account/model/login data without credential leakage', async () => {
@@ -63,13 +64,88 @@ describe('Codex account service', () => {
   });
 });
 
-it('shares catalog aliases/default fallback/speed projection with runtime settings validation', async () => {
+it('shares catalog aliases/explicit native default/speed projection with runtime settings validation', async () => {
   const { service, request } = await fixture();
-  request.mockImplementation(async (method: string) => method === 'model/list' ? { data: [{ id: 'alias', model: 'canonical', displayName: 'Model', isDefault: false,
+  request.mockImplementation(async (method: string) => method === 'model/list' ? { data: [{ id: 'alias', model: 'canonical', displayName: 'Model', isDefault: true,
     supportedReasoningEfforts: [{ reasoningEffort: 'medium' }, { reasoningEffort: 'ultra' }], serviceTiers: [{ id: 'fast', name: 'Fast' }], additionalSpeedTiers: ['fast', 'priority'] }], nextCursor: null } : {});
   expect((await service.listModels())[0]?.serviceTiers.map(tier => tier.id)).toEqual(['fast', 'priority']);
   await expect(service.updateSettings({ model: 'alias', serviceTier: 'priority' })).resolves.toMatchObject({ model: 'alias', serviceTier: 'priority' });
   await expect(service.updateSettings({ model: null, serviceTier: 'default' })).resolves.toEqual({ reasoningEffort: 'ultra', serviceTier: 'default' });
   await expect(service.readSettings()).resolves.toEqual({ reasoningEffort: 'ultra', serviceTier: 'default' });
+  await service.dispose();
+});
+
+it('routes legacy login/cancel/logout through the same owner and ignores a cancelled late success', async () => {
+  const { service, request, client, notify } = await fixture();
+  const original = request.getMockImplementation()!;
+  request.mockImplementation(async method => method === 'account/read'
+    ? { account: { type: 'chatgpt', email: 'synthetic@example.test' } } : original(method));
+  const owner = new CodexAuthenticationOwner(client), admitted = await owner.admit(client);
+  const initial = owner.snapshot()!;
+  let stateAtStart: string | undefined;
+  request.mockImplementation(async method => {
+    if (method === 'account/login/start') stateAtStart = owner.snapshot()?.localState;
+    return method === 'account/read' ? { account: { type: 'chatgpt', email: 'synthetic@example.test' } } : original(method);
+  });
+  await service.startDeviceLogin();
+  expect(stateAtStart).toBe('transitioning');
+  expect(owner.snapshot()!.authGeneration).toBeGreaterThan(initial.authGeneration);
+  await expect(owner.guard({ ...admitted, ...admitted.connection }, client)).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+  await service.cancelLogin('l1');
+  const cancelled = owner.snapshot()!;
+  notify('account/login/completed', { loginId: 'l1', success: true });
+  expect((await service.readAccount()).login?.status).toBe('cancelled');
+  expect(owner.snapshot()).toEqual(cancelled);
+  await service.startDeviceLogin();
+  notify('account/login/completed', { loginId: 'l1', success: true });
+  await service.readAccount();
+  expect(owner.snapshot()?.localState).toBe('ready');
+  const ready = owner.snapshot()!;
+  await service.logout();
+  expect(owner.snapshot()).toMatchObject({ localState: 'disconnected', authGeneration: ready.authGeneration + 1 });
+  await service.dispose();
+});
+
+it('discards an account read that crossed logout instead of publishing a stale connection', async () => {
+  const { service, request, client } = await fixture();
+  const owner = new CodexAuthenticationOwner(client);
+  request.mockImplementation(async method => method === 'account/read' ? { account: { type: 'chatgpt', email: 'first@example.test' } } : {});
+  await owner.admit(client);
+  let entered!: () => void, finish!: (value: unknown) => void;
+  const began = new Promise<void>(resolve => { entered = resolve; });
+  request.mockImplementation(async method => {
+    if (method !== 'account/read') return {};
+    entered(); return new Promise(resolve => { finish = resolve; });
+  });
+  const status = service.readAccount(); await began;
+  await service.logout();
+  finish({ account: { type: 'chatgpt', email: 'first@example.test' } });
+  expect((await status).connected).toBe(false);
+  expect(owner.snapshot()?.localState).toBe('disconnected');
+  await service.dispose();
+});
+
+it('leaves the owner non-ready after a login RPC failure', async () => {
+  const { service, request, client } = await fixture();
+  const owner = new CodexAuthenticationOwner(client);
+  request.mockImplementation(async () => { throw new Error('Synthetic RPC deadline'); });
+  await expect(service.startDeviceLogin()).rejects.toThrow('Synthetic RPC deadline');
+  expect(owner.snapshot()).toMatchObject({ localState: 'unknown', operationId: null });
+  await service.dispose();
+});
+
+it('refuses to guess the first catalog model when native default evidence is absent', async () => {
+  const { service, request } = await fixture();
+  request.mockImplementation(async method => method === 'model/list' ? { data: [{ id: 'alias', model: 'canonical', isDefault: false,
+    supportedReasoningEfforts: [{ reasoningEffort: 'ultra' }], serviceTiers: [{ id: 'priority' }] }] } : {});
+  await expect(service.updateSettings({ model: null })).rejects.toMatchObject({ code: 'CODEX_MODEL_UNAVAILABLE' });
+  await service.dispose();
+});
+
+it('rejects ambiguous native defaults instead of choosing whichever catalog row appeared first', async () => {
+  const { service, request } = await fixture();
+  request.mockImplementation(async method => method === 'model/list' ? { data: ['one', 'two'].map(model => ({ id: model, model, isDefault: true,
+    supportedReasoningEfforts: [{ reasoningEffort: 'ultra' }], serviceTiers: [{ id: 'priority' }] })) } : {});
+  await expect(service.updateSettings({ model: null })).rejects.toMatchObject({ code: 'CODEX_MODEL_UNAVAILABLE' });
   await service.dispose();
 });

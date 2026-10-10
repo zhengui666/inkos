@@ -26,14 +26,17 @@ it('settles a request and episode when episode initialization fails after creati
     original.call(this, input);
     throw new Error('fixture initialization failure');
   });
-  createClient.mockClear();
+  const codex = new CodexFixture(() => { throw new Error('Model must not run after episode initialization failed'); });
+  createClient.mockClear(); createClient.mockImplementation(codex.createClient);
   try {
     await expect(runAgentSession(configuration(root, 'initialization'), 'Go')).rejects.toThrow('fixture initialization failure');
     expect((await readTranscriptEvents(root, 'initialization')).at(-1)?.type).toBe('request_failed');
     const episodes = new CreativeEpisodeStore(join(root, '.inkos', 'harness.sqlite'));
     try { expect(episodes.listEpisodes().map(e => e.status)).toEqual(['failed']); }
     finally { episodes.close(); }
-    expect(createClient).not.toHaveBeenCalled();
+    // Queue admission precedes episode creation, but initialization failure cannot dispatch a model.
+    expect(createClient).toHaveBeenCalledOnce();
+    expect(codex.requests.filter(r => r.method === "thread/start" || r.method === "turn/start")).toHaveLength(0);
   } finally { start.mockRestore(); abortAgentSession(root, 'initialization'); await rm(root, { recursive: true, force: true }); }
 });
 

@@ -71,3 +71,28 @@ describe("capability-scoped Codex project configuration", () => {
     await expect(loadProjectConfig(root, { purpose: "codex" })).rejects.toThrow("Cannot read Codex settings");
   });
 });
+
+it('projects a saved native model as unknown metadata without writing defaults or probing authentication', async () => {
+  const root = await project();
+  await mkdir(join(root, '.inkos'));
+  const bytes = JSON.stringify({ model: null, reasoningEffort: 'medium', serviceTier: 'default' });
+  await writeFile(join(root, '.inkos', 'codex-config.json'), bytes);
+  const result = await resolveEffectiveLLMConfig({ consumer: 'studio', projectRoot: root, envLayers, purpose: 'codex' });
+  expect(result.llm.model).toBe('codex-default');
+  expect(await readFile(join(root, '.inkos', 'codex-config.json'), 'utf8')).toBe(bytes);
+  const { readdir } = await import('node:fs/promises');
+  expect(await readdir(join(root, '.inkos'))).toEqual(['codex-config.json']);
+});
+
+it('keeps an unassembled Pi desire intact and reports its disconnected execution path without falling back', async () => {
+  const root = await project();
+  await mkdir(join(root, '.inkos'));
+  const bytes = JSON.stringify({ schemaVersion: 1, revision: 9, selectedHarnessId: 'pi', modelConnectionRef: null,
+    harnessPreferences: { codex: { model: 'gpt-6.1-sol', effort: 'ultra', speed: 'priority' }, pi: { model: null, effort: null, speed: null } } });
+  await writeFile(join(root, '.inkos', 'agent-config.json'), bytes);
+  await expect(resolveEffectiveLLMConfig({ consumer: 'studio', projectRoot: root, envLayers, purpose: 'codex' }))
+    .rejects.toMatchObject({ code: 'RUNTIME_HARNESS_NOT_CONNECTED' });
+  expect(await readFile(join(root, '.inkos', 'agent-config.json'), 'utf8')).toBe(bytes);
+  const { readdir } = await import('node:fs/promises');
+  expect(await readdir(join(root, '.inkos'))).toEqual(['agent-config.json']);
+});

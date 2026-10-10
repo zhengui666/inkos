@@ -657,3 +657,5 @@ export { observeCodexRuntime, bindCodexModelConnection, withCodexExecution, guar
 export type { CodexRuntimeObservation, CodexExecutionOptions, CodexThreadEffective } from './runtime/execution.js';
 export { currentCodexRun, runWithCodexContext } from './runtime/run-context.js';
 export type { CodexRunContext } from './runtime/run-context.js';
+
+export * from "./runtime/run-history.js";

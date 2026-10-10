@@ -32,9 +32,6 @@ export interface CodexClientOptions {
 
 /** Verified against openai/codex rust-v0.159.2/config.schema.json. No API-key/provider override. */
 export const CODEX_ISOLATED_CONFIG: Readonly<Record<string, string | number | boolean | string[]>> = Object.freeze({
-  model: 'gpt-6.1-sol',
-  model_reasoning_effort: 'ultra',
-  service_tier: 'fast',
   approval_policy: 'never', sandbox_mode: 'read-only', forced_login_method: 'chatgpt',
   cli_auth_credentials_store: 'file', project_doc_max_bytes: 0,
   project_doc_fallback_filenames: [], web_search: 'disabled', notify: [],
@@ -65,6 +62,9 @@ export const CODEX_ISOLATED_CONFIG: Readonly<Record<string, string | number | bo
   'tools.update_plan.enabled': false, 'tools.experimental_request_user_input.enabled': false,
   'agents.enabled': false, 'apps._default.enabled': false,
 });
+// Accept the previous native directory preferences read-only without restoring
+// the old process-local model/effort/tier overrides.
+const LEGACY_NATIVE_CONFIG: Readonly<Record<string, string>> = { model: '', model_reasoning_effort: '', service_tier: '' };
 
 export class CodexRpcError extends Error {
   constructor(public readonly code: number, public readonly method: string) {
@@ -134,10 +134,10 @@ async function validateExistingConfig(codexHome: string): Promise<void> {
       if (raw.trim() !== '{}') throw incompatible();
       continue;
     }
-    if (!Object.hasOwn(CODEX_ISOLATED_CONFIG, key)) throw incompatible();
+    if (!Object.hasOwn(CODEX_ISOLATED_CONFIG, key) && !Object.hasOwn(LEGACY_NATIVE_CONFIG, key)) throw incompatible();
     let value: unknown;
     try { value = JSON.parse(raw); } catch { throw incompatible(); }
-    const expected = CODEX_ISOLATED_CONFIG[key];
+    const expected = CODEX_ISOLATED_CONFIG[key] ?? LEGACY_NATIVE_CONFIG[key];
     // Scalars/arrays replace their old values. Tables would recursively merge.
     if (Array.isArray(expected)
       ? !Array.isArray(value) || !value.every(item => typeof item === 'string')
