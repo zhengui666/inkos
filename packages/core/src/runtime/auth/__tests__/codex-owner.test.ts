@@ -110,14 +110,16 @@ describe('managed Codex authentication owner', () => {
     const sourceRoot = new URL('../../../', import.meta.url).href;
     const child = spawnSync(process.execPath, ['--experimental-transform-types', '--input-type=module', '-e', `
       import {registerHooks} from 'node:module';
+      import {writeSync} from 'node:fs';
       const sourceRoot=${JSON.stringify(sourceRoot)};
       registerHooks({resolve(specifier,context,next){return next(context.parentURL?.startsWith(sourceRoot)&&specifier.startsWith('.')&&specifier.endsWith('.js')?specifier.slice(0,-3)+'.ts':specifier,context);}});
       const {CodexAuthenticationOwner}=await import(sourceRoot+'runtime/auth/codex-owner.ts');
       const owner=new CodexAuthenticationOwner({codexHome:${JSON.stringify(f.home)}});
-      owner.disconnect(); process.stdout.write(String(owner.snapshot().authGeneration));
+      owner.disconnect(); writeSync(1,String(owner.snapshot().authGeneration));
     `], { encoding: 'utf8', timeout: 5000 });
-    expect(child.status).toBe(0);
-    expect(Number(child.stdout)).toBe(selected.authGeneration + 1);
+    expect(child.status, child.stderr).toBe(0);
+    expect(Number(child.stdout), JSON.stringify({ stdout: child.stdout, stderr: child.stderr,
+      after: f.owner.snapshot()?.authGeneration })).toBe(selected.authGeneration + 1);
     await expect(f.owner.guard(selected, f.client)).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
   });
 
@@ -200,5 +202,18 @@ describe('managed Codex authentication owner', () => {
     f.setAccount({ account: { type: 'chatgpt', email: 'b@example.test' }, workspaceRouting: { chatgptAccountId: 'account-a' } });
     await expect(restarted.guard(target(admitted), f.client)).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
     expect(restarted.snapshot()?.authGeneration).toBe(admitted.authGeneration + 1);
+  });
+
+  it('revokes a recorded A when the first live probe observes B and the second has nullable identity', async () => {
+    const f = fixture(); f.setAccount({ account: { type: 'chatgpt', email: 'a@example.test' } });
+    const admitted = await f.owner.admit(f.client);
+    vi.mocked(f.client.request)
+      .mockResolvedValueOnce({ account: { type: 'chatgpt', email: 'b@example.test' } })
+      .mockResolvedValueOnce({ account: { type: 'chatgpt', email: null }, workspaceRouting: null });
+    const observed = await f.owner.probe(f.client, async () => ({ catalog: 'candidate' }));
+    expect(observed).toMatchObject({ ready: false, value: null, account: null, owner: null });
+    expect(f.owner.snapshot()).toMatchObject({ localState: 'disconnected', authGeneration: admitted.authGeneration + 1 });
+    await expect(f.owner.guard(target(admitted), f.client)).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+    expect(f.owner.snapshot()?.authGeneration).toBe(admitted.authGeneration + 1);
   });
 });

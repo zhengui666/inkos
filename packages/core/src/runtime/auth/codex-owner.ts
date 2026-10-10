@@ -216,9 +216,11 @@ export class CodexAuthenticationOwner {
         if (current?.authGeneration !== before?.authGeneration || current?.operationId !== before?.operationId
           || current?.connectionRef !== before?.connectionRef || current?.localState !== before?.localState) return unknown('owner-changed-during-probe');
         if (current?.localState === 'ready' && (!first.authenticated || !last.authenticated
-          || changedIdentity(first.identityRef, last.identityRef) || changedIdentity(current.identityRef, last.identityRef))) {
+          || changedIdentity(first.identityRef, last.identityRef) || changedIdentity(current.identityRef, first.identityRef)
+          || changedIdentity(current.identityRef, last.identityRef))) {
+          const knownIdentity = hasIdentity(last.identityRef) ? last.identityRef : first.identityRef;
           this.bump(current, { localState: 'disconnected', operationId: null,
-            ...(hasIdentity(last.identityRef) ? { identityRef: last.identityRef } : {}) });
+            ...(hasIdentity(knownIdentity) ? { identityRef: knownIdentity } : {}) });
           return unknown('account-changed-during-probe');
         }
         if (!first.authenticated || !last.authenticated || changedIdentity(first.identityRef, last.identityRef)) return unknown('chatgpt-account-unverified');

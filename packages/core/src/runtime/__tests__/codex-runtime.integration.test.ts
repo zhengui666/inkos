@@ -158,6 +158,26 @@ describe('Codex runtime core boundary (authenticated protocol fixture)', () => {
     });
   });
 
+  it('discards catalog ownership after a recorded A is observed as B and then nullable during a real probe', async () => {
+    const client = new Peer(root), owner = new CodexAuthenticationOwner(client);
+    account = { account: { type: 'chatgpt', email: 'a@example.test' } };
+    const admitted = await owner.admit(client), request = client.request.bind(client);
+    let reads = 0;
+    client.request = async <T = unknown>(method: string, parameters?: unknown): Promise<T> => {
+      const result = await request<T>(method, parameters);
+      if (method !== 'account/read') return result;
+      return (++reads === 1 ? { account: { type: 'chatgpt', email: 'b@example.test' } }
+        : { account: { type: 'chatgpt', email: null }, workspaceRouting: null }) as T;
+    };
+    expect(await observeCodexRuntime(client)).toMatchObject({ ready: false, descriptor: null,
+      catalogOwnership: null, nativeDefaultsEvidence: null, account: null });
+    expect(reads).toBe(2);
+    expect(owner.snapshot()).toMatchObject({ localState: 'disconnected', authGeneration: admitted.authGeneration + 1 });
+    await expect(owner.guard({ harnessId: 'codex', authContextRef: admitted.authContextRef,
+      connectionRef: admitted.connection.connectionRef, authGeneration: admitted.authGeneration }, client)).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+    expect(owner.snapshot()?.authGeneration).toBe(admitted.authGeneration + 1);
+  });
+
   it('resolves all three saved nulls to native values, keeps saved bytes/preferences, and exposes only actual ACK fields', async () => {
     const legacy = '{\r\n "model": null, "reasoningEffort": "low", "serviceTier": "default"\r\n}\r\n';
     const legacyPath = join(root, '.inkos', 'codex-config.json'); writeFileSync(legacyPath, legacy);
