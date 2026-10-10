@@ -1,18 +1,22 @@
 import { readChapterReviewInputs, readChapterReviewInputsSync, sameChapterReviewInputs } from "../pipeline/review-inputs.js";
 import { join, resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { SchedulerPublisher } from '../pipeline/autonomous-chapters.js';
 import { StateManager } from '../state/manager.js';
-import { loadWorkManifest } from '../harness/work-store.js';
+import { loadWorkManifest, workManifestPath } from '../harness/work-store.js';
+import { WorkManifestSchema } from '../harness/contracts.js';
+import { ChapterMetaSchema } from '../models/chapter.js';
+import { chapterDocumentBody } from '../utils/chapter-document.js';
 import { runInWorkMutationQueue, withWorkMutationScope } from '../utils/work-mutation-scope.js';
 import { ManualPublishingAdapter } from './manual-adapter.js';
 import { PublishingStore } from './store.js';
 import { MegaNovelPublishingAdapter } from './meganovel-adapter.js';
-import { publishingError, type PublishingPackage } from './contracts.js';
-import { MegaNovelScopeSchema, type MegaNovelBrowserPort, type MegaNovelScope, type MegaNovelRun } from './meganovel-contracts.js';
+import { publishingError, PublishingManifestSchema, publishingManifestValue, type PublishingPackage } from './contracts.js';
+import { MegaNovelScopeSchema, type MegaNovelBrowserPort, type MegaNovelScope, type MegaNovelRun, type MegaNovelSubmission } from './meganovel-contracts.js';
 import type { MegaNovelCdpConfiguration, MegaNovelDomBinding } from './meganovel-cdp.js';
 import { createMegaNovelDomBinding, MegaNovelDomConfigurationSchema } from './meganovel-dom-binding.js';
 import { createPublisherCleanup, PublisherStartupCleanupError } from './publisher-cleanup.js';
@@ -181,13 +185,6 @@ export function createMegaNovelSchedulerPublisher(root: string, bindings: readon
         }
         input.signal.throwIfAborted();
       };
-      const authorizeSubmission = () => {
-        input.signal.throwIfAborted();
-        if (!sameChapterReviewInputs(input.reviewInputs, readChapterReviewInputsSync(state.bookDir(input.workId), input.chapterNumber))) {
-          throw publishingError('CHAPTER_REVIEW_INPUTS_CHANGED', 'Review authority changed before the final submission request.');
-        }
-        input.authorizeSubmission?.();
-      };
       if (!pkg) {
         if (input.chapterNumber >= binding.firstNewChapter) await beforeMutation();
         pkg = await freeze(binding, input.chapterNumber, input.revisionId);
@@ -200,6 +197,49 @@ export function createMegaNovelSchedulerPublisher(root: string, bindings: readon
         : await remote.saveDraft(request, { signal: input.signal, beforeMutation });
       input.signal.throwIfAborted();
       if (run.phase === 'draft' && input.chapterNumber >= binding.firstNewChapter) {
+        const frozen = await packages.verify(pkg.manifest.id);
+        const frozenManifest = publishingManifestValue(pkg.manifest);
+        const frozenBytes = readFileSync(join(frozen.directory, selected.packagePath));
+        const storedBytes = pkg.manifest.files.find(file => file.path === selected.packagePath)?.contentBase64;
+        if (publishingManifestValue(frozen.package.manifest) !== frozenManifest
+          || storedBytes !== undefined && !frozenBytes.equals(Buffer.from(storedBytes, 'base64'))) {
+          throw publishingError('PUBLISHING_PACKAGE_INTEGRITY', 'The original frozen chapter payload changed before submission.');
+        }
+        const language = pkg.manifest.language;
+        if (language !== 'en' && language !== 'zh') throw publishingError('MEGANOVEL_LANGUAGE_UNSUPPORTED', 'The frozen chapter requires a supported language.');
+        const frozenBody = chapterDocumentBody(frozenBytes.toString('utf8'), selected.number, selected.title, language);
+        const remoteChapterId = run.remoteChapterId;
+        const authorizeSubmission = (submission: MegaNovelSubmission) => {
+          input.signal.throwIfAborted();
+          input.authorizeSubmission?.();
+          if (!sameChapterReviewInputs(input.reviewInputs, readChapterReviewInputsSync(state.bookDir(input.workId), input.chapterNumber))) {
+            throw publishingError('CHAPTER_REVIEW_INPUTS_CHANGED', 'Review authority changed before the final submission request.');
+          }
+          const work = WorkManifestSchema.parse(JSON.parse(readFileSync(workManifestPath(root, binding.workId), 'utf8')));
+          const prefix = `source/chapters/${String(input.chapterNumber).padStart(4, '0')}_`;
+          const matches = work.artifacts.flatMap(artifact => artifact.revisions.filter(revision =>
+            revision.id === artifact.currentRevisionId && revision.path.startsWith(prefix) && revision.path.endsWith('.md'))
+            .map(revision => ({artifact, revision})));
+          const current = matches[0];
+          const meta = ChapterMetaSchema.array().parse(JSON.parse(readFileSync(
+            join(state.bookDir(input.workId), 'chapters', 'index.json'), 'utf8'))).find(item => item.number === input.chapterNumber);
+          if (matches.length !== 1 || !current?.revision.snapshotPath || current.revision.id !== input.revisionId
+            || current.revision.id !== selected.revisionId || current.artifact.id !== selected.artifactId
+            || current.revision.path !== selected.sourcePath || meta?.title !== selected.title
+            || !readFileSync(join(root, 'works', binding.workId, current.revision.path)).equals(frozenBytes)
+            || !readFileSync(join(root, 'works', binding.workId, current.revision.snapshotPath)).equals(frozenBytes)) {
+            throw publishingError('CHAPTER_REVISION_CHANGED', 'Current chapter no longer matches the original reviewed frozen revision.');
+          }
+          if (publishingManifestValue(store.getPackage(pkg!.manifest.id).manifest) !== frozenManifest
+            || publishingManifestValue(PublishingManifestSchema.parse(JSON.parse(readFileSync(join(frozen.directory, 'manifest.json'), 'utf8')))) !== frozenManifest
+            || !readFileSync(join(frozen.directory, selected.packagePath)).equals(frozenBytes)
+            || !submission || submission.packageId !== request.packageId || submission.chapterNumber !== input.chapterNumber
+            || submission.revisionId !== selected.revisionId || submission.remoteChapterId !== remoteChapterId
+            || submission.title !== selected.title || submission.content !== frozenBody || submission.aiAssisted !== request.aiAssisted
+            || !(['sessionId', 'accountId', 'accountLabel', 'remoteBookId'] as const).every(key => submission.scope[key] === request.scope[key])) {
+            throw publishingError('PUBLISHING_PACKAGE_INTEGRITY', 'The actual submission differs from the original frozen attempt or payload.');
+          }
+        };
         run = await remote.submit(request, { signal: input.signal, beforeMutation, authorizeSubmission });
       }
       return view(run);

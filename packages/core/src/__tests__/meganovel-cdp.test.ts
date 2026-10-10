@@ -149,7 +149,7 @@ describe('MegaNovel actual CDP transport with synthetic browser driver', () => {
       await guard!();
       expect(authorizeSubmission).not.toHaveBeenCalled();
       // The binding performs its final authorisation synchronously next to its effect.
-      expect(guard!.authorizeSubmission!()).toBeUndefined();
+      expect(guard!.authorizeSubmission!(_input)).toBeUndefined();
       order.push('submission effect');
     });
     await port.submit({packageId: 'package-1', chapterNumber: 1, scope: config.scope, aiAssisted: true,
@@ -157,6 +157,8 @@ describe('MegaNovel actual CDP transport with synthetic browser driver', () => {
     {authorizeSubmission, ...(hasAsyncGuard ? {beforeMutation} : {})});
     expect(binding.submit).toHaveBeenCalledOnce();
     expect(authorizeSubmission).toHaveBeenCalledOnce();
+    expect(authorizeSubmission).toHaveBeenCalledWith(expect.objectContaining({packageId: 'package-1',
+      revisionId: 'revision-1', remoteChapterId: 'remote-1', title: 'Title', content: 'Body'}));
     expect(order).toEqual(hasAsyncGuard
       ? ['async guard', 'binding entered', 'async guard', 'final authorization', 'submission effect']
       : ['binding entered', 'final authorization', 'submission effect']);

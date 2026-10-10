@@ -6,8 +6,10 @@ import { join, resolve } from "node:path";
 import type { PipelineRunner } from "./runner.js";
 import { StateManager } from "../state/manager.js";
 import { BookConfigSchema } from "../models/book.js";
+import { ChapterMetaSchema } from "../models/chapter.js";
 import { ChapterGoalService } from "../goals/service.js";
-import { loadWorkManifest } from "../harness/work-store.js";
+import { loadWorkManifest, workManifestPath } from "../harness/work-store.js";
+import { WorkManifestSchema } from "../harness/contracts.js";
 import { createBuiltInWorkProfileRegistry } from "../harness/builtin-profiles.js";
 import { loadAvailableAgentSkills, resolveProfileSkillActivations } from "../skills/index.js";
 import { withExecutionEvidence } from "../harness/execution-evidence.js";
@@ -293,7 +295,10 @@ export class AutonomousChapterRunner {
       if (this.options.shouldContinue?.(job.workId) === false || !["active", "outlining"].includes(book.status)) {
         throw Object.assign(new Error("Publication paused before submission authorization."), { code: "CHAPTER_PUBLICATION_PAUSED" });
       }
-      if (!sameChapterReviewInputs(job.reviewReceipt?.inputs, readChapterReviewInputsSync(bookDir, job.chapter))
+      const current = this.chapterRevisionSync(job.workId, job.chapter);
+      if (current.revisionId !== job.revisionId || job.reviewReceipt?.revisionId !== current.revisionId
+        || unresolvedReview(current.observations).length
+        || !sameChapterReviewInputs(job.reviewReceipt?.inputs, readChapterReviewInputsSync(bookDir, job.chapter))
         || !sameChapterReviewPolicy(job.reviewReceipt?.reviewPolicy, {
           language: book.language, requireStoryClosure: this.options.requireStoryClosure?.(job.workId, job.chapter) === true })) {
         throw Object.assign(new Error("Review authority changed before submission authorization."), { code: "CHAPTER_REVIEW_INPUTS_CHANGED" });
@@ -337,6 +342,22 @@ export class AutonomousChapterRunner {
     const bytes = await readFile(join(this.root, "works", workId, revision.path));
     if (!bytes.equals(await readFile(join(this.root, "works", workId, revision.snapshotPath!)))) {
       throw Object.assign(new Error("Current chapter has unregistered edits; retain them and reconcile before publication."), { code: "CHAPTER_REVISION_CHANGED" });
+    }
+    return { revisionId: revision.id, observations: meta.observations };
+  }
+  /** Same retained-revision checks at the final host boundary, without an await. */
+  private chapterRevisionSync(workId: string, chapter: number) {
+    const meta = ChapterMetaSchema.array().parse(JSON.parse(readFileSync(
+      join(this.state.bookDir(workId), "chapters", "index.json"), "utf8"))).find(item => item.number === chapter);
+    const work = WorkManifestSchema.parse(JSON.parse(readFileSync(workManifestPath(this.root, workId), "utf8")));
+    const prefix = `source/chapters/${String(chapter).padStart(4, "0")}_`;
+    const revisions = work.artifacts.flatMap(artifact => artifact.revisions.filter(revision =>
+      revision.id === artifact.currentRevisionId && revision.path.startsWith(prefix) && revision.path.endsWith(".md")));
+    const revision = revisions[0];
+    if (!meta || revisions.length !== 1 || !revision?.snapshotPath
+      || !readFileSync(join(this.root, "works", workId, revision.path)).equals(
+        readFileSync(join(this.root, "works", workId, revision.snapshotPath)))) {
+      throw Object.assign(new Error("The retained chapter changed before submission authorization."), { code: "CHAPTER_REVIEW_INPUTS_CHANGED" });
     }
     return { revisionId: revision.id, observations: meta.observations };
   }

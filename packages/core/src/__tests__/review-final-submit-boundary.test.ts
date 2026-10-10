@@ -11,7 +11,7 @@ import { ChapterReviewInputsSchema, readChapterReviewInputs, sameChapterReviewIn
 import { PublishingStore } from '../publishing/store.js';
 import { ManualPublishingAdapter } from '../publishing/manual-adapter.js';
 import { createMegaNovelSchedulerPublisher } from '../publishing/scheduler-publisher.js';
-import type { MegaNovelBrowserPort, MegaNovelSnapshot } from '../publishing/meganovel-contracts.js';
+import type { MegaNovelBrowserPort, MegaNovelMutationGuard, MegaNovelSnapshot } from '../publishing/meganovel-contracts.js';
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { vi.restoreAllMocks(); cdp.connect.mockReset(); for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -220,7 +220,7 @@ it.each(['language', 'closure', 'styleGuide'] as const)('rejects %s changing whi
   const events = new EventEmitter();
   let connected = true, inFinalGuard = false, snapshotReads = 0, changed = false;
   let retained: { job: ScheduledChapter; packageId: string; remoteChapterId: string; revisionId: string } | undefined;
-  const submissionAuthorizations: MockInstance<() => void>[] = [];
+  const submissionAuthorizations: MockInstance<NonNullable<MegaNovelMutationGuard['authorizeSubmission']>>[] = [];
   const page = Object.assign(dom.page, {isClosed: () => false,
     setDefaultTimeout: vi.fn(), setDefaultNavigationTimeout: vi.fn()});
   const context = { pages: () => [page], newCDPSession: async () => ({
@@ -342,3 +342,151 @@ it.each(['language', 'closure', 'styleGuide'] as const)('rejects %s changing whi
     reviewCalls: f.pipeline.reviewChapter.mock.calls.length,
   } }));
 });
+
+it.each(['registered chapter revision', 'unregistered body edit'] as const)(
+  'rejects %s completed during the final asynchronous snapshot read', async kind => {
+    const f = await setup();
+    const revisedContent = 'The author revised this retained chapter during the last asynchronous snapshot read.\n';
+    const dom = domFixture(); dom.state.title = 'Scene'; dom.state.body = content;
+    const events = new EventEmitter();
+    let connected = true, inFinalGuard = false, snapshotReads = 0, changed = false;
+    let editCompleted = false, editCompletedAtAuthorization = false;
+    let retained: { job: ScheduledChapter; packageId: string; remoteChapterId: string; revisionId: string } | undefined;
+    const submissionAuthorizations: MockInstance<NonNullable<MegaNovelMutationGuard['authorizeSubmission']>>[] = [];
+    const page = Object.assign(dom.page, { isClosed: () => false,
+      setDefaultTimeout: vi.fn(), setDefaultNavigationTimeout: vi.fn() });
+    const context = { pages: () => [page], newCDPSession: async () => ({
+      send: async () => ({ targetInfo: { targetId: scope.sessionId } }), detach: vi.fn() }) };
+    cdp.connect.mockResolvedValue({ once: events.once.bind(events),
+      close: vi.fn(async () => { connected = false; events.emit('disconnected'); }),
+      isConnected: () => connected, contexts: () => [context] });
+    const originalCreate = f.browser.createDraft;
+    const originalSubmit = f.browser.submit;
+    const binding: MegaNovelDomBinding = { protocol: 'inkos-meganovel-dom-v1',
+      calibration: { observedAt: '2026-10-06T00:00:00Z', evidence: 'Offline retained revision boundary fixture only.' },
+      probe: vi.fn(async () => ({ scope, origin: 'https://www.meganovel.com' as const, blocker: 'none' as const })),
+      snapshot: vi.fn(async () => structuredClone(f.snapshot)),
+      createDraft: vi.fn(async (_page, input, signal, beforeMutation) => originalCreate(input, { signal, beforeMutation })),
+      submit: vi.fn(async (_page, input, signal, beforeMutation) => {
+        if (!beforeMutation?.authorizeSubmission) throw new Error('Final submit requires the forwarded synchronous authority guard.');
+        const authorize = beforeMutation.authorizeSubmission;
+        submissionAuthorizations.push(vi.spyOn(beforeMutation, 'authorizeSubmission').mockImplementation(submission => {
+          editCompletedAtAuthorization = editCompleted;
+          authorize(submission);
+        }));
+        inFinalGuard = true;
+        try { await dom.binding.submit(dom.page, input, signal, beforeMutation); }
+        finally { inFinalGuard = false; }
+        await originalSubmit(input, { signal });
+      }),
+    };
+    readBoundary.hook = async path => {
+      if (!inFinalGuard || !dom.state.now || changed || !String(path).includes('/revisions/') || !String(path).endsWith('.md')) return;
+      snapshotReads++;
+      // Read old snapshot bytes, then complete the edit before that final async read returns.
+      // The production DOM's synchronous authorization must observe this completed change.
+      if (snapshotReads === 2) {
+        const pkg = f.store.listPackages()[0]!;
+        const run = f.store.getMegaNovelRun(pkg.manifest.id, 1)!;
+        expect(run.remoteChapterId).toBe('102');
+        retained = { job: structuredClone(f.latest()), packageId: pkg.manifest.id,
+          remoteChapterId: run.remoteChapterId!, revisionId: run.revisionId };
+        changed = true;
+        if (kind === 'registered chapter revision') {
+          await syncWorkSourceArtifacts({ projectRoot: f.root, workId: 'book', accept: true,
+            writes: [{ relativePath: sourcePath, content: revisedContent }] });
+        } else await writeFile(join(f.root, sourcePath), revisedContent);
+        editCompleted = true;
+      }
+    };
+    const port = await connectMegaNovelCdpPort({ endpointURL: 'ws://127.0.0.1:9222/devtools/browser/offline',
+      scope, lockDirectory: join(f.root, 'offline-cdp-locks'), operationTimeoutMs: 5000,
+      authorization: { automation: { provenance: 'user_reported', reference: 'Offline fixture' },
+        aiAssistedContent: { provenance: 'user_reported', reference: 'Offline fixture' } } }, binding);
+    cleanups.push(() => port.close());
+    f.browser.probe = vi.fn((input, options) => port.probe(input, options));
+    f.browser.snapshot = vi.fn((input, options) => port.snapshot(input, options));
+    f.browser.createDraft = vi.fn((input, options) => port.createDraft(input, options));
+    f.browser.submit = vi.fn((input, options) => port.submit(input, options));
+
+    const result = await f.run(f.job);
+    const currentChapter = async () => {
+      const manifest = await loadWorkManifest(f.root, 'book');
+      const revisions = manifest.artifacts.flatMap(artifact => artifact.revisions.filter(revision =>
+        revision.id === artifact.currentRevisionId && revision.path.endsWith('0001_Scene.md')));
+      expect(revisions).toHaveLength(1);
+      const revision = revisions[0]!;
+      expect(revision.snapshotPath).toBeTruthy();
+      return { revisionId: revision.id, source: await readFile(join(f.root, sourcePath), 'utf8'),
+        snapshot: await readFile(join(f.root, 'works/book', revision.snapshotPath!), 'utf8') };
+    };
+    const current = await currentChapter();
+    const authorityStillMatches = sameChapterReviewInputs(retained?.job.reviewReceipt?.inputs, await f.capture());
+    console.log(JSON.stringify({ kind, changed, snapshotReads, editCompleted, editCompletedAtAuthorization,
+      phase: result.phase, originalRevision: retained?.revisionId, currentRevision: current.revisionId,
+      authorityStillMatches, receiptPolicy: retained?.job.reviewReceipt?.reviewPolicy,
+      currentPolicy: await f.capturePolicy(), confirmClicks: dom.state.publishes,
+      actualSubmissions: vi.mocked(originalSubmit).mock.calls.length, remoteStatus: f.snapshot.candidates[0]?.status }));
+    expect(changed).toBe(true);
+    expect(snapshotReads).toBe(2);
+    expect(retained).toBeDefined();
+    expect(editCompleted).toBe(true);
+    expect(editCompletedAtAuthorization).toBe(true);
+    expect(submissionAuthorizations).toHaveLength(1);
+    expect(submissionAuthorizations[0]).toHaveBeenCalledOnce();
+    expect(authorityStillMatches).toBe(true);
+    expect(await f.capturePolicy()).toEqual(retained!.job.reviewReceipt!.reviewPolicy);
+    expect(current.source).toBe(revisedContent);
+    if (kind === 'registered chapter revision') {
+      expect(current.revisionId).not.toBe(retained!.revisionId);
+      expect(current.snapshot).toBe(revisedContent);
+    } else {
+      expect(current.revisionId).toBe(retained!.revisionId);
+      expect(current.snapshot).toBe(content);
+    }
+    expect(dom.state.publishes).toBe(0);
+    expect(originalSubmit).not.toHaveBeenCalled();
+    expect(result.revisionId).toBe(retained!.revisionId);
+    expect(result.publicationStartedAt).toBe(retained!.job.publicationStartedAt);
+    expect(result.publication).toEqual(retained!.job.publication);
+    expect(result.reviewChecks).toBe(retained!.job.reviewChecks);
+    expect(result.reviewAttempts).toBe(retained!.job.reviewAttempts);
+    expect(result.reviewUnavailableChecks).toBe(retained!.job.reviewUnavailableChecks);
+    expect(f.latest()).toEqual(result);
+    const expectFrozenDraft = () => {
+      expect(originalCreate).toHaveBeenCalledOnce();
+      expect(originalSubmit).not.toHaveBeenCalled();
+      expect(dom.state.publishes).toBe(0);
+      expect(f.snapshot.candidates).toHaveLength(1);
+      expect(f.snapshot.candidates[0]).toMatchObject({ remoteChapterId: retained!.remoteChapterId,
+        status: 'draft', content });
+      expect(f.store.listPackages()).toHaveLength(1);
+      expect(f.store.listPackages()[0]!.manifest.id).toBe(retained!.packageId);
+      expect(f.store.listPackages()[0]!.manifest.chapters[0]!.revisionId).toBe(retained!.revisionId);
+      expect(f.store.getMegaNovelRun(retained!.packageId, 1)).toMatchObject({ phase: 'draft',
+        remoteChapterId: retained!.remoteChapterId, revisionId: retained!.revisionId });
+    };
+    expectFrozenDraft();
+
+    await f.restart();
+    expect(f.latest()).toEqual(result);
+    const resumed = await f.run(f.latest());
+    // A newly reviewed revision cannot authorize the older frozen package.
+    // An unregistered body edit must remain available for explicit reconciliation.
+    expectFrozenDraft();
+    expect(await currentChapter()).toEqual(current);
+    expect(resumed.publicationStartedAt).toBe(retained!.job.publicationStartedAt);
+    expect(resumed.publication).toEqual(retained!.job.publication);
+    expect(resumed.reviewChecks ?? 0).toBeGreaterThanOrEqual(retained!.job.reviewChecks ?? 0);
+    expect(resumed.reviewAttempts).toBe(retained!.job.reviewAttempts);
+    expect(resumed.reviewUnavailableChecks).toBe(retained!.job.reviewUnavailableChecks);
+    expect(f.pipeline.writeChapters).not.toHaveBeenCalled();
+    expect(f.pipeline.reviseDraft).not.toHaveBeenCalled();
+    console.log(JSON.stringify({ kind, afterRestart: { phase: resumed.phase,
+      schedulerRevision: resumed.revisionId, currentRevision: current.revisionId,
+      originalPackageId: retained!.packageId, packageCount: f.store.listPackages().length,
+      remoteChapterId: f.snapshot.candidates[0]?.remoteChapterId,
+      confirmClicks: dom.state.publishes, actualSubmissions: vi.mocked(originalSubmit).mock.calls.length,
+      draftCalls: vi.mocked(originalCreate).mock.calls.length, reviewChecks: resumed.reviewChecks,
+      reviewAttempts: resumed.reviewAttempts } }));
+  });

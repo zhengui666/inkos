@@ -261,7 +261,7 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       await verifyScheduleDialog(scheduleTitle, [now, later, confirm, cancel]);
       signal.throwIfAborted();
       await guard();
-      try { beforeMutation?.authorizeSubmission?.(); signal.throwIfAborted(); }
+      try { beforeMutation?.authorizeSubmission?.(input); signal.throwIfAborted(); }
       catch (error) { throw new MegaNovelSubmissionBlockedError(error); }
       // Authorization and issuing this request share a host call stack. Remote
       // execution is asynchronous; filesystem writes and DOM are not atomic.

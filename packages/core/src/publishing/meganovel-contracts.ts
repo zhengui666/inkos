@@ -59,10 +59,11 @@ export class MegaNovelSubmissionBlockedError extends Error {
     if (typeof (cause as {code?: unknown} | null)?.code === 'string') this.code = (cause as {code: string}).code;
   }
 }
+export type MegaNovelSubmission = MegaNovelIntent & {remoteChapterId: string; title: string; content: string; revisionId: string};
 export interface MegaNovelMutationGuard {
   (): Promise<void>;
   /** Call synchronously immediately before issuing Confirm, without another await. */
-  authorizeSubmission?: () => void;
+  authorizeSubmission?: (submission: MegaNovelSubmission) => void;
 }
 export interface MegaNovelObservationPort {
   probe(scope: MegaNovelScope, options?: MegaNovelBrowserOptions): Promise<MegaNovelProbe>;
@@ -73,7 +74,7 @@ export interface MegaNovelBrowserOptions {
   /** Recheck local authority after async preflight, immediately before each editor effect. */
   beforeMutation?: () => Promise<void>;
   /** Synchronous authorization of the frozen attempt at the final action boundary. */
-  authorizeSubmission?: () => void;
+  authorizeSubmission?: (submission: MegaNovelSubmission) => void;
 }
 
 /** Browser paragraph text may omit the document's final newline. No prose or internal spacing is changed. */
@@ -90,5 +91,5 @@ export interface MegaNovelBrowserPort {
   /** Recheck scope/blockers immediately before typing: editor input can autosave. No internal retries. */
   createDraft(input: MegaNovelIntent & {title: string; content: string; revisionId: string}, options?: MegaNovelBrowserOptions): Promise<void>;
   /** Check exact draft/title/body and truthful AI disclosure immediately before final action. */
-  submit(input: MegaNovelIntent & {remoteChapterId: string; title: string; content: string; revisionId: string}, options?: MegaNovelBrowserOptions): Promise<void>;
+  submit(input: MegaNovelSubmission, options?: MegaNovelBrowserOptions): Promise<void>;
 }
