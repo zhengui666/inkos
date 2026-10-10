@@ -2,21 +2,22 @@ import { ApiResponseError, fetchJson } from "./use-api";
 import type { SaveIntent, SelectionIntent, TargetView, TextView, ConnectionIntent } from "../components/agent-configuration-ui/view-model";
 import { sameTarget } from "../components/agent-configuration-ui/view-model";
 import { toPreferences } from "../pages/agent-configuration-adapter";
-import { samePreferences, validScope, type AgentSettings, type HarnessId, type HarnessPreferences, type HarnessState, type SettingsUpdate } from "../shared/agent-configuration";
+import { samePreferences, validScope, type AgentSettings, type HarnessId, type HarnessPreferences, type HarnessState, type SettingsUpdate, type DeviceLoginAttemptReservation, type DeviceLoginAttemptCloseResult } from "../shared/agent-configuration";
 import type { StudioCodexLogin } from "../shared/codex";
 
 export interface AgentConfigurationTransport {
   readSettings(signal: AbortSignal): Promise<AgentSettings>;
   saveSettings(request: SettingsUpdate, signal: AbortSignal): Promise<AgentSettings>;
   readHarnessState(harness: HarnessId, signal: AbortSignal): Promise<HarnessState>;
-  startLogin?(signal: AbortSignal): Promise<StudioCodexLogin>;
-  cancelLogin?(loginId: string, signal: AbortSignal): Promise<void>;
+  reserveLogin?(signal: AbortSignal): Promise<DeviceLoginAttemptReservation>;
+  startLogin?(attemptHandle: string, signal: AbortSignal): Promise<StudioCodexLogin>;
+  closeLogin?(attemptHandle: string, signal: AbortSignal): Promise<DeviceLoginAttemptCloseResult>;
   logout?(signal: AbortSignal): Promise<void>;
   bindConnection?(expectedRevision: number, signal: AbortSignal): Promise<AgentSettings>;
 }
 export function createAgentConfigurationTransport(fetchImpl?: typeof fetch): AgentConfigurationTransport {
-  const post = <T>(action: string, body: unknown, signal: AbortSignal) => fetchJson<T>(`/agent-configuration/harnesses/codex/${action}`, {
-    method: "POST", signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  const post = <T>(action: string, body: unknown, signal: AbortSignal, keepalive = false) => fetchJson<T>(`/agent-configuration/harnesses/codex/${action}`, {
+    method: "POST", signal, keepalive, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   }, { fetchImpl });
   return {
     readSettings: async signal => (await fetchJson<{ settings: AgentSettings }>("/agent-configuration/settings", { signal }, { fetchImpl })).settings,
@@ -24,8 +25,9 @@ export function createAgentConfigurationTransport(fetchImpl?: typeof fetch): Age
       method: "PUT", signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(request),
     }, { fetchImpl })).settings,
     readHarnessState: async (harness, signal) => (await fetchJson<{ state: HarnessState }>(`/agent-configuration/harnesses/${harness}/state`, { signal }, { fetchImpl })).state,
-    startLogin: async signal => (await post<{ login: StudioCodexLogin }>("login", {}, signal)).login,
-    cancelLogin: async (loginId, signal) => { await post("login/cancel", { loginId }, signal); },
+    reserveLogin: async signal => (await post<{ reservation: DeviceLoginAttemptReservation }>("login/reserve", {}, signal)).reservation,
+    startLogin: async (attemptHandle, signal) => (await post<{ login: StudioCodexLogin }>("login", { attemptHandle }, signal)).login,
+    closeLogin: async (attemptHandle, signal) => (await post<{ result: DeviceLoginAttemptCloseResult }>("login/close", { attemptHandle }, signal, true)).result,
     logout: async signal => { await post("logout", {}, signal); },
     bindConnection: async (expectedRevision, signal) => (await post<{ settings: AgentSettings }>("bind", { expectedRevision }, signal)).settings,
   };
@@ -57,6 +59,8 @@ export interface AgentConfigurationSnapshot {
   readonly reviewable: boolean;
   readonly authBusy: "login" | "cancel" | "logout" | "bind" | null;
   readonly authDetail?: TextView;
+  readonly authCloseResult?: DeviceLoginAttemptCloseResult;
+  readonly canCloseConnection: boolean;
 }
 class RequestTimeout extends Error {}
 const key = (target: TargetView) => JSON.stringify([target.harness, target.contextKey]);
@@ -72,6 +76,31 @@ function describePreferences(value: HarnessPreferences, isZh: boolean) {
   const native = isZh ? "原生默认" : "Native default";
   return isZh ? `模型 ${value.model ?? native}，推理强度 ${value.effort ?? native}，速度 ${value.speed ?? native}`
     : `Model ${value.model ?? native}, reasoning ${value.effort ?? native}, speed ${value.speed ?? native}`;
+}
+
+interface LoginAttempt {
+  readonly target: TargetView;
+  reservation?: DeviceLoginAttemptReservation;
+  loginId?: string;
+  started: boolean;
+  detached: boolean;
+  closeRequested: boolean;
+  closeToken?: { readonly lifetime: number; readonly target: TargetView; readonly ownerGeneration: number | null };
+  closePromise?: Promise<void>;
+  closeResult?: DeviceLoginAttemptCloseResult;
+  closeUncertain?: boolean;
+}
+// In-memory correlation only. Returning to this transport can settle a known attempt;
+// no observed login ID is promoted into authority and nothing is persisted in the browser.
+const knownAttempts = new WeakMap<AgentConfigurationTransport, Map<string, LoginAttempt>>();
+function closeDescription(result: DeviceLoginAttemptCloseResult): TextView {
+  if (result.state === "already-terminal") return { zh: "本次登录已完成结算，可能已登录；Close 不会退出账号。请核对连接状态。执行尚未验证。", en: "This sign-in is already terminal and may be signed in. Close does not sign out. Check connection status; execution remains unverified." };
+  if (result.state === "unknown-or-expired") return { zh: "本次尝试标识未知或已过期；无法确认取消结果。执行尚未验证。", en: "This attempt is unknown or expired; cancellation cannot be confirmed. Execution remains unverified." };
+  if (result.state === "superseded") return { zh: "本次尝试已被替代；不会取消新的登录。执行尚未验证。", en: "This attempt was superseded. A newer sign-in will not be cancelled. Execution remains unverified." };
+  if (result.cleanup === "unconfirmed") return { zh: "本次尝试已关闭；提供方清理尚未确认。可再次核对同一尝试。执行尚未验证。", en: "This attempt is closed; provider cleanup is unconfirmed. You can check the same attempt again. Execution remains unverified." };
+  if (result.cleanup === "cancel-acknowledged") return { zh: "提供方已确认取消本次登录。执行尚未验证。", en: "The provider acknowledged cancellation of this sign-in. Execution remains unverified." };
+  return result.cleanup === "not-started" ? { zh: "本次尝试已关闭，未启动提供方登录。执行尚未验证。", en: "This attempt is closed; provider sign-in was not started. Execution remains unverified." }
+    : { zh: "本次尝试已关闭；提供方清理不适用。执行尚未验证。", en: "This attempt is closed; provider cleanup is not applicable. Execution remains unverified." };
 }
 
 export function createAgentConfigurationController(transport: AgentConfigurationTransport, initialTarget?: TargetView, timeoutMs = 15_000) {
@@ -92,8 +121,18 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   let saveEpoch = 0;
   let entryEdits = 0;
   let authDetail: TextView | undefined;
-  type AuthenticationOperation = { action: "login" | "cancel" | "logout" | "bind"; token: ReturnType<typeof capture>; closeRequested: boolean;
-    loginId?: string; cancelReturnedLogin?: (id: string) => Promise<void>; cancellation?: Promise<void>; reconciliation?: Promise<void> };
+  let authCloseResult: DeviceLoginAttemptCloseResult | undefined;
+  type AuthenticationOperation = { action: "login" | "logout" | "bind"; token: ReturnType<typeof capture>; closeRequested: boolean; attempt?: LoginAttempt };
+  let closing: { attempt: LoginAttempt; token: ReturnType<typeof capture> } | null = null;
+  const attempts = knownAttempts.get(transport) ?? new Map<string, LoginAttempt>();
+  knownAttempts.set(transport, attempts);
+  const knownAttempt = () => authentication?.attempt ?? attempts.get(key(target));
+  function canCloseAttempt(attempt: LoginAttempt | undefined) {
+    if (!attempt || !sameTarget(attempt.target, target)) return false;
+    const observed = state?.connection?.login;
+    if (attempt.loginId && observed && observed.loginId !== attempt.loginId) return false;
+    return !attempt.closeResult || attempt.closeUncertain || attempt.closeResult.cleanup === "unconfirmed";
+  }
   let authentication: AuthenticationOperation | null = null;
   const drafts = new Map<string, Draft>();
   const listeners = new Set<() => void>();
@@ -101,25 +140,26 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   const draft = (): Draft => drafts.get(key(target)) ?? { preferences: baseline?.harnessPreferences[target.harness] ?? empty(), baselineRevision: baseline?.revision ?? null, edits: 0, dirty: false };
   let snapshot: AgentConfigurationSnapshot;
   function publish() {
-    const current = draft();
+    const currentDraft = draft();
     // A read or confirmed save for another target cannot rebase this target's edits.
-    if (current.dirty && baseline && current.baselineRevision !== baseline.revision && !["saving", "uncertain"].includes(savePhase)) {
+    if (currentDraft.dirty && baseline && currentDraft.baselineRevision !== baseline.revision && !["saving", "uncertain"].includes(savePhase)) {
       savePhase = "conflict"; reviewable = true; detail = changed;
     }
-    if (current.contextConflict && savePhase !== "saving") {
+    if (currentDraft.contextConflict && savePhase !== "saving") {
       if (savePhase !== "uncertain") { savePhase = "conflict"; reviewable = baseline !== null; }
       detail = {
-        zh: `当前入口草稿：${describePreferences(current.preferences, true)}。保留的上下文草稿：${current.retained?.map(value => describePreferences(value.preferences, true)).join("；")}。草稿未合并；请核对当前入口草稿后再保存。${savePhase === "uncertain" ? uncertain.zh : ""}`,
-        en: `Current entry draft: ${describePreferences(current.preferences, false)}. Retained context drafts: ${current.retained?.map(value => describePreferences(value.preferences, false)).join("; ")}. Drafts remain separate; review the current entry draft before saving. ${savePhase === "uncertain" ? uncertain.en : ""}`,
+        zh: `当前入口草稿：${describePreferences(currentDraft.preferences, true)}。保留的上下文草稿：${currentDraft.retained?.map(value => describePreferences(value.preferences, true)).join("；")}。草稿未合并；请核对当前入口草稿后再保存。${savePhase === "uncertain" ? uncertain.zh : ""}`,
+        en: `Current entry draft: ${describePreferences(currentDraft.preferences, false)}. Retained context drafts: ${currentDraft.retained?.map(value => describePreferences(value.preferences, false)).join("; ")}. Drafts remain separate; review the current entry draft before saving. ${savePhase === "uncertain" ? uncertain.en : ""}`,
       };
     }
-    const hasChanges = baseline !== null && (baseline.selectedHarnessId !== target.harness || !samePreferences(current.preferences, baseline.harnessPreferences[target.harness]));
-    snapshot = Object.freeze({ target, ownerGeneration, baseline, revision: current.baselineRevision, draft: current.preferences, retainedDrafts: current.retained ?? Object.freeze([]), state, submitted, loading, savePhase, detail, hasChanges, reviewable,
-      authBusy: authentication?.action ?? null, authDetail,
-      canSave: baseline !== null && current.baselineRevision !== null && !["saving", "conflict", "uncertain"].includes(savePhase) });
+    const hasChanges = baseline !== null && (baseline.selectedHarnessId !== target.harness || !samePreferences(currentDraft.preferences, baseline.harnessPreferences[target.harness]));
+    snapshot = Object.freeze({ target, ownerGeneration, baseline, revision: currentDraft.baselineRevision, draft: currentDraft.preferences, retainedDrafts: currentDraft.retained ?? Object.freeze([]), state, submitted, loading, savePhase, detail, hasChanges, reviewable,
+      authBusy: closing && current(closing.token) ? "cancel" : authentication?.action ?? null, authDetail, authCloseResult, canCloseConnection: canCloseAttempt(knownAttempt()),
+      canSave: baseline !== null && currentDraft.baselineRevision !== null && !["saving", "conflict", "uncertain"].includes(savePhase) });
     for (const listener of listeners) listener();
   }
   function invalidate() {
+    if (authentication?.attempt) authentication.attempt.detached = true;
     lifetime++; readEpoch++; stateEpoch++; saveEpoch++;
     for (const request of requests) request.abort();
     if (savePhase === "saving") { savePhase = "uncertain"; detail = uncertain; reviewable = false; }
@@ -130,9 +170,9 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   function current(token: ReturnType<typeof capture>) {
     return !disposed && token.lifetime === lifetime && sameTarget(token.target, target) && token.ownerGeneration === ownerGeneration;
   }
-  async function request<T>(run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  async function request<T>(run: (signal: AbortSignal) => Promise<T>, independent = false): Promise<T> {
     const controller = new AbortController();
-    requests.add(controller);
+    if (!independent) requests.add(controller);
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([Promise.resolve().then(() => run(controller.signal)), new Promise<never>((_, reject) => {
@@ -209,7 +249,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     followSavedHarness = false;
     if (disposed || sameTarget(target, next)) return;
     invalidate(); target = Object.freeze({ ...next }); ownerGeneration = null; state = null;
-    authDetail = undefined;
+    authDetail = undefined; authCloseResult = undefined;
     submitted = null;
     const currentDraft = draft();
     if (baseline && !currentDraft.dirty && !currentDraft.contextConflict) drafts.set(key(target), { ...currentDraft, preferences: baseline.harnessPreferences[target.harness], baselineRevision: baseline.revision });
@@ -272,40 +312,76 @@ export function createAgentConfigurationController(transport: AgentConfiguration
       savePhase = "unsaved"; detail = undefined; publish();
     }
   }
-  async function accountAction(action: "login" | "cancel" | "logout", loginId?: string) {
-    if (disposed || authentication || target.harness !== "codex") return;
-    if (!transport.startLogin || !transport.cancelLogin || !transport.logout) {
+  async function settleClose(attempt: LoginAttempt, reconcile = false) {
+    if (!reconcile && (attempt.closeResult || attempt.closeUncertain)) return;
+    if (attempt.closePromise || !attempt.reservation || !transport.closeLogin) return attempt.closePromise;
+    const handle = attempt.reservation.attemptHandle;
+    const token = attempt.closeToken ?? { ...capture(), target: attempt.target };
+    const operation = { attempt, token };
+    if (current(token)) closing = operation;
+    if (current(token)) {
+      stateEpoch++; state = null; authCloseResult = undefined;
+      authDetail = { zh: "正在结算本次关闭请求…", en: "Settling Close for this attempt…" }; publish();
+    }
+    // Close owns its deadline and signal. Navigation may abort reads/reserve/start,
+    // but cannot withdraw an explicit settlement once its handle is known.
+    attempt.closePromise = request(signal => transport.closeLogin!(handle, signal), true).then(async result => {
+      if (result.attemptHandle !== handle) throw new Error("Close returned a different attempt");
+      attempt.closeResult = Object.freeze({ ...result }); attempt.closeUncertain = false;
+      if (!current(token) || attempts.get(key(attempt.target)) !== attempt) return;
+      authCloseResult = attempt.closeResult; authDetail = closeDescription(result); publish();
+      await refreshState();
+    }).catch(() => {
+      attempt.closeUncertain = true;
+      if (current(token) && attempts.get(key(attempt.target)) === attempt) {
+        authCloseResult = undefined;
+        authDetail = { zh: "Close 结果不确定；可再次核对同一尝试。不会自动登录或退出账号。执行尚未验证。", en: "Close outcome is uncertain. Check the same attempt again; sign-in and logout will not be replayed automatically. Execution remains unverified." }; publish();
+      }
+    }).finally(() => { attempt.closePromise = undefined; if (closing === operation) closing = null; publish(); });
+    return attempt.closePromise;
+  }
+  async function accountAction(action: "login" | "logout") {
+    if (disposed || authentication || (closing && current(closing.token)) || target.harness !== "codex") return;
+    if ((action === "login" && (!transport.reserveLogin || !transport.startLogin || !transport.closeLogin)) || (action === "logout" && !transport.logout)) {
       authDetail = { zh: "认证接口不可用，请核对连接状态。", en: "Authentication endpoints are unavailable. Check connection status." }; publish(); return;
     }
     invalidate(); state = null; ownerGeneration = null;
-    const operation: AuthenticationOperation = { action, token: capture(), closeRequested: false };
-    authentication = operation; authDetail = undefined; publish();
-    const cancelClosedLogin = (id: string) => operation.cancellation ??= request(signal => transport.cancelLogin!(id, signal));
-    operation.cancelReturnedLogin = cancelClosedLogin;
+    const attempt: LoginAttempt | undefined = action === "login" ? { target, started: false, detached: false, closeRequested: false } : undefined;
+    const operation: AuthenticationOperation = { action, token: capture(), closeRequested: false, attempt };
+    authentication = operation; authDetail = undefined; authCloseResult = undefined; publish();
     try {
-      if (action === "login") {
-        const login = await request(signal => {
-          const pending = transport.startLogin!(signal);
-          // Explicit Close can outlive an aborted/timed-out HTTP response. Cancel only its returned attempt.
+      if (attempt) {
+        const reservation = await request(signal => {
+          const pending = transport.reserveLogin!(signal);
+          // A late reserve response can settle a recorded Close, but cannot start
+          // after timeout, navigation, disposal or replacement by a newer attempt.
           void pending.then(value => {
-            operation.loginId = value.loginId;
-            if (operation.closeRequested) void cancelClosedLogin(value.loginId).catch(() => undefined);
+            attempt.reservation = value;
+            if (attempt.closeRequested) {
+              if ((authentication === operation && !attempt.detached) || !attempts.has(key(attempt.target)) || attempts.get(key(attempt.target)) === attempt) attempts.set(key(attempt.target), attempt);
+              void settleClose(attempt);
+            }
           }, () => undefined);
           return pending;
         });
-        if (operation.closeRequested) await cancelClosedLogin(login.loginId);
-      } else if (action === "cancel") await request(signal => transport.cancelLogin!(loginId!, signal));
-      else await request(signal => transport.logout!(signal));
+        attempt.reservation = reservation;
+        if (attempt.closeRequested) { await settleClose(attempt); return; }
+        if (attempt.detached || !current(operation.token) || authentication !== operation) return;
+        attempts.set(key(attempt.target), attempt);
+        attempt.started = true;
+        const login = await request(signal => transport.startLogin!(reservation.attemptHandle, signal));
+        attempt.loginId = login.loginId;
+        if (attempt.closeRequested) { await settleClose(attempt); return; }
+      } else await request(signal => transport.logout!(signal));
       if (!current(operation.token) || authentication !== operation) return;
       authDetail = { zh: "操作已返回，请以当前连接观察为准。执行仍尚未验证。", en: "The operation returned. Check the current connection observation; execution remains unverified." };
       await refreshState();
-      if (operation.reconciliation) await operation.reconciliation;
     } catch {
-      if (current(operation.token) && authentication === operation) {
+      if (current(operation.token) && authentication === operation && !attempt?.closeRequested) {
         authDetail = { zh: "认证操作结果不确定，请核对当前状态；不会自动重新登录。", en: "Authentication outcome is uncertain. Check current status; sign-in will not be replayed automatically." };
         await refreshState();
       }
-    } finally { if (authentication === operation) authentication = null; publish(); }
+    } finally { if (attempt) attempt.detached = true; if (authentication === operation) authentication = null; publish(); }
   }
   async function bindConnection() {
     if (disposed || authentication || target.harness !== "codex" || !transport.bindConnection || !snapshot.canSave || !baseline
@@ -339,29 +415,22 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     if (target.harness !== "codex") return;
     if (intent.action === "connect" && ["signed-out", "failed"].includes(state?.connection?.phase ?? "")) void accountAction("login");
     if (intent.action === "sign-out" && state?.account?.type === "chatgpt") void accountAction("logout");
-    if (intent.action === "cancel-sign-in" && state?.connection?.login?.status === "pending" && state.connection.login.loginId === intent.attemptKey) void accountAction("cancel", intent.attemptKey);
+    if (intent.action === "cancel-sign-in" && state?.connection?.login?.status === "pending" && state.connection.login.loginId === intent.attemptKey) closeConnection();
   }
   function closeConnection() {
-    if (authentication?.action === "login") {
-      const operation = authentication;
-      operation.closeRequested = true;
-      authDetail = { zh: "关闭请求已记录；收到本次登录标识后将取消此尝试。", en: "Close requested. This attempt will be cancelled when its sign-in ID is returned." }; publish();
-      if (operation.loginId && operation.cancelReturnedLogin && !operation.reconciliation) {
-        // The ID may already have returned while the earlier observation is still in flight.
-        // Fence that read and reconcile only this explicit Close, retaining the target token.
-        stateEpoch++; state = null;
-        operation.reconciliation = operation.cancelReturnedLogin(operation.loginId).then(async () => {
-          if (!current(operation.token) || (authentication !== operation && authentication !== null)) return;
-          authDetail = { zh: "取消请求已返回，请核对当前连接状态。", en: "Cancellation returned. Check the current connection state." };
-          await refreshState();
-        }).catch(() => {
-          if (current(operation.token) && (authentication === operation || authentication === null)) {
-            authDetail = { zh: "取消结果不确定，请核对当前连接状态。", en: "Cancellation outcome is uncertain. Check the current connection state." }; publish();
-          }
-        });
-        publish();
-      }
-    } else if (state?.connection?.login?.status === "pending") void accountAction("cancel", state.connection.login.loginId);
+    if (disposed || target.harness !== "codex") return;
+    const attempt = knownAttempt();
+    if (!canCloseAttempt(attempt) || !attempt) {
+      authDetail = { zh: "当前页面没有本次尝试的已知标识；无法确认关闭，请刷新连接状态。", en: "This page has no known handle for this attempt. Close cannot be confirmed; refresh connection status." }; publish(); return;
+    }
+    attempt.closeRequested = true; attempt.closeToken = capture();
+    if (!attempt.reservation) {
+      authDetail = { zh: "关闭请求已记录；收到本次标识后仅关闭，不启动登录。", en: "Close requested. If this attempt's handle returns, it will only be closed; sign-in will not start." }; publish(); return;
+    }
+    // The handle is retained before starting so a lost start response never
+    // forces cancellation to depend on a subsequently returned provider ID.
+    attempts.set(key(attempt.target), attempt);
+    void settleClose(attempt, true);
   }
   publish();
   return {

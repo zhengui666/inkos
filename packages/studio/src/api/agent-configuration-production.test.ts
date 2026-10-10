@@ -8,6 +8,8 @@ import {
   type CodexClient, type CodexAccountService,
 } from "@actalk/inkos-core";
 import { createStudioServer, shutdownStudioServer } from "./server.js";
+import type { DeviceLoginAttemptService } from "./agent-configuration.js";
+import type { DeviceLoginAttemptCloseResult } from "../shared/agent-configuration";
 import { createAgentConfigurationController, createAgentConfigurationTransport } from "../hooks/agent-configuration-controller";
 import { adaptAgentConfiguration, toSelection } from "../pages/agent-configuration-adapter";
 
@@ -67,12 +69,52 @@ const post = (body: unknown = {}) => ({ method: "POST", headers: { "Content-Type
 const put = (body: unknown) => ({ ...post(body), method: "PUT" });
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done; }); return { promise, resolve }; }
 
-describe("mounted Studio configuration → public Core bridge (protocol fixture)", () => {
+/** Offline contract injection only. New Core attempt management must be re-tested after its import. */
+function installAttemptContractFixture(service: CodexAccountService) {
+  const start = service.startDeviceLogin.bind(service), cancel = service.cancelLogin.bind(service);
+  const attempts = new Map<string, { expiresAt: number; closed: boolean; loginId?: string;
+    pending?: ReturnType<typeof start>; cleanup?: Promise<void> }>();
+  let nextHandle = 0;
+  const fixture: DeviceLoginAttemptService = {
+    reserveDeviceLoginAttempt() {
+      const attemptHandle = `fixture-attempt-${++nextHandle}`, expiresAt = Date.now() + 60_000;
+      attempts.set(attemptHandle, { expiresAt, closed: false });
+      return { attemptHandle, expiresAt };
+    },
+    startDeviceLogin({ attemptHandle }) {
+      const attempt = attempts.get(attemptHandle);
+      if (!attempt || attempt.closed || attempt.expiresAt <= Date.now()) return Promise.reject(new Error("The fixture attempt is no longer startable"));
+      attempt.pending ??= start().then(async login => {
+        attempt.loginId = login.loginId;
+        if (attempt.closed) { attempt.cleanup ??= cancel(login.loginId); await attempt.cleanup; }
+        return login;
+      });
+      return attempt.pending;
+    },
+    async closeDeviceLoginAttempt(attemptHandle): Promise<DeviceLoginAttemptCloseResult> {
+      const attempt = attempts.get(attemptHandle);
+      if (!attempt || attempt.expiresAt <= Date.now()) return { attemptHandle, state: "unknown-or-expired", cleanup: "not-applicable" };
+      const repeated = attempt.closed; attempt.closed = true;
+      if (!attempt.pending) return { attemptHandle, state: repeated ? "already-terminal" : "closed", cleanup: "not-started" };
+      if (!attempt.loginId) {
+        // Fence immediately; the pending fixture start performs its exact-ID cleanup when it resolves.
+        return { attemptHandle, state: repeated ? "already-terminal" : "closed", cleanup: "unconfirmed" };
+      }
+      attempt.cleanup ??= cancel(attempt.loginId);
+      try { await attempt.cleanup; return { attemptHandle, state: repeated ? "already-terminal" : "closed", cleanup: "cancel-acknowledged" }; }
+      catch { return { attemptHandle, state: "closed", cleanup: "unconfirmed" }; }
+    },
+  };
+  Object.assign(service, fixture); // Same injected service object; production code never supplies this shim.
+}
+
+describe("mounted Studio public Core configuration + offline future-attempt contract fixture", () => {
   let root: string;
   let peer: ProtocolPeer;
   let service: CodexAccountService;
   let factory: ReturnType<typeof vi.fn<(projectDir: string) => Promise<CodexClient>>>;
   let app: ReturnType<typeof createStudioServer>;
+  let hasAttemptFixture: boolean;
   const additionalApps: ReturnType<typeof createStudioServer>[] = [];
   const additionalRoots: string[] = [];
   const controllers: ReturnType<typeof createAgentConfigurationController>[] = [];
@@ -85,6 +127,7 @@ describe("mounted Studio configuration → public Core bridge (protocol fixture)
     factory = vi.fn(async (_projectDir: string): Promise<CodexClient> => { if (peer.closed) peer = new ProtocolPeer(root); return peer; });
     service = createCodexAccountService({ projectDir: root, clientFactory: factory });
     app = createStudioServer({} as never, root, { codexAccountService: service });
+    hasAttemptFixture = false;
   });
   afterEach(async () => {
     for (const controller of controllers.splice(0)) controller.dispose();
@@ -101,7 +144,15 @@ describe("mounted Studio configuration → public Core bridge (protocol fixture)
   };
   const owner = () => new CodexAuthenticationOwner(peer);
   const bind = (expectedRevision = 0) => app.request(`${prefix}/harnesses/codex/bind`, post({ expectedRevision }));
+  const enableAttemptFixture = () => { if (!hasAttemptFixture) { installAttemptContractFixture(service); hasAttemptFixture = true; } };
+  const reserveFixture = async () => {
+    enableAttemptFixture(); const response = await app.request(`${prefix}/harnesses/codex/login/reserve`, post());
+    expect(response.status).toBe(200); return (await response.json()).reservation.attemptHandle as string;
+  };
+  const startFixture = async (handle?: string) => app.request(`${prefix}/harnesses/codex/login`, post({ attemptHandle: handle ?? await reserveFixture() }));
+  const closeFixture = (handle: string) => app.request(`${prefix}/harnesses/codex/login/close`, post({ attemptHandle: handle }));
   const ui = () => {
+    enableAttemptFixture();
     const httpCalls: Array<{ method: string; path: string; status: number }> = [];
     const fetchImpl: typeof fetch = async (input, init) => {
       const request = input instanceof Request ? new Request(input, init) : new Request(new URL(String(input), "http://localhost"), init);
@@ -124,6 +175,40 @@ describe("mounted Studio configuration → public Core bridge (protocol fixture)
     expect(factory).not.toHaveBeenCalled(); expect(peer.calls).toEqual([]);
     expect(existsSync(join(root, ".inkos", "agent-config.json"))).toBe(false);
     expect(existsSync(join(peer.codexHome, "inkos-connection.json"))).toBe(false);
+  });
+
+  it("fails closed on the actual older Core service instead of falling back to legacy start/cancel/logout", async () => {
+    for (const [action, body] of [["login/reserve", {}], ["login", { attemptHandle: "fixture-attempt" }], ["login/close", { attemptHandle: "fixture-attempt" }]] as const) {
+      const response = await app.request(`${prefix}/harnesses/codex/${action}`, post(body));
+      expect(response.status).toBe(503); expect((await response.json()).error.code).toBe("AGENT_CONFIGURATION_ATTEMPT_CONTRACT_UNAVAILABLE");
+    }
+    expect(factory).not.toHaveBeenCalled(); expect(peer.calls).toEqual([]); expect(owner().snapshot()).toBeUndefined();
+    expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();
+  });
+
+  it("offline attempt fixture: reserve and Close before start create no peer, owner operation or OAuth request", async () => {
+    const handle = await reserveFixture();
+    expect(factory).not.toHaveBeenCalled(); expect(owner().snapshot()).toBeUndefined();
+    expect(await (await closeFixture(handle)).json()).toEqual({ result: { attemptHandle: handle, state: "closed", cleanup: "not-started" } });
+    expect(await (await closeFixture(handle)).json()).toEqual({ result: { attemptHandle: handle, state: "already-terminal", cleanup: "not-started" } });
+    expect((await startFixture(handle)).status).toBe(503);
+    expect(factory).not.toHaveBeenCalled(); expect(peer.calls).toEqual([]); expect(owner().snapshot()).toBeUndefined();
+  });
+
+  it("offline attempt fixture: an aborted start response can still be closed by its pre-reserved handle before the native ID arrives", async () => {
+    peer.authenticated = false; const handle = await reserveFixture();
+    const entered = deferred<void>(); const release = deferred<void>(); const abort = new AbortController();
+    peer.beforeRequest = async method => { if (method === "account/login/start") { entered.resolve(); await release.promise; } };
+    const pending = app.request(new Request(`http://localhost${prefix}/harnesses/codex/login`, { ...post({ attemptHandle: handle }), signal: abort.signal }));
+    await entered.promise; abort.abort();
+    const closed = await closeFixture(handle);
+    expect(await closed.json()).toEqual({ result: { attemptHandle: handle, state: "closed", cleanup: "unconfirmed" } });
+    expect(peer.count("account/login/cancel")).toBe(0);
+    release.resolve(); expect((await pending).status).toBe(200);
+    expect(peer.calls.filter(call => call.method === "account/login/cancel").map(call => call.params)).toEqual([{ loginId: "login-1" }]);
+    expect(owner().snapshot()).toMatchObject({ localState: "disconnected", operationId: null });
+    expect((await state()).connection.login.status).toBe("cancelled");
+    expect(peer.count("account/login/start")).toBe(1); expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();
   });
 
   it("observes the actual peer catalogue without binding, creating an owner, exposing identity or claiming inference", async () => {
@@ -206,15 +291,16 @@ describe("mounted Studio configuration → public Core bridge (protocol fixture)
     ["/harnesses/codex/bind", { expectedRevision: 0, authContextRef: "browser-ref" }],
     ["/harnesses/codex/bind", { expectedRevision: 0, codexHome: "/browser/home" }],
     ["/harnesses/codex/login", { projectRoot: "/browser/project" }],
-    ["/harnesses/codex/login/cancel", { loginId: "login-1", authGeneration: 3 }],
+    ["/harnesses/codex/login/reserve", { projectRoot: "/browser/project" }],
+    ["/harnesses/codex/login/close", { attemptHandle: "fixture-attempt", authGeneration: 3 }],
     ["/harnesses/codex/logout", { connectionRef: "browser-ref" }],
   ])("rejects browser authority fields on mounted %s before creating a peer", async (path, body) => {
     expect((await app.request(`${prefix}${path}`, post(body))).status).toBe(400);
     expect(factory).not.toHaveBeenCalled(); expect(peer.calls).toEqual([]);
   });
 
-  it.each(["/harnesses/codex/login", "/harnesses/codex/logout", "/harnesses/codex/bind", "/harnesses/codex/login/cancel", "/settings"])("enforces real Host/Origin/Sec-Fetch/JSON guards on %s before RPC", async path => {
-    const request = path === "/settings" ? put({ expectedRevision: 0, patch: { selectedHarnessId: "pi" } }) : post(path.endsWith("/bind") ? { expectedRevision: 0 } : path.endsWith("/cancel") ? { loginId: "login-1" } : {});
+  it.each(["/harnesses/codex/login/reserve", "/harnesses/codex/login", "/harnesses/codex/logout", "/harnesses/codex/bind", "/harnesses/codex/login/close", "/settings"])("enforces real Host/Origin/Sec-Fetch/JSON guards on %s before RPC", async path => {
+    const request = path === "/settings" ? put({ expectedRevision: 0, patch: { selectedHarnessId: "pi" } }) : post(path.endsWith("/bind") ? { expectedRevision: 0 } : path.endsWith("/close") || path.endsWith("/login") ? { attemptHandle: "fixture-attempt" } : {});
     expect((await app.request(`http://evil.test${prefix}${path}`, request)).status).toBe(403);
     expect((await app.request(`${prefix}${path}`, { ...request, headers: { "Content-Type": "application/json", Origin: "https://evil.test" } })).status).toBe(403);
     expect((await app.request(`${prefix}${path}`, { ...request, headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "cross-site" } })).status).toBe(403);
@@ -241,7 +327,7 @@ describe("mounted Studio configuration → public Core bridge (protocol fixture)
 
   it("deduplicates parallel logins and recovers the pending attempt through a subsequent GET", async () => {
     peer.authenticated = false;
-    const starts = await Promise.all([app.request(`${prefix}/harnesses/codex/login`, post()), app.request(`${prefix}/harnesses/codex/login`, post())]);
+    const handle = await reserveFixture(); const starts = await Promise.all([startFixture(handle), startFixture(handle)]);
     expect(starts.map(response => response.status)).toEqual([200, 200]);
     const results = await Promise.all(starts.map(response => response.json()));
     expect(results[0]).toEqual(results[1]); expect(results[0].login).toMatchObject({ loginId: "login-1", status: "pending", userCode: "FIXTURE-CODE" });
@@ -250,13 +336,13 @@ describe("mounted Studio configuration → public Core bridge (protocol fixture)
     expect(owner().snapshot()?.localState).toBe("transitioning"); expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();
   });
 
-  it("guards stale cancel, deduplicates repeated cancel and fences a late successful completion", async () => {
+  it("offline attempt fixture: unknown Close cannot cancel the pending owner, repeated exact Close fences late success", async () => {
     peer.authenticated = false;
-    await app.request(`${prefix}/harnesses/codex/login`, post()); const pending = owner().snapshot()!;
-    expect((await app.request(`${prefix}/harnesses/codex/login/cancel`, post({ loginId: "stale" }))).status).toBe(409);
+    const handle = await reserveFixture(); await startFixture(handle); const pending = owner().snapshot()!;
+    const unknown = await closeFixture("unknown"); expect(unknown.status).toBe(200);
+    expect(await unknown.json()).toEqual({ result: { attemptHandle: "unknown", state: "unknown-or-expired", cleanup: "not-applicable" } });
     expect(peer.count("account/login/cancel")).toBe(0); expect(owner().snapshot()).toEqual(pending);
-    expect((await app.request(`${prefix}/harnesses/codex/login/cancel`, post({ loginId: "login-1" }))).status).toBe(200);
-    expect((await app.request(`${prefix}/harnesses/codex/login/cancel`, post({ loginId: "login-1" }))).status).toBe(200);
+    expect((await closeFixture(handle)).status).toBe(200); expect((await closeFixture(handle)).status).toBe(200);
     const cancelled = owner().snapshot()!; expect(cancelled).toMatchObject({ localState: "disconnected", operationId: null, authGeneration: pending.authGeneration + 1 });
     peer.authenticated = true; peer.notify("account/login/completed", { loginId: "login-1", success: true, accessToken: "synthetic-private-token" });
     const observed = await state(); expect(observed.account).toEqual({ type: "chatgpt" }); expect(observed.catalog).toBeNull(); expect(observed.execution).toBeNull();
@@ -265,7 +351,7 @@ describe("mounted Studio configuration → public Core bridge (protocol fixture)
   });
 
   it("settles a successful login in the same owner without automatically binding settings or verifying execution", async () => {
-    peer.authenticated = false; await app.request(`${prefix}/harnesses/codex/login`, post()); const pending = owner().snapshot()!;
+    peer.authenticated = false; await startFixture(); const pending = owner().snapshot()!;
     peer.authenticated = true; peer.notify("account/login/completed", { loginId: "login-1", success: true });
     const observed = await state();
     expect(owner().snapshot()).toMatchObject({ localState: "ready", authGeneration: pending.authGeneration, operationId: null });
@@ -275,7 +361,7 @@ describe("mounted Studio configuration → public Core bridge (protocol fixture)
   });
 
   it("logout cancels the pending login and revokes its generation even if completion arrives later", async () => {
-    peer.authenticated = false; await app.request(`${prefix}/harnesses/codex/login`, post()); const pending = owner().snapshot()!;
+    peer.authenticated = false; await startFixture(); const pending = owner().snapshot()!;
     expect((await app.request(`${prefix}/harnesses/codex/logout`, post())).status).toBe(200);
     const loggedOut = owner().snapshot()!; expect(loggedOut).toMatchObject({ localState: "disconnected", authGeneration: pending.authGeneration + 1, operationId: null });
     expect(peer.calls.filter(call => call.method === "account/login/cancel").map(call => call.params)).toEqual([{ loginId: "login-1" }]);
@@ -286,7 +372,7 @@ describe("mounted Studio configuration → public Core bridge (protocol fixture)
   });
 
   it("a peer failure marks the pending attempt failed and borrows a fresh peer without restoring ready", async () => {
-    peer.authenticated = false; await app.request(`${prefix}/harnesses/codex/login`, post()); const oldPeer = peer; const pending = owner().snapshot()!;
+    peer.authenticated = false; await startFixture(); const oldPeer = peer; const pending = owner().snapshot()!;
     oldPeer.disconnect();
     const observed = await state();
     expect(factory).toHaveBeenCalledTimes(2); expect(peer).not.toBe(oldPeer);
@@ -299,7 +385,7 @@ describe("mounted Studio configuration → public Core bridge (protocol fixture)
   });
 
   it("production shutdown settles a pending ticket and closes the owned peer once, fencing late completion", async () => {
-    peer.authenticated = false; await app.request(`${prefix}/harnesses/codex/login`, post()); const pending = owner().snapshot()!;
+    peer.authenticated = false; await startFixture(); const pending = owner().snapshot()!;
     await shutdownStudioServer(app); const settled = owner().snapshot()!;
     expect(settled).toMatchObject({ localState: "unknown", operationId: null, authGeneration: pending.authGeneration });
     expect(peer.closed).toBe(true); expect(peer.closeCount).toBe(1);
@@ -310,7 +396,7 @@ describe("mounted Studio configuration → public Core bridge (protocol fixture)
 
   it("sanitizes login RPC failure, settles unknown and closes the peer through the same service", async () => {
     peer.beforeRequest = async method => { if (method === "account/login/start") throw new Error("synthetic-private-RPC-error"); };
-    const response = await app.request(`${prefix}/harnesses/codex/login`, post());
+    const response = await startFixture();
     expect(response.status).toBe(503); expect(await response.text()).not.toContain("synthetic-private");
     expect(owner().snapshot()).toMatchObject({ localState: "unknown", operationId: null }); expect(peer.closeCount).toBe(1);
     expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();

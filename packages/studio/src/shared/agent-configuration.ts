@@ -63,3 +63,13 @@ export function catalogMatchesState(state: HarnessState): boolean {
 export function samePreferences(a: HarnessPreferences, b: HarnessPreferences): boolean {
   return a.model === b.model && a.effort === b.effort && a.speed === b.speed;
 }
+
+export interface DeviceLoginAttemptReservation {
+  readonly attemptHandle: string;
+  readonly expiresAt: number;
+}
+export interface DeviceLoginAttemptCloseResult {
+  readonly attemptHandle: string;
+  readonly state: "closed" | "already-terminal" | "unknown-or-expired" | "superseded";
+  readonly cleanup: "not-started" | "cancel-acknowledged" | "unconfirmed" | "not-applicable";
+}

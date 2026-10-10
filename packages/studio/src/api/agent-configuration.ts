@@ -4,10 +4,11 @@ import {
   AgentSettingsConflictError, AgentSettingsPatchSchema, RuntimeCapabilityError,
   RuntimeAuthenticationError, observeCodexRuntime, bindCodexModelConnection,
   parseHarnessCapabilityCatalog, readAgentSettings, updateAgentSettings,
-  type HarnessCapabilityCatalog, type HarnessId, type CodexAccountService,
+  type HarnessCapabilityCatalog, type HarnessId, type CodexAccountService, type CodexDeviceLogin,
 } from "@actalk/inkos-core";
 import { ApiError } from "./errors.js";
-import { catalogMatchesState, unavailableHarnessState, validScope, type HarnessState, type SettingsUpdate } from "../shared/agent-configuration.js";
+import { catalogMatchesState, unavailableHarnessState, validScope, type HarnessState, type SettingsUpdate,
+  type DeviceLoginAttemptReservation, type DeviceLoginAttemptCloseResult } from "../shared/agent-configuration.js";
 import { isCodexVerificationUrl, type StudioCodexLogin } from "../shared/codex.js";
 
 export interface AgentConfigurationRouteDependencies {
@@ -15,6 +16,12 @@ export interface AgentConfigurationRouteDependencies {
   readonly observeHarness?: (harnessId: HarnessId, signal?: AbortSignal) => Promise<HarnessState>;
   readonly accountService?: CodexAccountService;
   readonly bindConnection?: (expectedRevision: number, signal?: AbortSignal) => ReturnType<typeof bindCodexModelConnection>;
+}
+/** Trusted server contract; presence is checked before touching an older Core account service. */
+export interface DeviceLoginAttemptService {
+  reserveDeviceLoginAttempt(): DeviceLoginAttemptReservation;
+  startDeviceLogin(options: { attemptHandle: string }): Promise<CodexDeviceLogin>;
+  closeDeviceLoginAttempt(attemptHandle: string): Promise<DeviceLoginAttemptCloseResult>;
 }
 const LOGIN_FAILURE = "ChatGPT sign-in did not complete. Check the current attempt before retrying.";
 function publicLogin(login: StudioCodexLogin | null): StudioCodexLogin | null {
@@ -61,6 +68,24 @@ export function createAgentConfigurationDependencies(projectRoot: string, accoun
 }
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function validAttemptHandle(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value;
+}
+function publicReservation(value: unknown): DeviceLoginAttemptReservation {
+  if (!object(value) || !validAttemptHandle(value.attemptHandle) || !Number.isSafeInteger(value.expiresAt) || (value.expiresAt as number) <= Date.now()) {
+    throw new ApiError(502, "AGENT_CONFIGURATION_INVALID_ATTEMPT", "The account service returned an invalid sign-in reservation.");
+  }
+  return { attemptHandle: value.attemptHandle, expiresAt: value.expiresAt as number };
+}
+function publicCloseResult(value: unknown, attemptHandle: string): DeviceLoginAttemptCloseResult {
+  if (!object(value) || value.attemptHandle !== attemptHandle
+    || typeof value.state !== "string" || typeof value.cleanup !== "string"
+    || !["closed", "already-terminal", "unknown-or-expired", "superseded"].includes(String(value.state))
+    || !["not-started", "cancel-acknowledged", "unconfirmed", "not-applicable"].includes(String(value.cleanup))) {
+    throw new ApiError(502, "AGENT_CONFIGURATION_INVALID_ATTEMPT", "The account service returned an invalid sign-in close result.");
+  }
+  return { attemptHandle, state: value.state as DeviceLoginAttemptCloseResult["state"], cleanup: value.cleanup as DeviceLoginAttemptCloseResult["cleanup"] };
 }
 function parseUpdate(value: unknown): SettingsUpdate {
   if (!object(value) || Object.keys(value).some(key => !["expectedRevision", "patch"].includes(key))
@@ -144,6 +169,13 @@ export function createAgentConfigurationRoutes(projectRoot: string, dependencies
     if (!dependencies.accountService) throw new ApiError(503, "AGENT_CONFIGURATION_UNAVAILABLE", "The ChatGPT account service is unavailable.");
     return dependencies.accountService;
   };
+  const attemptService = (): DeviceLoginAttemptService => {
+    const account = service() as CodexAccountService & Partial<DeviceLoginAttemptService>;
+    if (typeof account.reserveDeviceLoginAttempt !== "function" || typeof account.startDeviceLogin !== "function" || typeof account.closeDeviceLoginAttempt !== "function") {
+      throw new ApiError(503, "AGENT_CONFIGURATION_ATTEMPT_CONTRACT_UNAVAILABLE", "Safe sign-in attempt management is unavailable in this account service.");
+    }
+    return account as unknown as DeviceLoginAttemptService;
+  };
   const body = async (request: Request, allowed: readonly string[]) => {
     const value: unknown = await request.json().catch(() => null);
     if (!object(value) || Object.keys(value).some(key => !allowed.includes(key))) throw new ApiError(400, "AGENT_CONFIGURATION_INVALID_REQUEST", "Invalid configuration action.");
@@ -158,19 +190,22 @@ export function createAgentConfigurationRoutes(projectRoot: string, dependencies
     if (current.selectedHarnessId !== "codex") throw new RuntimeAuthenticationError("Binding requires the selected Codex harness");
     return c.json({ settings: await dependencies.bindConnection(value.expectedRevision as number, c.req.raw.signal) });
   });
-  app.post("/harnesses/codex/login", async c => {
+  app.post("/harnesses/codex/login/reserve", async c => {
     await body(c.req.raw, []);
-    const login = await service().startDeviceLogin();
-    if (!isCodexVerificationUrl(login.verificationUrl)) throw new ApiError(502, "AGENT_CONFIGURATION_INVALID_LOGIN", LOGIN_FAILURE);
+    return c.json({ reservation: publicReservation(attemptService().reserveDeviceLoginAttempt()) });
+  });
+  app.post("/harnesses/codex/login", async c => {
+    const value = await body(c.req.raw, ["attemptHandle"]);
+    if (!validAttemptHandle(value.attemptHandle)) throw new ApiError(400, "AGENT_CONFIGURATION_INVALID_REQUEST", "A valid sign-in attempt handle is required.");
+    const login = await attemptService().startDeviceLogin({ attemptHandle: value.attemptHandle });
+    if (login.type !== "chatgptDeviceCode" || !validAttemptHandle(login.loginId) || typeof login.userCode !== "string" || !login.userCode || login.userCode.length > 256
+      || !isCodexVerificationUrl(login.verificationUrl)) throw new ApiError(502, "AGENT_CONFIGURATION_INVALID_LOGIN", LOGIN_FAILURE);
     return c.json({ login: publicLogin({ ...login, status: "pending" }) });
   });
-  app.post("/harnesses/codex/login/cancel", async c => {
-    const value = await body(c.req.raw, ["loginId"]);
-    if (typeof value.loginId !== "string" || !value.loginId || value.loginId.length > 256) throw new ApiError(400, "AGENT_CONFIGURATION_INVALID_REQUEST", "A valid login ID is required.");
-    const account = service(), status = await account.readAccount();
-    if (status.login?.loginId !== value.loginId) throw new ApiError(409, "AGENT_CONFIGURATION_LOGIN_CHANGED", "The sign-in attempt changed. Check current status.");
-    if (status.login.status === "pending") await account.cancelLogin(value.loginId);
-    return c.json({ ok: true });
+  app.post("/harnesses/codex/login/close", async c => {
+    const value = await body(c.req.raw, ["attemptHandle"]);
+    if (!validAttemptHandle(value.attemptHandle)) throw new ApiError(400, "AGENT_CONFIGURATION_INVALID_REQUEST", "A valid sign-in attempt handle is required.");
+    return c.json({ result: publicCloseResult(await attemptService().closeDeviceLoginAttempt(value.attemptHandle), value.attemptHandle) });
   });
   app.post("/harnesses/codex/logout", async c => {
     await body(c.req.raw, []); await service().logout(); return c.json({ ok: true });

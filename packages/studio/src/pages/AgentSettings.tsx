@@ -19,7 +19,7 @@ export function AgentSettings({ isZh }: { readonly isZh: boolean }) {
       <p>{text(isZh, "在 ChatGPT 页面输入本次登录码：", "Enter this attempt's code on the ChatGPT page:")} <strong>{login.userCode}</strong></p>
       <a className={buttonClass} href={login.verificationUrl} target="_blank" rel="noopener noreferrer">{text(isZh, "打开 ChatGPT 登录页面", "Open ChatGPT sign-in page")}</a>
     </div>}
-    {(snapshot.authBusy === "login" || login?.status === "pending") && <button type="button" className={buttonClass} onClick={controller.closeConnection}>{text(isZh, "关闭并取消登录", "Close and cancel sign-in")}</button>}
+    {(snapshot.canCloseConnection || snapshot.authBusy === "login") && <button type="button" className={buttonClass} disabled={snapshot.authBusy === "cancel"} onClick={controller.closeConnection}>{snapshot.authCloseResult?.cleanup === "unconfirmed" || snapshot.authDetail?.en.startsWith("Close outcome") ? text(isZh, "核对本次关闭结果", "Check this Close again") : text(isZh, "关闭并取消登录", "Close and cancel sign-in")}</button>}
     <p role="status" aria-live="polite">{snapshot.target.harness === "pi"
       ? text(isZh, "Pi 生产执行尚未接入；可保存偏好，待连接。", "Pi production execution is unavailable. Preferences can be saved pending connection.")
       : bound ? text(isZh, "当前模型连接已绑定；执行尚未验证。", "Current model connection is bound; execution remains unverified.")

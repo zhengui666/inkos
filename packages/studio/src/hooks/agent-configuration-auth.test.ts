@@ -9,6 +9,9 @@ const native = { model: null, effort: null, speed: null };
 const initial: AgentSettings = { schemaVersion: 1, revision: 0, selectedHarnessId: "codex", modelConnectionRef: null, harnessPreferences: { codex: native, pi: native } };
 const target = { harness: "codex" as const, contextKey: "server-context" };
 const piTarget = { harness: "pi" as const, contextKey: "unobserved" };
+const attemptHandle = "reserved-attempt-one";
+type LoginCloseResult = Awaited<ReturnType<NonNullable<AgentConfigurationTransport["closeLogin"]>>>;
+const closeResult: LoginCloseResult = { attemptHandle, state: "closed", cleanup: "cancel-acknowledged" };
 const pendingLogin: StudioCodexLogin = { loginId: "attempt-one", status: "pending", verificationUrl: "https://auth.openai.com/codex/device", userCode: "PUBLIC-CODE" };
 function deferred<T>() { let resolve!: (value: T) => void; let reject!: (error: unknown) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 async function flush() { for (let i = 0; i < 30; i++) await Promise.resolve(); }
@@ -26,8 +29,9 @@ function setup(state = observed(), timeout = 15_000) {
     readSettings: vi.fn<AgentConfigurationTransport["readSettings"]>().mockResolvedValue(initial),
     saveSettings: vi.fn<AgentConfigurationTransport["saveSettings"]>(),
     readHarnessState: vi.fn<AgentConfigurationTransport["readHarnessState"]>().mockImplementation(async harness => harness === "codex" ? state : unavailableHarnessState(harness)),
+    reserveLogin: vi.fn<NonNullable<AgentConfigurationTransport["reserveLogin"]>>().mockImplementation(async () => ({ attemptHandle, expiresAt: Date.now() + 120_000 })),
     startLogin: vi.fn<NonNullable<AgentConfigurationTransport["startLogin"]>>().mockResolvedValue(pendingLogin),
-    cancelLogin: vi.fn<NonNullable<AgentConfigurationTransport["cancelLogin"]>>().mockResolvedValue(undefined),
+    closeLogin: vi.fn<NonNullable<AgentConfigurationTransport["closeLogin"]>>().mockResolvedValue(closeResult),
     logout: vi.fn<NonNullable<AgentConfigurationTransport["logout"]>>().mockResolvedValue(undefined),
     bindConnection: vi.fn<NonNullable<AgentConfigurationTransport["bindConnection"]>>().mockResolvedValue(settings()),
   };
@@ -40,6 +44,11 @@ function setup(state = observed(), timeout = 15_000) {
   return { controller, transport, edit, save, intent };
 }
 afterEach(() => { vi.useRealTimers(); });
+async function primeKnownAttempt(value: ReturnType<typeof setup>, pendingState: HarnessState) {
+  value.transport.readHarnessState.mockResolvedValue(observed("signed-out")); await value.controller.refreshState();
+  value.transport.readHarnessState.mockResolvedValue(pendingState); value.intent("connect"); await flush();
+  value.transport.startLogin.mockClear(); value.transport.reserveLogin.mockClear();
+}
 
 describe("account requests belong to one observed attempt", () => {
   it("dispatches synchronous repeated connect only once and keeps a null owner generation valid", async () => {
@@ -54,13 +63,14 @@ describe("account requests belong to one observed attempt", () => {
     expect(controller.getSnapshot().state?.connection?.login?.loginId).toBe("attempt-one");
     expect(controller.getSnapshot().authBusy).toBeNull(); controller.dispose();
   });
-  it("cancels only the observed pending login ID and ignores wrong IDs and repeated clicks", async () => {
-    const { controller, transport, intent } = setup(observed("signing-in", 1, target.contextKey, pendingLogin)); await controller.refresh();
-    intent("cancel-sign-in", "another-attempt"); expect(transport.cancelLogin).not.toHaveBeenCalled();
-    const cancellation = deferred<void>(); transport.cancelLogin.mockReturnValue(cancellation.promise);
+  it("closes only the locally reserved observed pending attempt and ignores wrong IDs and repeated clicks", async () => {
+    const value = setup(observed("signing-in", 1, target.contextKey, pendingLogin)); const { controller, transport, intent } = value;
+    await controller.refresh(); await primeKnownAttempt(value, observed("signing-in", 1, target.contextKey, pendingLogin));
+    intent("cancel-sign-in", "another-attempt"); expect(transport.closeLogin).not.toHaveBeenCalled();
+    const cancellation = deferred<LoginCloseResult>(); transport.closeLogin.mockReturnValue(cancellation.promise);
     intent("cancel-sign-in", pendingLogin.loginId); intent("cancel-sign-in", pendingLogin.loginId); await flush();
-    expect(transport.cancelLogin).toHaveBeenCalledTimes(1); expect(transport.cancelLogin.mock.calls[0]![0]).toBe("attempt-one");
-    controller.selectTarget(piTarget); cancellation.resolve(); await flush();
+    expect(transport.closeLogin).toHaveBeenCalledTimes(1); expect(transport.closeLogin.mock.calls[0]![0]).toBe(attemptHandle);
+    controller.selectTarget(piTarget); cancellation.resolve(closeResult); await flush();
     expect(controller.getSnapshot().target).toEqual(piTarget); expect(controller.getSnapshot().state).toBeNull();
     expect(transport.startLogin).not.toHaveBeenCalled(); controller.dispose();
   });
@@ -71,31 +81,32 @@ describe("account requests belong to one observed attempt", () => {
     transport.readHarnessState.mockResolvedValue(observed("signed-out")); logout.resolve(); await flush();
     expect(controller.getSnapshot().state?.account).toBeNull(); expect(controller.getSnapshot().authBusy).toBeNull(); controller.dispose();
   });
-  it("explicit Close before login/start returns cancels its returned ID once, even after navigation", async () => {
+  it("explicit Close before login/start returns closes its reserved handle once, even after navigation", async () => {
     const { controller, transport, intent, edit } = setup(observed("signed-out")); await controller.refresh();
     const login = deferred<StudioCodexLogin>(); transport.startLogin.mockReturnValue(login.promise);
     intent("connect"); await flush(); controller.closeConnection(); controller.closeConnection();
     controller.selectTarget(piTarget); edit("pi-draft"); login.resolve(pendingLogin); await flush();
-    expect(transport.cancelLogin).toHaveBeenCalledTimes(1); expect(transport.cancelLogin.mock.calls[0]![0]).toBe("attempt-one");
+    expect(transport.closeLogin).toHaveBeenCalledTimes(1); expect(transport.closeLogin.mock.calls[0]![0]).toBe(attemptHandle);
     expect(controller.getSnapshot().target).toEqual(piTarget); expect(controller.getSnapshot().draft.model).toBe("pi-draft");
     expect(controller.getSnapshot().state).toBeNull(); expect(controller.getSnapshot().authDetail).toBeUndefined(); controller.dispose();
   });
-  it("explicit Close survives timeout when transport ignores abort and cancels only the late returned attempt", async () => {
+  it("explicit Close survives timeout when transport ignores abort and closes only the reserved attempt despite a late response", async () => {
     vi.useFakeTimers(); const { controller, transport, intent } = setup(observed("signed-out"), 25); await controller.refresh();
     const login = deferred<StudioCodexLogin>(); transport.startLogin.mockReturnValue(login.promise);
     intent("connect"); await flush(); controller.closeConnection(); await vi.advanceTimersByTimeAsync(26); await flush();
-    expect(transport.startLogin.mock.calls[0]![0].aborted).toBe(true);
+    expect(transport.startLogin.mock.calls[0]![1].aborted).toBe(true);
     const before = controller.getSnapshot(); login.resolve(pendingLogin); await flush();
-    expect(transport.cancelLogin).toHaveBeenCalledTimes(1); expect(transport.cancelLogin.mock.calls[0]![0]).toBe("attempt-one");
+    expect(transport.closeLogin).toHaveBeenCalledTimes(1); expect(transport.closeLogin.mock.calls[0]![0]).toBe(attemptHandle);
     expect(controller.getSnapshot().target).toEqual(before.target); expect(controller.getSnapshot().state).toEqual(before.state);
     expect(transport.startLogin).toHaveBeenCalledTimes(1); controller.dispose();
   });
   it("Close with an observed pending attempt suppresses duplicate cancellation", async () => {
-    const { controller, transport } = setup(observed("signing-in", null, target.contextKey, pendingLogin)); await controller.refresh();
-    const cancellation = deferred<void>(); transport.cancelLogin.mockReturnValue(cancellation.promise);
+    const value = setup(observed("signing-in", null, target.contextKey, pendingLogin)); const { controller, transport } = value;
+    await controller.refresh(); await primeKnownAttempt(value, observed("signing-in", null, target.contextKey, pendingLogin));
+    const cancellation = deferred<LoginCloseResult>(); transport.closeLogin.mockReturnValue(cancellation.promise);
     controller.closeConnection(); controller.closeConnection(); await flush();
-    expect(transport.cancelLogin).toHaveBeenCalledTimes(1); expect(transport.cancelLogin.mock.calls[0]![0]).toBe("attempt-one");
-    cancellation.resolve(); await flush(); controller.dispose();
+    expect(transport.closeLogin).toHaveBeenCalledTimes(1); expect(transport.closeLogin.mock.calls[0]![0]).toBe(attemptHandle);
+    cancellation.resolve(closeResult); await flush(); controller.dispose();
   });
   it("explicit Close after login/start returned still cancels that attempt while its observation is delayed", async () => {
     const { controller, transport, intent } = setup(observed("signed-out")); await controller.refresh();
@@ -103,15 +114,15 @@ describe("account requests belong to one observed attempt", () => {
     intent("connect"); await flush();
     expect(transport.startLogin).toHaveBeenCalledTimes(1); expect(controller.getSnapshot().authBusy).toBe("login");
     controller.closeConnection(); controller.closeConnection(); await flush();
-    const cancellationCountBeforeObservation = transport.cancelLogin.mock.calls.length;
+    const cancellationCountBeforeObservation = transport.closeLogin.mock.calls.length;
     observation.resolve(observed("signing-in", null, target.contextKey, pendingLogin)); await flush(); controller.dispose();
-    expect(cancellationCountBeforeObservation).toBe(1); expect(transport.cancelLogin).toHaveBeenCalledTimes(1);
-    expect(transport.cancelLogin.mock.calls[0]![0]).toBe("attempt-one");
+    expect(cancellationCountBeforeObservation).toBe(1); expect(transport.closeLogin).toHaveBeenCalledTimes(1);
+    expect(transport.closeLogin.mock.calls[0]![0]).toBe(attemptHandle);
   });
   it("a rejected Close cancellation fences the old pending observation and retains the draft with an uncertain outcome", async () => {
     const { controller, transport, intent, edit } = setup(observed("signed-out")); await controller.refresh(); edit("before-close");
     const observation = deferred<HarnessState>(); transport.readHarnessState.mockReturnValueOnce(observation.promise);
-    const cancellation = deferred<void>(); transport.cancelLogin.mockReturnValue(cancellation.promise);
+    const cancellation = deferred<LoginCloseResult>(); transport.closeLogin.mockReturnValue(cancellation.promise);
     intent("connect"); await flush(); controller.closeConnection(); await flush(); edit("during-close");
     cancellation.reject(new Error("cancel response lost")); await flush();
     expect(controller.getSnapshot().authDetail?.en).toContain("uncertain");
@@ -120,12 +131,12 @@ describe("account requests belong to one observed attempt", () => {
     expect(controller.getSnapshot().state).toBeNull(); expect(controller.getSnapshot().authBusy).toBeNull();
     expect(controller.getSnapshot().authDetail?.en).toContain("uncertain");
     expect(controller.getSnapshot().draft.model).toBe("during-close"); expect(controller.getSnapshot().revision).toBe(0);
-    expect(transport.cancelLogin).toHaveBeenCalledTimes(1); expect(transport.startLogin).toHaveBeenCalledTimes(1); controller.dispose();
+    expect(transport.closeLogin).toHaveBeenCalledTimes(1); expect(transport.startLogin).toHaveBeenCalledTimes(1); controller.dispose();
   });
   it("navigation to Pi after Close cannot be changed by late cancellation rejection or the older login observation", async () => {
     const { controller, transport, intent, edit } = setup(observed("signed-out")); await controller.refresh(); edit("codex-draft");
     const observation = deferred<HarnessState>(); transport.readHarnessState.mockReturnValueOnce(observation.promise);
-    const cancellation = deferred<void>(); transport.cancelLogin.mockReturnValue(cancellation.promise);
+    const cancellation = deferred<LoginCloseResult>(); transport.closeLogin.mockReturnValue(cancellation.promise);
     intent("connect"); await flush(); controller.closeConnection(); await flush();
     controller.selectTarget(piTarget); edit("pi-draft"); await controller.refreshState();
     const before = controller.getSnapshot(); cancellation.reject(new Error("late cancel response lost")); await flush();
@@ -133,7 +144,7 @@ describe("account requests belong to one observed attempt", () => {
     expect(controller.getSnapshot().target).toEqual(piTarget); expect(controller.getSnapshot().state).toEqual(before.state);
     expect(controller.getSnapshot().draft.model).toBe("pi-draft"); expect(controller.getSnapshot().revision).toBe(0);
     expect(controller.getSnapshot().authDetail).toBeUndefined(); expect(controller.getSnapshot().authBusy).toBeNull();
-    expect(transport.cancelLogin).toHaveBeenCalledTimes(1); expect(transport.cancelLogin.mock.calls[0]![0]).toBe("attempt-one");
+    expect(transport.closeLogin).toHaveBeenCalledTimes(1); expect(transport.closeLogin.mock.calls[0]![0]).toBe(attemptHandle);
     expect(transport.startLogin).toHaveBeenCalledTimes(1); controller.selectTarget(target);
     expect(controller.getSnapshot().draft.model).toBe("codex-draft"); controller.dispose();
   });
@@ -146,7 +157,7 @@ describe("account requests belong to one observed attempt", () => {
     edit("current-draft"); const before = controller.getSnapshot(); login.resolve(pendingLogin); await flush();
     expect(controller.getSnapshot().target).toEqual(before.target); expect(controller.getSnapshot().draft).toEqual(before.draft);
     expect(controller.getSnapshot().state).toEqual(before.state); expect(controller.getSnapshot().revision).toBe(before.revision);
-    expect(transport.cancelLogin).not.toHaveBeenCalled(); expect(transport.readHarnessState).toHaveBeenCalledTimes(1); controller.dispose();
+    expect(transport.closeLogin).not.toHaveBeenCalled(); expect(transport.readHarnessState).toHaveBeenCalledTimes(1); controller.dispose();
   });
   it("navigation return observes an existing pending attempt without starting another login", async () => {
     const { controller, transport, intent } = setup(observed("signed-out")); await controller.refresh();
@@ -170,7 +181,7 @@ describe("account requests belong to one observed attempt", () => {
     for (const action of ["connect", "sign-out", "cancel-sign-in"] as const) controller.connectionIntent({ action, target: piTarget, attemptKey: "attempt-one" });
     controller.connectionIntent({ action: "connect", target }); controller.closeConnection(); await controller.bindConnection(); await flush();
     expect(controller.getSnapshot().target).toEqual(piTarget); expect(controller.getSnapshot().state?.availability).toBe("unavailable");
-    expect(transport.startLogin).not.toHaveBeenCalled(); expect(transport.cancelLogin).not.toHaveBeenCalled();
+    expect(transport.startLogin).not.toHaveBeenCalled(); expect(transport.closeLogin).not.toHaveBeenCalled();
     expect(transport.logout).not.toHaveBeenCalled(); expect(transport.bindConnection).not.toHaveBeenCalled(); controller.dispose();
   });
 });
@@ -230,17 +241,21 @@ describe("explicit binding preserves target-owned draft revisions", () => {
 });
 
 describe("browser transport carries only narrow authentication intents", () => {
-  it("posts empty login/logout bodies, the exact cancellation ID and bind revision without credential references", async () => {
+  it("posts reservation, start/close handle and bind revision without credential references", async () => {
     const calls: { path: string; body: unknown }[] = [];
     const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       calls.push({ path: String(input), body: JSON.parse(String(init?.body)) });
-      return new Response(JSON.stringify(String(input).endsWith("/login") ? { login: pendingLogin } : String(input).endsWith("/bind") ? { settings: settings() } : {}), { status: 200, headers: { "Content-Type": "application/json" } });
+      const result = String(input).endsWith("/login/reserve") ? { reservation: { attemptHandle, expiresAt: Date.now() + 120_000 } }
+        : String(input).endsWith("/login/close") ? { result: closeResult }
+        : String(input).endsWith("/login") ? { login: pendingLogin } : String(input).endsWith("/bind") ? { settings: settings() } : {};
+      return new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json" } });
     });
     const transport = createAgentConfigurationTransport(fetchImpl); const signal = new AbortController().signal;
-    await transport.startLogin!(signal); await transport.cancelLogin!(pendingLogin.loginId, signal); await transport.logout!(signal); await transport.bindConnection!(7, signal);
+    await transport.reserveLogin!(signal); await transport.startLogin!(attemptHandle, signal); await transport.closeLogin!(attemptHandle, signal); await transport.logout!(signal); await transport.bindConnection!(7, signal);
     expect(calls).toEqual([
-      { path: "/api/v1/agent-configuration/harnesses/codex/login", body: {} },
-      { path: "/api/v1/agent-configuration/harnesses/codex/login/cancel", body: { loginId: "attempt-one" } },
+      { path: "/api/v1/agent-configuration/harnesses/codex/login/reserve", body: {} },
+      { path: "/api/v1/agent-configuration/harnesses/codex/login", body: { attemptHandle } },
+      { path: "/api/v1/agent-configuration/harnesses/codex/login/close", body: { attemptHandle } },
       { path: "/api/v1/agent-configuration/harnesses/codex/logout", body: {} },
       { path: "/api/v1/agent-configuration/harnesses/codex/bind", body: { expectedRevision: 7 } },
     ]);
