@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { publishingError } from './contracts.js';
 import { acquireMegaNovelCdpLock } from './meganovel-cdp-lock.js';
 import { createPublisherCleanup, PublisherStartupCleanupError } from './publisher-cleanup.js';
-import { MegaNovelProbeSchema, MegaNovelScopeSchema, MegaNovelSnapshotRequestSchema, type MegaNovelBrowserPort,
+import { MegaNovelProbeSchema, MegaNovelScopeSchema, MegaNovelSnapshotRequestSchema, MegaNovelSubmissionBlockedError, type MegaNovelMutationGuard, type MegaNovelBrowserPort,
   type MegaNovelProbe, type MegaNovelScope, type MegaNovelBrowserOptions, type MegaNovelSnapshotRequest, type MegaNovelSnapshot } from './meganovel-contracts.js';
 
 /** DOM functions must be implemented from an authorized observation of the current official UI.
@@ -19,7 +19,7 @@ export interface MegaNovelDomBinding {
   observeSnapshot?(page: Page, input: MegaNovelSnapshotRequest, signal: AbortSignal): Promise<MegaNovelSnapshot>;
   snapshot(page: Page, input: Parameters<MegaNovelBrowserPort['snapshot']>[0], signal: AbortSignal): ReturnType<MegaNovelBrowserPort['snapshot']>;
   createDraft(page: Page, input: Parameters<MegaNovelBrowserPort['createDraft']>[0], signal: AbortSignal, beforeMutation?: () => Promise<void>): Promise<void>;
-  submit(page: Page, input: Parameters<MegaNovelBrowserPort['submit']>[0], signal: AbortSignal, beforeMutation?: () => Promise<void>): Promise<void>;
+  submit(page: Page, input: Parameters<MegaNovelBrowserPort['submit']>[0], signal: AbortSignal, beforeMutation?: MegaNovelMutationGuard): Promise<void>;
 }
 
 const AuthorizationEvidence = z.object({
@@ -174,7 +174,18 @@ class MegaNovelCdpPort implements MegaNovelBrowserPort {
     return this.serial(async signal => { await this.check(input.scope, signal); await options.beforeMutation?.(); signal.throwIfAborted(); await this.binding.createDraft(this.page, input, signal, options.beforeMutation); }, options.signal);
   }
   submit(input: Parameters<MegaNovelBrowserPort['submit']>[0], options: MegaNovelBrowserOptions = {}) {
-    return this.serial(async signal => { await this.check(input.scope, signal); await options.beforeMutation?.(); signal.throwIfAborted(); await this.binding.submit(this.page, input, signal, options.beforeMutation); }, options.signal);
+    let bindingEntered = false;
+    return this.serial(async signal => {
+      const guard: MegaNovelMutationGuard = async () => { await options.beforeMutation?.(); signal.throwIfAborted(); };
+      guard.authorizeSubmission = options.authorizeSubmission;
+      await this.check(input.scope, signal); await guard();
+      // Generic errors after entering an arbitrary binding cannot prove no effect.
+      bindingEntered = true;
+      await this.binding.submit(this.page, input, signal, guard);
+    }, options.signal).catch(error => {
+      if (!bindingEntered) throw new MegaNovelSubmissionBlockedError(error);
+      throw error;
+    });
   }
   close(): Promise<void> {
     this.closing = true;

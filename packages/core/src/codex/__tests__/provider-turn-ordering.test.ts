@@ -1,3 +1,7 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { Type } from '@sinclair/typebox';
 import { Agent } from '../agent.js';
@@ -7,6 +11,8 @@ import type { LLMClient } from '../../llm/provider.js';
 const mocks = vi.hoisted(() => ({ create: vi.fn() }));
 vi.mock('../client.js', () => ({ createCodexClient: mocks.create }));
 class FailureClient {
+  closed = false;
+  readonly closes = new Set<() => void>();
   readonly cwd = '/offline-fixture';
   notifications = new Set<(method: string, params: unknown) => void>();
   run: () => void | Promise<void> = () => {};
@@ -26,8 +32,8 @@ class FailureClient {
   async tool() {
     return await this.handler!('item/tool/call', { threadId: 'thread', turnId: 'turn', callId: 'call', tool: 'submit', arguments: { value: 7 } });
   }
-  onClose() { return () => {}; }
-  close = vi.fn(async () => {});
+  onClose(fn: () => void) { this.closes.add(fn); return () => { this.closes.delete(fn); }; }
+  close = vi.fn(async () => { this.closed = true; for (const fn of this.closes) fn(); this.closes.clear(); });
   notify(method: string, params: object) {
     for (const listener of this.notifications) listener(method, { threadId: 'thread', turnId: 'turn', ...params });
   }
@@ -38,18 +44,43 @@ class FailureClient {
     else this.notify(source, { turn: { id: 'turn', status: 'failed', error } });
   }
 }
-const clientOptions: LLMClient = { provider: 'openai', apiFormat: 'chat', stream: false,
+let clientOptions: LLMClient = { provider: 'openai', apiFormat: 'chat', stream: false,
   defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
-  _codex: { projectRoot: '/offline-fixture', settings: { model: 'fixture', reasoningEffort: 'high', serviceTier: 'default' } } };
-let client: FailureClient;
-beforeEach(() => { client = new FailureClient(); mocks.create.mockReset().mockResolvedValue(client); });
+  _codex: { projectRoot: '', settings: { model: 'fixture', reasoningEffort: 'high', serviceTier: 'default' } } };
+let client: FailureClient, fixtureRoot: string;
+beforeEach(async () => {
+  fixtureRoot = await mkdtemp(join(tmpdir(), 'inkos-provider-recovery-'));
+  vi.stubEnv('INKOS_CODEX_HOME', ''); delete process.env.INKOS_CODEX_HOME;
+  vi.stubEnv('INKOS_CODEX_STATE_ROOT', ''); delete process.env.INKOS_CODEX_STATE_ROOT;
+  client = new FailureClient();
+  clientOptions = { ...clientOptions, _codex: { ...clientOptions._codex, projectRoot: fixtureRoot } };
+  mocks.create.mockReset().mockImplementation(async (projectRoot: string) => {
+    const codexHome = join(projectRoot, '.inkos', 'codex', 'home');
+    mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+    const legacyPath = join(projectRoot, '.inkos', 'codex-config.json');
+    try { writeFileSync(legacyPath, JSON.stringify({ model: 'fixture', reasoningEffort: 'high', serviceTier: 'default' }), { flag: 'wx' }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+    let used = false, closed = false;
+    const closes = new Set<() => void>();
+    return { cwd: client.cwd, codexHome, get closed() { return closed || used && client.closed; },
+      request: async (method: string, params?: unknown, options?: unknown) => {
+        if (method === 'thread/start') { used = true; client.closed = false; }
+        return Reflect.apply(client.request, client, [method, params, options]);
+      },
+      onNotification: client.onNotification.bind(client), onRequest: client.onRequest.bind(client),
+      onClose: (fn: () => void) => { closes.add(fn); client.closes.add(fn); return () => { closes.delete(fn); client.closes.delete(fn); }; },
+      close: async () => { closed = true; if (used) await client.close(); else for (const fn of closes) { client.closes.delete(fn); fn(); } },
+    };
+  });
+});
+afterEach(async () => { await rm(fixtureRoot, { recursive: true, force: true }); vi.unstubAllEnvs(); });
 afterEach(() => { vi.restoreAllMocks(); });
 
 it('binds the successful start response before later mismatched notifications overtake its gated read-only inspection', async () => {
   let release!: () => void, entered!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const started = new Promise<void>(resolve => { entered = resolve; });
-  const agent = new Agent({ projectRoot: '/offline-fixture', settings: clientOptions._codex!.settings,
+  const agent = new Agent({ projectRoot: fixtureRoot, settings: clientOptions._codex!.settings,
     initialState: { model: resolveCodexModel(), systemPrompt: '', messages: [], tools: [] } });
   agent.subscribe(event => {
     if (event.type === 'message_start' && event.message.role === 'assistant') { entered(); return gate; }
@@ -80,7 +111,7 @@ function heldAgent(signal?: AbortSignal) {
   const started = new Promise<void>(resolve => { entered = resolve; });
   const execute = vi.fn(async () => ({ content: [{ type: 'text' as const, text: 'saved' }], details: {} }));
   const persisted = vi.fn();
-  const agent = new Agent({ projectRoot: '/offline-fixture', settings: clientOptions._codex!.settings, signal,
+  const agent = new Agent({ projectRoot: fixtureRoot, settings: clientOptions._codex!.settings, signal,
     initialState: { model: resolveCodexModel(), systemPrompt: '', messages: [], tools: [
       { name: 'submit', label: 'Submit', description: 'Offline tool', parameters: Type.Object({ value: Type.Integer() }), execute },
     ] } });
@@ -170,7 +201,7 @@ it('uses the queued RPC identity before admitting a later tool request behind an
 
 it.each(['completed', 'failed'])('does not admit queued tool effects after the turn is %s', async status => {
   const execute = vi.fn(async () => ({ content: [], details: {} }));
-  const agent = new Agent({ projectRoot: '/offline-fixture', settings: clientOptions._codex!.settings,
+  const agent = new Agent({ projectRoot: fixtureRoot, settings: clientOptions._codex!.settings,
     initialState: { model: resolveCodexModel(), systemPrompt: '', messages: [], tools: [
       { name: 'submit', label: 'Submit', description: 'Offline tool', parameters: Type.Object({ value: Type.Integer() }), execute },
     ] } });

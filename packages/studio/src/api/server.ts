@@ -173,8 +173,13 @@ import { createCodexRoutes } from "./codex.js";
 import { buildStudioBookConfig, normalizeStudioPlatform } from "./book-create.js";
 import {
   deleteStudioTaskSnapshot,
-  loadStudioTaskSnapshot,
+  hasStudioTaskOwner,
+  recoverStudioTaskSnapshot,
+  reserveStudioTaskExecution,
   saveStudioTaskSnapshot,
+  tryAcquireStudioTaskOwnerGuard,
+  type StudioTaskLease,
+  type StudioTaskOwnerGuard,
   type StudioTaskSnapshot,
 } from "./task-store.js";
 
@@ -1513,6 +1518,7 @@ async function executeConfirmedProductionAction(args: {
   });
 
   try {
+    args.signal.throwIfAborted();
     const actionResult = await executeExplicitCapabilityTool({
       projectRoot: args.root,
       binding,
@@ -2567,41 +2573,20 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
   };
 
   const loadReconciledTaskSnapshot = async (sessionId: string): Promise<StudioTaskSnapshot | null> => {
-    const task = await loadStudioTaskSnapshot(root, sessionId);
-    if (!task) return null;
-    const running = task.execution.status === "running" || task.execution.status === "processing";
-    if (!running || activeConfirmedTasks.has(task.execution.id)) return task;
-    // running 快照但本进程没有对应的 AbortController，只可能是任务运行期间
-    // server 进程退出过（正常流程里 controller 先于首次持久化进入 Map、晚于
-    // 终态持久化删除）。任务本体已随旧进程消失，这里把快照改写为终态并保存，
-    // 否则前端每次刷新都会恢复出一个永远运行中的任务卡，停止按钮也无法终结它。
     const lang = await currentProjectLanguage();
-    const completedAt = Date.now();
-    const reconciled: StudioTaskSnapshot = {
-      ...task,
-      updatedAt: completedAt,
-      execution: {
-        ...task.execution,
-        status: "error",
-        error: pick(
-          lang,
-          "任务已中断：Studio 服务在任务运行期间重启，任务未能继续。请重新发起。",
-          "Task interrupted: the Studio server restarted while this task was running. Please start it again.",
-        ),
-        completedAt,
-      },
-    };
-    await saveStudioTaskSnapshot(root, reconciled);
-    return reconciled;
+    return recoverStudioTaskSnapshot(root, sessionId, pick(
+      lang,
+      "任务已中断：Studio 服务在任务运行期间重启，任务未能继续。请重新发起。",
+      "Task interrupted: the Studio server restarted while this task was running. Please start it again.",
+    ));
   };
 
-  // 判断"该会话是否真有生产任务在跑"的唯一入口：
-  // 对账后的快照是 running/processing，且本进程还持有对应的 AbortController。
+  // 持久快照包含其他 Studio 实例仍持有所有权的任务；本地 controller 只用于中止。
   const findActiveRunningTask = async (sessionId: string): Promise<StudioTaskSnapshot | null> => {
     const task = await loadReconciledTaskSnapshot(sessionId);
     if (!task) return null;
     const running = task.execution.status === "running" || task.execution.status === "processing";
-    return running && activeConfirmedTasks.has(task.execution.id) ? task : null;
+    return running ? task : null;
   };
 
   // 找该会话正在运行的任务控制器：优先查内存（预留表 sessionId → taskId →
@@ -4615,8 +4600,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const sessionId = c.req.param("sessionId");
     const chatOnly = c.req.query("scope") === "chat";
     const controller = chatOnly ? undefined : await findRunningTaskController(sessionId);
-    controller?.abort();
-    const taskAborted = Boolean(controller);
+    // The selected task may finish while the async finder returns. Only the
+    // same still-registered controller can accept this Stop.
+    const taskAborted = !!controller && [...activeConfirmedTasks.values()].includes(controller);
+    if (taskAborted) controller.abort();
     const chat = chatRequests.get(sessionId);
     const chatRunning = chat?.snapshot.status === "running";
     const cancellation = await chatRequestStore.cancel(sessionId, chatRunning ? chat.snapshot.requestId : undefined);
@@ -4959,15 +4946,16 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         const taskId = confirmedTaskId;
         const taskController = new AbortController();
         activeConfirmedTasks.set(taskId, taskController);
+        let taskLease: StudioTaskLease | null = null;
+        let taskExecution: CollectedToolExec | undefined;
         let pendingBookId: string | null = null;
         try {
-          // 预留成功后再走快照检查：本进程的任务都会占预留名额，这里防的是
-          // 旧进程遗留的运行中快照（loadReconciledTaskSnapshot 会把它对账成
-          // 终态）等边界情况，保证不覆盖一个仍被认为在运行的任务。
-          const runningTask = await findActiveRunningTask(bookSession.sessionId);
-          if (runningTask) {
+          // 内存占位是本实例的快速路径，持久 owner lease 负责跨实例 admission。
+          taskLease = await reserveStudioTaskExecution(root, reservedSessionId, taskId);
+          if (!taskLease) {
             return productionTaskBusyResponse();
           }
+          taskController.signal.throwIfAborted();
 
           pendingBookId = confirmedIntent === "create_book" && actionPayload?.createBook?.title
             ? deriveBookIdFromTitle(actionPayload.createBook.title)
@@ -5009,12 +4997,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
             taskId,
             sourceRequestId,
             signal: taskController.signal,
-            onTaskChange: (taskExec) => persistConfirmedTask(
-              bookSession.sessionId,
-              confirmedIntent,
-              taskExec,
-              sourceRequestId,
-            ),
+            onTaskChange: (taskExec) => {
+              taskExecution = taskExec;
+              return persistConfirmedTask(reservedSessionId, confirmedIntent, taskExec, sourceRequestId);
+            },
             ...(playMode ? { playMode } : {}),
           });
           const exec = confirmedOutcome.execution;
@@ -5050,7 +5036,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           exec.status = "running";
           exec.completedAt = undefined;
           exec.logs = [...(exec.logs ?? []), pick(surfaceLanguage, "继续完成确认请求中的剩余动作…", "Continuing the remaining confirmed request...")].slice(-80);
-          await persistConfirmedTask(bookSession.sessionId, confirmedIntent, exec, sourceRequestId);
+          await persistConfirmedTask(reservedSessionId, confirmedIntent, exec, sourceRequestId);
           const continuation = await runAgentSession({
             onWorkTransition: publishExecutionTarget,
             signal: taskController.signal,
@@ -5104,7 +5090,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
                 };
                 continuedToolExecs.push(toolExec);
                 exec.logs = [...(exec.logs ?? []), `${toolExec.label}…`].slice(-80);
-                void persistConfirmedTask(bookSession.sessionId, confirmedIntent, exec, sourceRequestId).catch(() => undefined);
+                void persistConfirmedTask(reservedSessionId, confirmedIntent, exec, sourceRequestId).catch(() => undefined);
                 broadcast("tool:start", {
                   sessionId: streamSessionId,
                   id: event.toolCallId,
@@ -5124,7 +5110,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
                   else toolExec.result = summarizeToolResult(event.result);
                   toolExec.details = (event.result as { details?: unknown } | undefined)?.details;
                   exec.logs = [...(exec.logs ?? []), `${toolExec.label}: ${toolExec.status}`].slice(-80);
-                  void persistConfirmedTask(bookSession.sessionId, confirmedIntent, exec, sourceRequestId).catch(() => undefined);
+                  void persistConfirmedTask(reservedSessionId, confirmedIntent, exec, sourceRequestId).catch(() => undefined);
                 }
                 broadcast("tool:end", {
                   sessionId: streamSessionId,
@@ -5149,7 +5135,11 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
               continuationError: continuation.errorMessage,
             };
           }
-          await persistConfirmedTask(bookSession.sessionId, confirmedIntent, exec, sourceRequestId);
+          await persistConfirmedTask(reservedSessionId, confirmedIntent, exec, sourceRequestId);
+          // Select success without yielding: an accepted Stop before this
+          // point wins, and later Stops cannot cancel the completed task.
+          taskController.signal.throwIfAborted();
+          activeConfirmedTasks.delete(taskId);
           const responseText = continuation.responseText
             || exec.result
             || pick(surfaceLanguage, "已完成。", "Done.");
@@ -5167,13 +5157,27 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
             },
           });
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          const failure = formatAgentActionFailure(error, surfaceLanguage);
+          const cancelled = taskController.signal.aborted;
+          const message = cancelled
+            ? pick(surfaceLanguage, "生产任务已停止。", "The production task was stopped.")
+            : error instanceof Error ? error.message : String(error);
+          if (cancelled && taskExecution) {
+            // Keep the actual execution and its tool receipt. FIFO persistence
+            // drains earlier progress before this cancellation state; failure
+            // to save it must surface rather than become a successful Stop.
+            taskExecution.status = "error";
+            taskExecution.completedAt = Date.now();
+            taskExecution.error = message;
+            await persistConfirmedTask(reservedSessionId, confirmedIntent, taskExecution, sourceRequestId);
+          }
+          const failure = cancelled
+            ? { code: "PRODUCTION_TASK_CANCELLED", message, status: 409 as const }
+            : formatAgentActionFailure(error, surfaceLanguage);
           if (pendingBookId) {
             bookCreateStatus.set(pendingBookId, { status: "error", error: message });
             broadcast("book:error", { bookId: pendingBookId, sessionId: streamSessionId, error: message });
           }
-          if (error instanceof ApiError) {
+          if (error instanceof ApiError && !cancelled) {
             broadcast("agent:error", { instruction, activeBookId: agentBookId, sessionId: bookSession.sessionId, sessionKind, error: message });
             return c.json({
               error: { code: error.code, message: error.message },
@@ -5198,8 +5202,12 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
             response: failure.message,
           }, failure.status);
         } finally {
-          activeConfirmedTasks.delete(taskId);
-          reservedProductionSessions.delete(reservedSessionId);
+          try {
+            await taskLease?.release();
+          } finally {
+            activeConfirmedTasks.delete(taskId);
+            reservedProductionSessions.delete(reservedSessionId);
+          }
         }
       }
 
@@ -5214,6 +5222,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       // 同时传 suppressProductionTools 在 host 层剔除会修改书籍/产物的
       // 生产工具（提示词只是软约束）。
       const backgroundTask = await findActiveRunningTask(bookSession.sessionId);
+      // Admission precedes transcript/snapshot persistence. An occupied owner
+      // suppresses production even when there is no execution to describe yet.
+      const suppressProductionTools = !!backgroundTask || hasStudioTaskOwner(root, bookSession.sessionId);
+      let chatToolGuard: StudioTaskOwnerGuard | undefined;
       const result = await runAgentSession(
         {
           signal: chatRequest?.controller.signal,
@@ -5225,9 +5237,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           ...(backgroundTask
             ? {
                 backgroundTaskContext: buildRunningTaskContextBlock(backgroundTask, surfaceLanguage),
-                suppressProductionTools: true,
               }
             : {}),
+          ...(suppressProductionTools ? { suppressProductionTools: true } : {}),
           projectRoot: root,
           bookId: agentBookId,
           sessionKind,
@@ -5263,6 +5275,18 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
               }
             }
             if (event.type === "tool_execution_start") {
+              // The Agent awaits this listener before argument preparation and
+              // execution. Acquire synchronously: a later confirmation cannot
+              // race a turn that still has production tools. Initially read-only
+              // turns need no guard and can keep using their remaining tools.
+              if (!suppressProductionTools && !chatToolGuard) {
+                chatToolGuard = tryAcquireStudioTaskOwnerGuard(root, bookSession.sessionId);
+                if (!chatToolGuard) throw new ApiError(409, "PRODUCTION_TASK_ALREADY_RUNNING", pick(
+                  surfaceLanguage,
+                  "当前会话已有一个生产任务在运行，请等它完成，或先用停止按钮结束它，再发起新任务。",
+                  "A production task is already running in this session. Wait for it to finish, or stop it first, then start a new task.",
+                ));
+              }
               const toolName = capabilityActionId(event.toolName);
               const args = event.args as Record<string, unknown> | undefined;
 
@@ -5328,7 +5352,11 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           },
         },
         instruction,
-      );
+      ).finally(() => {
+        // runAgentSession drains actual tool work before settling, including on
+        // cancellation/failure. tool_execution_end alone is too early to release.
+        chatToolGuard?.release();
+      });
 
       bookSession = await loadBookSession(root, bookSession.sessionId) ?? bookSession;
 

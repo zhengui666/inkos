@@ -1,7 +1,7 @@
 import type { Frame, Locator, Page } from 'playwright-core';
 import { z } from 'zod';
 import { publishingError } from './contracts.js';
-import { normalizeMegaNovelBodyText, MegaNovelSnapshotRequestSchema, type MegaNovelBrowserPort, type MegaNovelProbe,
+import { normalizeMegaNovelBodyText, MegaNovelSnapshotRequestSchema, MegaNovelSubmissionBlockedError, type MegaNovelBrowserPort, type MegaNovelProbe,
   type MegaNovelScope, type MegaNovelSnapshot, type MegaNovelSnapshotRequest } from './meganovel-contracts.js';
 import type { MegaNovelDomBinding } from './meganovel-cdp.js';
 
@@ -218,7 +218,10 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       recent.set(key(input), editorIdentity(page.url())!.chapterId!);
     },
     async submit(page, input, signal, beforeMutation) {
-      const guard = async () => { await beforeMutation?.(); signal.throwIfAborted(); };
+      const guard = async () => {
+        try { await beforeMutation?.(); signal.throwIfAborted(); }
+        catch (error) { throw new MegaNovelSubmissionBlockedError(error); }
+      };
       await probe(page, input.scope, signal);
       await page.goto(editorUrl(input.scope.remoteBookId, input.remoteChapterId), {waitUntil: 'domcontentloaded'});
       const editor = await readEditor(page, input.scope, signal);
@@ -258,6 +261,10 @@ export function createMegaNovelDomBinding(configuration: MegaNovelDomConfigurati
       await verifyScheduleDialog(scheduleTitle, [now, later, confirm, cancel]);
       signal.throwIfAborted();
       await guard();
+      try { beforeMutation?.authorizeSubmission?.(input); signal.throwIfAborted(); }
+      catch (error) { throw new MegaNovelSubmissionBlockedError(error); }
+      // Authorization and issuing this request share a host call stack. Remote
+      // execution is asynchronous; filesystem writes and DOM are not atomic.
       await confirm.click(); // Exactly one final action. Readback is performed independently by the adapter.
     },
   };

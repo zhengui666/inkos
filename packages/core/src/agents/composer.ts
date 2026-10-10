@@ -1,4 +1,5 @@
-import { readerContractContext } from "./reader-contract-context.js";
+import { readerContractContext, readerContractContextFromRaw } from "./reader-contract-context.js";
+import type { ChapterReviewInputs } from "../pipeline/review-inputs.js";
 import { readFile, mkdir, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { BaseAgent, prepareWorkerInput } from "./base.js";
@@ -46,6 +47,7 @@ export interface ComposeChapterInput {
   readonly referenceContextProvider?: BookReferenceContextProvider;
   readonly memorySemanticSelector?: MemorySemanticSelector;
   readonly onContextCompression?: ContextCompressionCallback;
+  readonly authoritativeInputs?: ChapterReviewInputs;
 }
 
 export type BookReferenceContextProvider = (
@@ -99,6 +101,7 @@ export async function composeGovernedChapter(input: ComposeChapterInput): Promis
     input.book.language,
     input.outlineSectionSelector,
     input.memorySemanticSelector,
+    input.authoritativeInputs,
   );
   const referenceContext = await loadReferenceContext(input);
   return persistComposedContext(input, baseContext, referenceContext);
@@ -348,10 +351,10 @@ export class ComposerAgent extends BaseAgent {
     };
     if ((contextBudget || this.ctx.client._codex) && !input.outlineSectionSelector && !input.memorySemanticSelector) {
       const reference = await loadReferenceContext(configured);
-      const complete = await this.completeContextWithinBudget(input.bookDir, input.plan, input.book.language, contextBudget, reference.entries);
+      const complete = await this.completeContextWithinBudget(input.bookDir, input.plan, input.book.language, contextBudget, reference.entries, input.authoritativeInputs);
       if (complete) return persistComposedContext(configured, complete, reference);
       const selected = await collectSelectedContext(join(input.bookDir, "story"), input.plan, input.book.language,
-        configured.outlineSectionSelector, configured.memorySemanticSelector);
+        configured.outlineSectionSelector, configured.memorySemanticSelector, input.authoritativeInputs);
       return persistComposedContext(configured, selected, reference);
     }
     return composeGovernedChapter(configured);
@@ -365,6 +368,7 @@ export class ComposerAgent extends BaseAgent {
     readonly contextBudget?: ContextBudget;
     /** An existing chapter's actual memo preserves exact hook references. */
     readonly chapterMemo?: PlanChapterOutput["memo"];
+    readonly authoritativeInputs?: ChapterReviewInputs;
   }): Promise<ContextPackage> {
     const plan: PlanChapterOutput = {
       intent: { chapter: input.chapterNumber, goal: input.goal },
@@ -379,13 +383,14 @@ export class ComposerAgent extends BaseAgent {
       plannerInputs: [],
     };
     const budget = input.contextBudget ?? contextBudgetFromClient(this.ctx.client);
-    const complete = budget || this.ctx.client._codex ? await this.completeContextWithinBudget(input.bookDir, plan, input.language, budget) : undefined;
+    const complete = budget || this.ctx.client._codex ? await this.completeContextWithinBudget(input.bookDir, plan, input.language, budget, [], input.authoritativeInputs) : undefined;
     const selected = complete ?? await collectSelectedContext(
       join(input.bookDir, "story"),
       plan,
       input.language,
       (request) => this.selectOutlineSections(request),
       (request) => this.selectMemoryCandidates(request),
+      input.authoritativeInputs,
     );
     return ContextPackageSchema.parse({
       chapter: input.chapterNumber,
@@ -396,6 +401,7 @@ export class ComposerAgent extends BaseAgent {
   private async completeContextWithinBudget(
     bookDir: string, plan: PlanChapterOutput, language: "zh" | "en", budget: ContextBudget | undefined,
     references: ContextPackage["selectedContext"] = [],
+    authoritativeInputs?: ChapterReviewInputs,
   ): Promise<Awaited<ReturnType<typeof collectSelectedContext>> | undefined> {
     // With an explicit provider budget, reserve half for the consumer envelope.
     // Native Codex has no host capacity guess: retain the complete source corpus.
@@ -403,7 +409,7 @@ export class ComposerAgent extends BaseAgent {
     if (contextAllowance !== undefined && contextAllowance <= 0) return undefined;
     const complete = await collectSelectedContext(join(bookDir, "story"), plan, language,
       async request => request.candidates.map(candidate => candidate.source),
-      async request => request.candidates.map(candidate => candidate.id));
+      async request => request.candidates.map(candidate => candidate.id), authoritativeInputs);
     const tokens = estimateSelectedContextTokens([...complete.entries, ...references]);
     if (contextAllowance !== undefined && tokens > contextAllowance) return undefined;
     recordExecutionEvidence("context-selection", {scope:"story_context",mode:"complete",estimatedTokens:tokens,budgetTokens:contextAllowance,
@@ -673,6 +679,7 @@ async function collectSelectedContext(
   language: "zh" | "en",
   outlineSectionSelector?: OutlineSectionSelector,
   memorySemanticSelector?: MemorySemanticSelector,
+  authoritativeInputs?: ChapterReviewInputs,
 ): Promise<{
   readonly entries: ContextPackage["selectedContext"];
   readonly retrievalTrace: MemoryRetrievalTrace;
@@ -703,18 +710,21 @@ async function collectSelectedContext(
         "current_focus.md",
         "Current task focus for this chapter.",
         "protected",
+        authoritativeInputs?.currentFocus,
       ),
       maybeContextSource(
         storyDir,
         "author_intent.md",
         "User's long-term authorial intent and direction — binding, overrides model defaults.",
         "protected",
+        authoritativeInputs?.authorIntent,
       ),
       maybeContextSource(
         storyDir,
         "style_guide.md",
         "User-approved style guidance for this Work.",
         "protected",
+        authoritativeInputs?.styleGuide,
       ),
     ]);
     const currentStateEntries = await selectCurrentStateEntries({
@@ -749,12 +759,14 @@ async function collectSelectedContext(
         "parent_canon.md",
         "Preserve parent canon constraints for governed continuation or fanfic writing.",
         "protected",
+        authoritativeInputs?.parentCanon,
       ),
       maybeContextSource(
         storyDir,
         "fanfic_canon.md",
         "Preserve extracted fanfic canon constraints for governed writing.",
         "protected",
+        authoritativeInputs?.fanficCanon,
       ),
     ]);
     const roleEntries = await selectRoleCardEntries({
@@ -806,7 +818,7 @@ async function collectSelectedContext(
     return {
       entries: [
         ...chapterMemoEntry,
-        ...await readerContractContext(storyDir),
+        ...(authoritativeInputs ? readerContractContextFromRaw(authoritativeInputs.bookRulesJson) : await readerContractContext(storyDir)),
         ...entries.filter((entry): entry is NonNullable<typeof entry> => entry !== null),
         ...currentStateEntries,
         ...outlineEntries,
@@ -1004,9 +1016,10 @@ async function maybeContextSource(
   fileName: string,
   reason: string,
   protection: "protected" | "compressible",
+  authoritativeContent?: string | null,
 ): Promise<ContextPackage["selectedContext"][number] | null> {
     const path = join(storyDir, fileName);
-    const content = await readFileOrDefault(path);
+    const content = authoritativeContent === undefined ? await readFileOrDefault(path) : authoritativeContent;
 
     if (!content) return null;
 

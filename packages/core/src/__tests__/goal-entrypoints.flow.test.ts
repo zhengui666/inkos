@@ -85,7 +85,7 @@ describe('public persistent chapter goal entry points',()=>{
   it('recovers a dead process without inference, then explicitly continues within the same attempt budget',async()=>{
     const f=await setup(1),created=await f.service.create(f.input);
     const modulePath=new URL('../../dist/goals/store.js',import.meta.url).href;
-    const script=`import {GoalStore} from ${JSON.stringify(modulePath)};const store=new GoalStore(process.argv[1]);store.requestRun('goal',store.get('goal').version);const lease=store.claim('goal');store.beginAttempt(lease,'chapter-1');process.stdout.write('ready\\n');setInterval(()=>{},1000);`;
+    const script=`import {GoalStore} from ${JSON.stringify(modulePath)};const store=new GoalStore(process.argv[1]);store.requestRun('goal',store.get('goal').version);const lease=store.claim('goal');store.beginAttempt(lease,'chapter-1');process.stdout.write('ready\\n');setInterval(()=>{store.get('goal');},1000);`;
     const child=spawn(process.execPath,['--input-type=module','-e',script,join(f.root,'.inkos/harness.sqlite')],{stdio:['ignore','pipe','pipe']});
     try{
       await once(child.stdout,'data');const running=f.service.get('goal');

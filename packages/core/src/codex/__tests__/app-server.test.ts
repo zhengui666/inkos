@@ -50,6 +50,18 @@ describe('Codex stdio JSON-RPC', () => {
     await Promise.all([client.close(), client.close()]); expect(cleanup).toHaveBeenCalledOnce();
     const lateClose = vi.fn(); client.onClose(lateClose); await Promise.resolve(); expect(lateClose).toHaveBeenCalledOnce();
   });
+  it('separates transport failure from the shared process-exit and cleanup settlement', async () => {
+    const { client, child, cleanup } = fixture();
+    child.kill.mockImplementation(() => true);
+    const notice = vi.fn(); client.onClose(notice);
+    const request = client.request('pending'); child.stdout.write('invalid-frame\n');
+    await expect(request).rejects.toThrow('Invalid Codex'); expect(client.closed).toBe(true); expect(notice).toHaveBeenCalledTimes(1);
+    const closing = client.close(); expect(client.close()).toBe(closing);
+    let settled = false; void closing.then(() => { settled = true; });
+    await Promise.resolve(); expect(settled).toBe(false); expect(cleanup).not.toHaveBeenCalled();
+    child.emit('close', 1); await closing;
+    expect(cleanup).toHaveBeenCalledTimes(1); expect(child.kill).toHaveBeenCalledTimes(1); expect(settled).toBe(true);
+  });
   it('fails closed on malformed transport frames without exposing raw account errors', async () => {
     const { client, child, response } = fixture();
     const error = client.request('account/read');

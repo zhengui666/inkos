@@ -9,6 +9,7 @@ export const ShortStageSchema = z.object({
   status: z.enum(["completed", "failed"]),
   inputHash: z.string(),
   requestHash: z.string().optional(),
+  targetHash: z.string().optional(),
   reviewHash:z.string().optional(),
   updatedAt: z.string(),
   observations: z.array(ObservationSchema),

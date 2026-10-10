@@ -133,3 +133,10 @@ export { syncWorkSourceArtifacts, createInitialWorkManifestWrite } from "./sourc
 export { migrateLegacyWorks, type LegacyMigrationItem } from "./legacy-migration.js";
 
 export { createShortProductionStageTools } from "./tools/short-production.js";
+export {
+  SQLITE_OWNER_TOKEN_PREFIX,
+  createOwnershipLockSpace,
+  type OwnershipLockKind,
+  type OwnershipLockHandle,
+  type OwnershipLockSpace,
+} from "./ownership-lock.js";

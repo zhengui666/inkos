@@ -1,8 +1,9 @@
-import { readChapterReviewInputs, type ChapterReviewInputs } from "./review-inputs.js";
+import { readChapterReviewInputs, type ChapterReviewInputs, type ChapterReviewPolicy } from "./review-inputs.js";
 import { captureDraftSources, sameDraftPlanningSources, assertPreparedDraftInputs, saveUnsettledDraft, loadUnsettledDraft, assertDraftSourcesCurrent, clearUnsettledDraft } from "./unsettled-draft.js";
 import { prepareStateReplay, commitStateReplay } from "../state/state-replay.js";
 import { withWorkMutationScope } from "../utils/work-mutation-scope.js";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { withCodexExecution } from "../runtime/execution.js";
 import {readPinnedParentCanon} from "../harness/parent-canon.js";
 import {renderChapterDocument,chapterDocumentBody} from '../utils/chapter-document.js';
 import {changedSourceRegion} from '../utils/source-text.js';
@@ -244,7 +245,7 @@ export class PipelineRunner {
     merged.signal?.throwIfAborted();
     return this.operationContext.run(merged, async () => {
       merged.signal?.throwIfAborted();
-      return task();
+      return withCodexExecution(this.config.projectRoot, task, { signal: merged.signal });
     });
   }
 
@@ -838,8 +839,9 @@ export class PipelineRunner {
   }
 
   /** Review the existing chapter and save observations without replanning its story. */
-  async reviewChapter(bookId: string, chapterNumber?: number, options?: { readonly requireStoryClosure?: boolean }): Promise<AuditResult & { readonly chapterNumber: number; readonly reviewInputs: ChapterReviewInputs; readonly delivery?: ReturnType<typeof chapterLengthDelivery> }> {
+  async reviewChapter(bookId: string, chapterNumber?: number, options?: { readonly requireStoryClosure?: boolean }): Promise<AuditResult & { readonly chapterNumber: number; readonly reviewInputs: ChapterReviewInputs; readonly reviewPolicy: ChapterReviewPolicy; readonly delivery?: ReturnType<typeof chapterLengthDelivery> }> {
     const book = await this.state.loadBookConfig(bookId);
+    const reviewPolicy: ChapterReviewPolicy = { requireStoryClosure: options?.requireStoryClosure === true, language: book.language };
     const bookDir = this.state.bookDir(bookId);
     const targetChapter = chapterNumber ?? (await this.state.getNextChapterNumber(bookId)) - 1;
     if (targetChapter < 1) {
@@ -851,7 +853,7 @@ export class PipelineRunner {
     const chapterBrief = reviewInputs.authorBrief?.trim() ?? "";
     const governed = await this.prepareExistingChapterContext(book,targetChapter,
       chapterBrief, reviewInputs);
-    if (options?.requireStoryClosure) governed.contextPackage.selectedContext.push({
+    if (reviewPolicy.requireStoryClosure) governed.contextPackage.selectedContext.push({
       source: STORY_CLOSURE_SOURCE, protection: "protected",
       reason: "The authorized creation task requests story completion here, independently of chapter count.",
       excerpt: "Review the actual central promise and ending against the author brief. A count, planned ending or publication claim is not evidence of closure.",
@@ -894,7 +896,7 @@ export class PipelineRunner {
     await syncWorkSourceArtifacts({ projectRoot: this.config.projectRoot, workId: bookId, accept: true, acceptPaths: ["source/chapters/index.json"] });
     const spec=buildLengthSpec(book.chapterWordCount,book.language,book);
     const delivery=chapterLengthDelivery(countChapterLength(content,spec.countingMode),spec);
-    return { ...result, chapterNumber: targetChapter, reviewInputs,...(delivery?{delivery}:{}) };
+    return { ...result, chapterNumber: targetChapter, reviewInputs, reviewPolicy,...(delivery?{delivery}:{}) };
   }
 
   /** Revise the latest (or specified) chapter from user direction and review observations. */
@@ -2208,6 +2210,7 @@ export class PipelineRunner {
     const contextPackage=await new ComposerAgent(this.agentCtxFor('composer',book.id)).selectTaskContext({
       bookDir:this.state.bookDir(book.id),chapterNumber,goal:chapterIntent,language:book.language,
       chapterMemo: originalPlan?.memo,
+      authoritativeInputs: reviewInputs,
     });
     if (reviewInputs && reviewInputs.bookRules === null) throw new Error('Book rules are missing; review cannot proceed without its authority.');
     const rules = reviewInputs ? reviewInputs.bookRules! : await readFile(join(this.state.bookDir(book.id),'story/book_rules.md'),'utf8');

@@ -17,7 +17,7 @@ beforeAll(async () => {
   modules = await mkdtemp(join(tmpdir(), 'inkos-owner-modules-'));
   await mkdir(join(modules, 'pipeline'));
   await mkdir(join(modules, 'harness'));
-  for (const part of ['pipeline/scheduler-store', 'harness/sqlite']) {
+  for (const part of ['pipeline/scheduler-store', 'harness/sqlite', 'harness/ownership-lock']) {
     const source = await readFile(new URL(`../${part}.ts`, import.meta.url), 'utf8');
     await writeFile(join(modules, `${part}.js`), ts.transpileModule(source, {
       compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },

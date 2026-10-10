@@ -181,7 +181,7 @@ describe("Studio API mini-flows", () => {
     expect((await readFile(exportBody.outputPath)).byteLength).toBeGreaterThan(0);
   });
 
-  it("turns a server-interrupted task snapshot into a terminal session result", async () => {
+  it("preserves an ownerless legacy running task because server recreation cannot prove it stopped", async () => {
     const sessionId = "flow-session";
     await createAndPersistBookSession(root, null, sessionId, "short");
     await saveStudioTaskSnapshot(root, {
@@ -210,9 +210,12 @@ describe("Studio API mini-flows", () => {
       completed: typeof body.task.execution.completedAt === "number",
     }).toEqual({
       responseStatus: 200,
-      responseTask: "error",
-      persistedTask: "error",
-      completed: true,
+      responseTask: "running",
+      persistedTask: "running",
+      completed: false,
     });
+    expect(persisted).not.toHaveProperty("owner");
+    expect(persisted?.execution).not.toHaveProperty("error");
+    expect(persisted?.updatedAt).toBe(20);
   });
 });

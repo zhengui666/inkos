@@ -607,8 +607,27 @@ export { LLM_API_FORMATS, isLLMApiFormat, toPiApi, type LLMApiFormat } from "./l
 export * from "./harness/index.js";
 
 export * from "./codex/account.js";
+export type { CodexClient } from "./codex/app-server.js";
 export * from "./codex/settings.js";
 export * from "./codex/types.js";
+export {
+  HarnessIdSchema as RuntimeHarnessIdSchema, RuntimeIdSchema, RuntimeRevisionSchema,
+  ModelConnectionSchema, HarnessPreferencesSchema, AGENT_SETTINGS_SCHEMA_VERSION,
+  AgentSettingsSchema, HarnessModelCapabilitySchema, HarnessCapabilityCatalogSchema,
+  HarnessDescriptorSchema, ModelConnectionAdmissionSchema,
+} from "./runtime/contracts.js";
+export type {
+  HarnessId, ModelConnection, HarnessPreferences, AgentSettings, HarnessModelCapability,
+  HarnessCapabilityCatalog, HarnessDescriptor, ModelConnectionAdmission, RuntimeSelection,
+} from "./runtime/contracts.js";
+export * from "./runtime/capabilities.js";
+export * from "./runtime/selection.js";
+export * from "./runtime/registry.js";
+export {
+  AGENT_CONFIG_FILE, DEFAULT_AGENT_SETTINGS, AgentSettingsPatchSchema,
+  AgentSettingsConflictError, parseAgentSettings, readAgentSettings, updateAgentSettings,
+} from "./runtime/settings.js";
+export type { AgentSettingsPatch, UpdateAgentSettingsOptions } from "./runtime/settings.js";
 
 export { inspectCodexReadiness, selectCodexModel, CodexConfigurationError } from "./codex/account.js";
 export { GoalStore } from "./goals/store.js";
@@ -631,3 +650,13 @@ export { createChapterGoalTools } from './harness/tools/chapter-goals.js';
 export * from "./creation/contracts.js";
 export { CreationTaskStore } from "./creation/store.js";
 export { creationTaskView } from "./creation/coordinator.js";
+export { CodexAuthenticationOwner, RuntimeAuthenticationError } from './runtime/auth/codex-owner.js';
+export type { CodexConnectionRecord, CodexAuthOperation, CodexAuthenticationTarget, CodexAccountObservation, CodexOwnerObservation } from './runtime/auth/codex-owner.js';
+export { CodexRuntimeAdapter, CODEX_ADAPTER_VERSION } from './runtime/adapters/codex/adapter.js';
+export type { CodexNativeDefaultsEvidence } from './runtime/adapters/codex/adapter.js';
+export { observeCodexRuntime, bindCodexModelConnection, withCodexExecution, guardCodexExecution, startCodexRuntimeThread, startCodexRuntimeTurn, dispatchCodexHostEffect } from './runtime/execution.js';
+export type { CodexRuntimeObservation, CodexExecutionOptions, CodexThreadEffective } from './runtime/execution.js';
+export { currentCodexRun, runWithCodexContext } from './runtime/run-context.js';
+export type { CodexRunContext } from './runtime/run-context.js';
+
+export * from "./runtime/run-history.js";

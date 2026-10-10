@@ -1,7 +1,7 @@
-import type { ChapterReviewInputs } from "./review-inputs.js";
+import type { ChapterReviewInputs, ChapterReviewPolicy } from "./review-inputs.js";
 import { randomUUID } from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
-import { realpathSync } from "node:fs";
+import type { DatabaseSync } from "node:sqlite";
+import { createOwnershipLockSpace, SQLITE_OWNER_TOKEN_PREFIX, type OwnershipLockHandle, type OwnershipLockSpace } from "../harness/ownership-lock.js";
 import { openHarnessDatabase } from "../harness/sqlite.js";
 import type { BookConfig } from "../models/book.js";
 import type { Observation } from "../models/observation.js";
@@ -27,8 +27,8 @@ export interface ScheduledChapter {
   reviewUnavailableChecks?: number;
   reviewAttempt?: { revisionId: string; startedAt: number };
   reviewRepair?: { revisionId: string; startedAt: number };
-  /** Legacy receipts without inputs can only reconcile prior remote attempts. */
-  reviewReceipt?: { inputs?: ChapterReviewInputs; revisionId: string; reviewedAt: number; summary: string; observations: readonly Observation[] };
+  /** Legacy receipts without inputs or policy can only reconcile prior remote attempts. */
+  reviewReceipt?: { inputs?: ChapterReviewInputs; reviewPolicy?: ChapterReviewPolicy; revisionId: string; reviewedAt: number; summary: string; observations: readonly Observation[] };
   failures: number;
   nextAttemptAt: number;
   publicationStartedAt?: number;
@@ -37,7 +37,6 @@ export interface ScheduledChapter {
 }
 
 const owners = new Set<string>();
-const LOCKED_OWNER_PREFIX = "sqlite-lock-v1:";
 function daemonBusy(): Error {
   return Object.assign(new Error("A daemon already owns this project."), { code: "DAEMON_BUSY" });
 }
@@ -50,11 +49,11 @@ function alive(pid: number): boolean {
 export class SchedulerStore {
   private readonly db: DatabaseSync;
   private owner?: string;
-  private ownerLock?: DatabaseSync;
-  private readonly ownerLockPath: string;
+  private ownerLock?: OwnershipLockHandle;
+  private readonly lockSpace: OwnershipLockSpace;
   constructor(path: string) {
     this.db = openHarnessDatabase(path);
-    this.ownerLockPath = path === ":memory:" ? path : `${realpathSync(path)}.daemon-lock`;
+    this.lockSpace = createOwnershipLockSpace(path);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS scheduler_owner (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER NOT NULL, token TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS scheduler_control (id INTEGER PRIMARY KEY CHECK(id=1), stop_requested INTEGER NOT NULL);
@@ -69,23 +68,18 @@ export class SchedulerStore {
     // A separate SQLite transaction is held for the process lifetime. Kernel
     // locks disappear on crash/reboot, unlike persisted PIDs which may be reused.
     // Never hold this transaction on the shared writing/publication ledger.
-    const lock = new DatabaseSync(this.ownerLockPath);
-    try { lock.exec("PRAGMA busy_timeout = 0; BEGIN EXCLUSIVE"); }
-    catch (error) {
-      lock.close();
-      if ([5, 6].includes(Number((error as { errcode?: number }).errcode))) throw daemonBusy();
-      throw error;
-    }
+    const lock = this.lockSpace.tryAcquire("daemon");
+    if (!lock) throw daemonBusy();
     try {
       const token = this.transaction(() => {
         const previous = this.db.prepare("SELECT pid, token FROM scheduler_owner WHERE id=1").get();
         // Pre-upgrade daemons do not hold the new lock. Keep their conservative
         // PID check until they have stopped; never take over a live legacy owner.
-        if (previous && !String(previous.token).startsWith(LOCKED_OWNER_PREFIX)
+        if (previous && !String(previous.token).startsWith(SQLITE_OWNER_TOKEN_PREFIX)
           && (Number(previous.pid) === process.pid ? owners.has(String(previous.token)) : alive(Number(previous.pid)))) {
           throw daemonBusy();
         }
-        const next = `${LOCKED_OWNER_PREFIX}${randomUUID()}`;
+        const next = `${SQLITE_OWNER_TOKEN_PREFIX}${randomUUID()}`;
         this.db.prepare("INSERT OR REPLACE INTO scheduler_owner(id,pid,token) VALUES(1,?,?)").run(process.pid, next);
         this.db.prepare("INSERT OR REPLACE INTO scheduler_control(id,stop_requested) VALUES(1,0)").run();
         return next;
@@ -93,7 +87,10 @@ export class SchedulerStore {
       this.owner = token;
       owners.add(token);
       this.ownerLock = lock;
-    } catch (error) { lock.close(); throw error; }
+    } catch (error) {
+      try { lock.release(); } catch { /* preserve the claim failure */ }
+      throw error;
+    }
   }
   runningOwner(): { pid: number; token: string } | undefined {
     const row = this.db.prepare("SELECT pid,token FROM scheduler_owner WHERE id=1").get();
@@ -203,7 +200,7 @@ export class SchedulerStore {
       if (this.owner) owners.delete(this.owner);
       this.owner = undefined;
       try { this.db.close(); }
-      finally { this.ownerLock?.close(); this.ownerLock = undefined; }
+      finally { this.ownerLock?.release(); this.ownerLock = undefined; }
     }
   }
   private transaction<T>(operation: () => T): T {

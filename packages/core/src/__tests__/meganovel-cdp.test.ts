@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { connectMegaNovelCdpPort, validateMegaNovelCdpEndpoint, type MegaNovelCdpConfiguration,
   type MegaNovelDomBinding } from '../publishing/meganovel-cdp.js';
 import { PublisherStartupCleanupError } from '../publishing/publisher-cleanup.js';
+import { MegaNovelSubmissionBlockedError } from '../publishing/meganovel-contracts.js';
 
 const fixture = vi.hoisted(() => ({connect: vi.fn()}));
 vi.mock('playwright-core', () => ({chromium: {connectOverCDP: fixture.connect}}));
@@ -108,12 +109,90 @@ describe('MegaNovel actual CDP transport with synthetic browser driver', () => {
     let changed = false;
     binding.probe = vi.fn(async () => { changed = true; return {scope: config.scope, origin: 'https://www.meganovel.com' as const, blocker: 'none' as const}; });
     const beforeMutation = vi.fn(async () => { if (changed) throw Object.assign(new Error('New author brief'), {code: 'CHAPTER_REVIEW_INPUTS_CHANGED'}); });
-    await expect(port[operation](input, {beforeMutation})).rejects.toMatchObject({code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
+    const blocked = await port[operation](input, {beforeMutation}).catch(error => error);
+    if (operation === 'submit') {
+      expect(blocked).toBeInstanceOf(MegaNovelSubmissionBlockedError);
+      expect(blocked.cause).toMatchObject({code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
+    } else expect(blocked).toMatchObject({code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
     expect(binding[operation]).not.toHaveBeenCalled();
     changed = false;
     binding.probe = vi.fn(async () => ({scope: config.scope, origin: 'https://www.meganovel.com' as const, blocker: 'none' as const}));
     await port[operation](input, {beforeMutation});
-    expect(binding[operation]).toHaveBeenCalledWith(expect.anything(), input, expect.any(AbortSignal), beforeMutation);
+    expect(binding[operation]).toHaveBeenCalledWith(expect.anything(), input, expect.any(AbortSignal), expect.any(Function));
+    const forwardedGuard = vi.mocked(binding[operation]).mock.calls[0]![3]!;
+    await forwardedGuard();
+    expect(beforeMutation).toHaveBeenCalledTimes(3);
+  });
+  it.each(['CHAPTER_REVIEW_INPUTS_CHANGED', 'fixture-only-code'])('proves no submission when the transport guard rejects with %s before entering the binding', async code => {
+    port = await connectMegaNovelCdpPort(config, binding);
+    const cause = Object.assign(new Error('Offline pre-submit authority change'), {code});
+    const beforeMutation = vi.fn(async () => { throw cause; });
+    const input = {packageId: 'package-1', chapterNumber: 1, scope: config.scope, aiAssisted: true,
+      revisionId: 'revision-1', title: 'Title', content: 'Body', remoteChapterId: 'remote-1'};
+    const blocked = await port.submit(input, {beforeMutation}).catch(error => error);
+    expect(binding.submit).not.toHaveBeenCalled();
+    expect(beforeMutation).toHaveBeenCalledOnce();
+    expect(blocked).toBeInstanceOf(MegaNovelSubmissionBlockedError);
+    expect(blocked.cause).toBe(cause);
+    expect(blocked.cause.code).toBe(code);
+  });
+  it.each([false, true])('passes a synchronous final authorization to the binding with async guard=%s', async hasAsyncGuard => {
+    port = await connectMegaNovelCdpPort(config, binding);
+    const order: string[] = [];
+    const beforeMutation = vi.fn(async () => { order.push('async guard'); });
+    const authorizeSubmission = vi.fn(() => { order.push('final authorization'); });
+    binding.submit = vi.fn<MegaNovelDomBinding['submit']>(async (_page, _input, _signal, guard) => {
+      order.push('binding entered');
+      expect(guard).toBeTypeOf('function');
+      expect(guard!.authorizeSubmission).toBeTypeOf('function');
+      expect(authorizeSubmission).not.toHaveBeenCalled();
+      await guard!();
+      expect(authorizeSubmission).not.toHaveBeenCalled();
+      // The binding performs its final authorisation synchronously next to its effect.
+      expect(guard!.authorizeSubmission!(_input)).toBeUndefined();
+      order.push('submission effect');
+    });
+    await port.submit({packageId: 'package-1', chapterNumber: 1, scope: config.scope, aiAssisted: true,
+      revisionId: 'revision-1', title: 'Title', content: 'Body', remoteChapterId: 'remote-1'},
+    {authorizeSubmission, ...(hasAsyncGuard ? {beforeMutation} : {})});
+    expect(binding.submit).toHaveBeenCalledOnce();
+    expect(authorizeSubmission).toHaveBeenCalledOnce();
+    expect(authorizeSubmission).toHaveBeenCalledWith(expect.objectContaining({packageId: 'package-1',
+      revisionId: 'revision-1', remoteChapterId: 'remote-1', title: 'Title', content: 'Body'}));
+    expect(order).toEqual(hasAsyncGuard
+      ? ['async guard', 'binding entered', 'async guard', 'final authorization', 'submission effect']
+      : ['binding entered', 'final authorization', 'submission effect']);
+  });
+  it.each(['already-aborted', 'during-preflight'] as const)('proves no submission on %s cancellation before binding entry', async cancellation => {
+    port = await connectMegaNovelCdpPort(config, binding);
+    const controller = new AbortController();
+    const cause = new DOMException('Offline submit cancelled', 'AbortError');
+    const beforeMutation = vi.fn(async () => undefined);
+    binding.probe = vi.fn<MegaNovelDomBinding['probe']>(async () => {
+      if (cancellation === 'during-preflight') controller.abort(cause);
+      return {scope: config.scope, origin: 'https://www.meganovel.com', blocker: 'none'};
+    });
+    if (cancellation === 'already-aborted') controller.abort(cause);
+    const blocked = await port.submit({packageId: 'package-1', chapterNumber: 1, scope: config.scope, aiAssisted: true,
+      revisionId: 'revision-1', title: 'Title', content: 'Body', remoteChapterId: 'remote-1'},
+    {signal: controller.signal, beforeMutation}).catch(error => error);
+    expect(binding.submit).not.toHaveBeenCalled();
+    expect(beforeMutation).not.toHaveBeenCalled();
+    expect(blocked).toBeInstanceOf(MegaNovelSubmissionBlockedError);
+    expect(blocked.cause).toBe(cause);
+    if (cancellation === 'already-aborted') expect(binding.probe).not.toHaveBeenCalled();
+    else expect(binding.probe).toHaveBeenCalledOnce();
+  });
+  it('keeps a generic guard-coded failure after entering a legacy binding unproven', async () => {
+    port = await connectMegaNovelCdpPort(config, binding);
+    const cause = Object.assign(new Error('A legacy binding may already have submitted'), {code: 'CHAPTER_REVIEW_INPUTS_CHANGED'});
+    binding.submit = vi.fn<MegaNovelDomBinding['submit']>(async () => { throw cause; });
+    const beforeMutation = vi.fn(async () => undefined);
+    const failure = await port.submit({packageId: 'package-1', chapterNumber: 1, scope: config.scope, aiAssisted: true,
+      revisionId: 'revision-1', title: 'Title', content: 'Body', remoteChapterId: 'remote-1'}, {beforeMutation}).catch(error => error);
+    expect(binding.submit).toHaveBeenCalledOnce();
+    expect(failure).toBe(cause);
+    expect(failure).not.toBeInstanceOf(MegaNovelSubmissionBlockedError);
   });
   it('serializes binding operations on its owned target', async () => {
     port = await connectMegaNovelCdpPort(config, binding);

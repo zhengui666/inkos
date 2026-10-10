@@ -1,3 +1,6 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Type } from "@sinclair/typebox";
 import { runWorkerAgent, runWorkerAgentTool } from "../../agent/worker-agent.js";
@@ -7,12 +10,16 @@ const mocks = vi.hoisted(() => ({ create: vi.fn() }));
 vi.mock("../client.js", () => ({ createCodexClient: mocks.create }));
 
 class WorkerClient {
+  codexHome = "";
+  closed = false;
+  readonly closes = new Set<() => void>();
   readonly cwd = "/isolated/codex-work";
   readonly notices = new Set<(method: string, value: unknown) => void>();
   handler?: (method: string, value: unknown) => unknown;
   run: () => Promise<void> = async () => {};
   request = vi.fn(async (method: string, _params?: unknown) => {
     if (method === "account/read") return { account: { type: "chatgpt", email: "fixture@example.test", planType: "plus" }, requiresOpenaiAuth: false };
+    if (method === "config/read") return { config: {} };
     if (method === "model/list") return { data: [{ id: "codex-fixture", model: "codex-fixture", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "high" }] }] };
     if (method === "thread/start") return { thread: { id: "thread" }, model: "codex-fixture" };
     if (method === "turn/start") {
@@ -24,8 +31,8 @@ class WorkerClient {
   });
   onNotification(handler: (method: string, value: unknown) => void) { this.notices.add(handler); return () => { this.notices.delete(handler); }; }
   onRequest(handler: (method: string, value: unknown) => unknown) { this.handler = handler; return () => { this.handler = undefined; }; }
-  onClose() { return () => {}; }
-  close = vi.fn(async () => {});
+  onClose(fn: () => void) { this.closes.add(fn); return () => { this.closes.delete(fn); }; }
+  close = vi.fn(async () => { this.closed = true; for (const fn of this.closes) fn(); this.closes.clear(); });
   notify(method: string, value: object) { for (const handler of this.notices) handler(method, { threadId: "thread", ...value }); }
   async tool(id: string, args: unknown) {
     return await this.handler!("item/tool/call", { threadId: "thread", turnId: "turn", callId: id, tool: "submit", arguments: args }) as { success: boolean; contentItems: Array<{ text: string }> };
@@ -33,14 +40,35 @@ class WorkerClient {
   finish(status = "completed") { this.notify("turn/completed", { turn: { id: "turn", status } }); }
 }
 
-const llmClient: LLMClient = {
+let llmClient: LLMClient = {
   provider: "openai", apiFormat: "chat", stream: false,
   defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
   _codex: { projectRoot: "/selected-project", settings: { model: "codex-fixture", reasoningEffort: "high", serviceTier: "default" } },
 };
 const resultTool = { name: "submit", label: "Submit", description: "Submit typed state", parameters: Type.Object({ value: Type.Integer() }) };
-let client: WorkerClient;
-beforeEach(() => { client = new WorkerClient(); mocks.create.mockReset().mockResolvedValue(client); });
+let client: WorkerClient, projectRoot: string;
+beforeEach(async () => {
+  projectRoot = await mkdtemp(join(tmpdir(), "inkos-worker-bridge-"));
+  client = new WorkerClient(); client.codexHome = join(projectRoot, ".inkos", "codex", "home");
+  await mkdir(client.codexHome, { recursive: true, mode: 0o700 });
+  await writeFile(join(projectRoot, ".inkos", "codex-config.json"), JSON.stringify({ model: "codex-fixture", reasoningEffort: "high", serviceTier: "default" }));
+  llmClient = { ...llmClient, _codex: { ...llmClient._codex, projectRoot } };
+  mocks.create.mockReset().mockImplementation(async () => {
+    // Each admission/probe/model lease is a distinct peer; only model peers feed the shared turn fixture.
+    let used = false, closed = false;
+    const closes = new Set<() => void>();
+    return { cwd: client.cwd, codexHome: client.codexHome, get closed() { return closed || used && client.closed; },
+      request: async (method: string, params?: unknown) => {
+        if (method === "thread/start") { used = true; client.closed = false; }
+        return client.request(method, params);
+      },
+      onNotification: client.onNotification.bind(client), onRequest: client.onRequest.bind(client),
+      onClose: (fn: () => void) => { closes.add(fn); client.closes.add(fn); return () => { closes.delete(fn); client.closes.delete(fn); }; },
+      close: async () => { closed = true; if (used) await client.close(); else for (const fn of closes) { client.closes.delete(fn); fn(); } },
+    };
+  });
+});
+afterEach(async () => { await rm(projectRoot, { recursive: true, force: true }); });
 
 describe("Codex worker runtime integration", () => {
   it("validates and corrects dynamic-tool arguments in one turn, then retains usage when the host interrupts", async () => {
@@ -53,7 +81,7 @@ describe("Codex worker runtime integration", () => {
     await expect(runWorkerAgentTool(llmClient, "ignored-legacy-model", [{ role: "user", content: "Submit seven" }], resultTool, { onUsage })).resolves.toEqual({ value: 7 });
     expect(results).toEqual([false, true]);
     expect(onUsage).toHaveBeenCalledWith({ promptTokens: 20, completionTokens: 8, totalTokens: 28 });
-    expect(mocks.create).toHaveBeenCalledWith("/selected-project");
+    expect(mocks.create).toHaveBeenCalledWith(projectRoot);
     expect(client.request.mock.calls.filter(([method]) => method === "turn/start")).toHaveLength(1);
     expect(client.request.mock.calls.find(([method]) => method === "thread/start")?.[1]).toMatchObject({ model: "codex-fixture", dynamicTools: [{ name: "submit" }] });
     expect(client.close).toHaveBeenCalledOnce();

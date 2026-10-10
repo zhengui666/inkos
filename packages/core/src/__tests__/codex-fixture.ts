@@ -1,3 +1,5 @@
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
 import type { CodexClient, CodexNotificationListener, CodexRequestListener } from '../codex/client.js';
 
 export interface FixtureMessage { role: string; content: string; tool_calls?: unknown[]; tool_call_id?: string }
@@ -36,6 +38,8 @@ export class CodexFixture {
 
   createClient = async (projectRoot: string): Promise<CodexClient> => {
     const fixture = this;
+    const codexHome = join(projectRoot, ".inkos", "codex", "home");
+    await mkdir(codexHome, { recursive: true, mode: 0o700 });
     const threadId = `fixture-thread-${++this.nextClient}`;
     const turnId = `${threadId}-turn`;
     const notifications = new Set<CodexNotificationListener>();
@@ -101,12 +105,13 @@ export class CodexFixture {
       } catch (error) { finish('failed', error instanceof Error ? error.message : String(error)); }
     };
     return {
-      cwd: `/tmp/inkos-codex-fixture-${fixture.nextClient}`, codexHome: `${projectRoot}/.fixture-codex`,
+      cwd: `/tmp/inkos-codex-fixture-${fixture.nextClient}`, codexHome,
       get closed() { return closed; },
       async request<T>(method: string, raw: unknown = {}): Promise<T> {
         const params = raw as Record<string, any>;
         fixture.requests.push({ method, params: structuredClone(params) });
         if (method === 'account/read') return { account: { type: 'chatgpt', email: 'fixture@example.test', planType: 'plus' }, requiresOpenaiAuth: false } as T;
+        if (method === 'config/read') return { config: {} } as T;
         if (method === 'model/list') return { data: [
           { id: 'fixture', model: 'fixture', isDefault: true,
             defaultReasoningEffort: 'medium', supportedReasoningEfforts: [{ reasoningEffort: 'medium' }] },

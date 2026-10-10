@@ -49,6 +49,22 @@ export const MegaNovelSnapshotRequestSchema = z.object({
   scope: MegaNovelScopeSchema, chapterNumber: z.number().int().positive(), expectedTitle: Label.optional(), remoteChapterId: Label.optional(),
 }).strict();
 export type MegaNovelSnapshotRequest = z.infer<typeof MegaNovelSnapshotRequestSchema>;
+/** Issued only by a boundary that knows it has not invoked submission.
+ * An arbitrary guard error or a draft-looking readback is not this evidence. */
+export class MegaNovelSubmissionBlockedError extends Error {
+  readonly code?: string;
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : 'Submission was blocked before the final action was invoked.', { cause });
+    this.name = 'MegaNovelSubmissionBlockedError';
+    if (typeof (cause as {code?: unknown} | null)?.code === 'string') this.code = (cause as {code: string}).code;
+  }
+}
+export type MegaNovelSubmission = MegaNovelIntent & {remoteChapterId: string; title: string; content: string; revisionId: string};
+export interface MegaNovelMutationGuard {
+  (): Promise<void>;
+  /** Call synchronously immediately before issuing Confirm, without another await. */
+  authorizeSubmission?: (submission: MegaNovelSubmission) => void;
+}
 export interface MegaNovelObservationPort {
   probe(scope: MegaNovelScope, options?: MegaNovelBrowserOptions): Promise<MegaNovelProbe>;
   snapshot(input: MegaNovelSnapshotRequest, options?: MegaNovelBrowserOptions): Promise<MegaNovelSnapshot>;
@@ -57,6 +73,8 @@ export interface MegaNovelBrowserOptions {
   signal?: AbortSignal;
   /** Recheck local authority after async preflight, immediately before each editor effect. */
   beforeMutation?: () => Promise<void>;
+  /** Synchronous authorization of the frozen attempt at the final action boundary. */
+  authorizeSubmission?: (submission: MegaNovelSubmission) => void;
 }
 
 /** Browser paragraph text may omit the document's final newline. No prose or internal spacing is changed. */
@@ -73,5 +91,5 @@ export interface MegaNovelBrowserPort {
   /** Recheck scope/blockers immediately before typing: editor input can autosave. No internal retries. */
   createDraft(input: MegaNovelIntent & {title: string; content: string; revisionId: string}, options?: MegaNovelBrowserOptions): Promise<void>;
   /** Check exact draft/title/body and truthful AI disclosure immediately before final action. */
-  submit(input: MegaNovelIntent & {remoteChapterId: string; title: string; content: string; revisionId: string}, options?: MegaNovelBrowserOptions): Promise<void>;
+  submit(input: MegaNovelSubmission, options?: MegaNovelBrowserOptions): Promise<void>;
 }

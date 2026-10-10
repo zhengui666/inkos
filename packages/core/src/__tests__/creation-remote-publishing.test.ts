@@ -33,7 +33,7 @@ async function fixture(){
  const publisher=await registry.create(root,config);closers.push(()=>publisher.close());
  const input={workId:task.workId,chapterNumber:1,revisionId:'reviewed-r1',signal:new AbortController().signal};
  const job=scheduler.reserve(task.workId,1,Date.now(),1)!;
- const reviewed:ScheduledChapter={...job,phase:'publishing' as const,revisionId:input.revisionId,reviewReceipt:{inputs:{version:1,plan:null,authorBrief:null,bookRules:null},revisionId:input.revisionId,reviewedAt:Date.now(),summary:'Simulated review acceptance',observations:[]}};
+ const reviewed:ScheduledChapter={...job,phase:'publishing' as const,revisionId:input.revisionId,reviewReceipt:{inputs:{version:2,plan:null,authorBrief:null,bookRules:null,bookRulesJson:null,authorIntent:null,currentFocus:null,styleGuide:null,parentCanon:null,fanficCanon:null},reviewPolicy:{requireStoryClosure:false,language:creationBook(task).language},revisionId:input.revisionId,reviewedAt:Date.now(),summary:'Simulated review acceptance',observations:[]}};
  vi.spyOn(StateManager.prototype,'loadBookConfig').mockResolvedValue({...creationBook(task),status:'active'});
  const run=async(selected:SchedulerPublisher=publisher,current:ScheduledChapter=reviewed)=>{
   scheduler.save(current,'fixture-reviewed');

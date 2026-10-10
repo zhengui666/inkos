@@ -16,6 +16,9 @@ import { decodeWorkerOutput, workerOutputSchema } from "./worker-output.js";
 import { decodeStructuredFields } from "./structured-arguments.js";
 import { preserveToolArgumentTypes, toolArgumentIssues } from "./tool-arguments.js";
 import { isUnboundedWorkerExecution } from "./worker-execution-policy.js";
+import { RuntimeHistoryWriteError, guardCodexExecution, withCodexExecution } from "../runtime/execution.js";
+import { currentCodexRun } from "../runtime/run-context.js";
+import { RuntimeAuthenticationError } from "../runtime/auth/codex-owner.js";
 
 export interface WorkerAgentOptions {
   /** Resolve the same persisted Codex account/model settings as the parent workflow. */
@@ -100,9 +103,10 @@ class WorkerResultUncertainError extends Error {
 
 function throwIfWorkerAborted(signal?: AbortSignal, failure?: unknown): void {
   if (failure instanceof CodexCleanupError || failure instanceof CodexHostError) return;
-  // A late deadline cannot replace a retained native failure, including an
+  // A late deadline cannot replace a retained runtime/native failure, including an
   // unconfirmed turn or uncertain tool outcome. Explicit caller cancellation wins.
-  if ((failure instanceof CodexModelError || failure instanceof CodexTurnIdentityError || failure instanceof WorkerResultUncertainError)
+  if ((failure instanceof RuntimeHistoryWriteError || failure instanceof RuntimeAuthenticationError
+    || failure instanceof CodexModelError || failure instanceof CodexTurnIdentityError || failure instanceof WorkerResultUncertainError)
     && signal?.aborted && (signal.reason as { code?: unknown })?.code === "WORKER_TIMEOUT") return;
   signal?.throwIfAborted();
 }
@@ -135,14 +139,14 @@ async function runTextWorker(
   options: WorkerAgentOptions = {},
 ): Promise<LLMResponse> {
   options.signal?.throwIfAborted();
-  const model = resolveCodexModel(client._codex?.settings);
+  const runtime = currentCodexRun()!;
+  const model = resolveCodexModel({ model: runtime.selection.modelId });
   const promptMessages = toAgentMessages(messages, model);
   if (promptMessages.length === 0) throw new Error("Worker Agent requires at least one non-system message");
   const agent = new Agent({
-    projectRoot: options.projectRoot ?? client._codex?.projectRoot ?? process.cwd(),
+    projectRoot: runtime.projectRoot,
     signal: options.signal,
     ...(isUnboundedWorkerExecution() ? {} : { maxOutputTokens: options.maxTokens ?? client.defaults?.maxTokens ?? 32_768 }),
-    ...(client._codex?.settings ? { settings: client._codex.settings } : {}),
     initialState: {
       model,
       systemPrompt: messages.filter(message => message.role === "system").map(message => message.content).join("\n\n"),
@@ -183,7 +187,8 @@ async function runStructuredWorker<TParameters extends TSchema>(
   options: WorkerAgentOptions = {},
 ): Promise<Static<TParameters>> {
   options.signal?.throwIfAborted();
-  const model = resolveCodexModel(client._codex?.settings);
+  const runtime = currentCodexRun()!;
+  const model = resolveCodexModel({ model: runtime.selection.modelId });
   const promptMessages = toAgentMessages(messages, model);
   if (promptMessages.length === 0) throw new Error("Structured Worker Agent requires at least one non-system message");
   let submitted: Static<TParameters> | undefined;
@@ -223,11 +228,13 @@ async function runStructuredWorker<TParameters extends TSchema>(
       try {
         // prepareArguments has already validated without coercion. Preserve union
         // scalar types instead of converting the supplied JSON with Value.Parse.
+        await guardCodexExecution(options.signal);
         const result = validate ? await validate(params) : params;
         options.signal?.throwIfAborted();
         submitted = result;
         hasSubmitted = true;
       } catch (error) {
+        if (error instanceof RuntimeAuthenticationError) throw error;
         lastValidationError = error instanceof Error ? error : new Error(String(error));
         recordExecutionEvidence("worker-result-invalid", {
           code: lastValidationError.code ?? "WORKER_DOMAIN_INVALID",
@@ -240,10 +247,9 @@ async function runStructuredWorker<TParameters extends TSchema>(
     },
   };
   const agent = new Agent({
-    projectRoot: options.projectRoot ?? client._codex?.projectRoot ?? process.cwd(),
+    projectRoot: runtime.projectRoot,
     signal: options.signal,
     ...(isUnboundedWorkerExecution() ? {} : { maxOutputTokens: options.maxTokens ?? client.defaults?.maxTokens ?? 32_768 }),
-    ...(client._codex?.settings ? { settings: client._codex.settings } : {}),
     initialState: {
       model,
       systemPrompt: [
@@ -279,6 +285,7 @@ async function runStructuredWorker<TParameters extends TSchema>(
         await tool.execute("structured-output", prepared as Static<TParameters>, options.signal);
         recordExecutionEvidence("worker-result-accepted", { resultTool: resultTool.name, transport: "outputSchema" });
       } catch (error) {
+        if (error instanceof RuntimeAuthenticationError) throw error;
         options.signal?.throwIfAborted();
         lastValidationError = error instanceof Error ? error : new Error(String(error));
       }
@@ -335,10 +342,12 @@ async function withWorkerDeadline<T>(options: WorkerAgentOptions, run: (bounded:
 }
 
 export function runWorkerAgent(client: LLMClient, modelId: string, messages: ReadonlyArray<LLMMessage>, options: WorkerAgentOptions = {}): Promise<LLMResponse> {
-  return withWorkerDeadline(options, bounded => runTextWorker(client, modelId, messages, bounded));
+  return withWorkerDeadline(options, bounded => withCodexExecution(options.projectRoot ?? client._codex?.projectRoot ?? process.cwd(),
+    () => runTextWorker(client, modelId, messages, bounded), { signal: bounded.signal, settings: client._codex?.settings }));
 }
 
 export function runWorkerAgentTool<TParameters extends TSchema>(client: LLMClient, modelId: string,
   messages: ReadonlyArray<LLMMessage>, resultTool: WorkerResultTool<TParameters>, options: WorkerAgentOptions = {}): Promise<Static<TParameters>> {
-  return withWorkerDeadline(options, bounded => runStructuredWorker(client, modelId, messages, resultTool, bounded));
+  return withWorkerDeadline(options, bounded => withCodexExecution(options.projectRoot ?? client._codex?.projectRoot ?? process.cwd(),
+    () => runStructuredWorker(client, modelId, messages, resultTool, bounded), { signal: bounded.signal, settings: client._codex?.settings }));
 }

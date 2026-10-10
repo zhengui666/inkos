@@ -6,12 +6,12 @@ import { publishingError } from './contracts.js';
 import {compareMegaNovelChapter} from './meganovel-observation.js';
 import { ManualPublishingAdapter } from './manual-adapter.js';
 import { PublishingStore } from './store.js';
-import { MegaNovelIntentSchema, MegaNovelProbeSchema, MegaNovelScopeSchema, MegaNovelSnapshotSchema,
+import { MegaNovelIntentSchema, MegaNovelProbeSchema, MegaNovelScopeSchema, MegaNovelSnapshotSchema, MegaNovelSubmissionBlockedError,
   type MegaNovelIntent, type MegaNovelRun, type MegaNovelScope, type MegaNovelSnapshot,
-  type MegaNovelBrowserPort } from './meganovel-contracts.js';
+  type MegaNovelBrowserPort, type MegaNovelBrowserOptions } from './meganovel-contracts.js';
 
 /** Durable single-chapter adapter. A concrete calibrated UI binding is a separate deployment prerequisite. */
-export interface MegaNovelOperationOptions { signal?: AbortSignal; beforeMutation?: () => Promise<void> }
+export interface MegaNovelOperationOptions extends MegaNovelBrowserOptions {}
 
 export class MegaNovelPublishingAdapter {
   constructor(private readonly packages: ManualPublishingAdapter, private readonly store: PublishingStore,
@@ -63,11 +63,21 @@ export class MegaNovelPublishingAdapter {
     this.assertDisclosure(found.aiDisclosure, intent.aiAssisted);
     await options.beforeMutation?.();
     options.signal?.throwIfAborted();
-    this.write({...prior, phase: 'submit_unknown'}, pkg.version);
+    const reservation = this.write({...prior, phase: 'submit_unknown'}, pkg.version);
     try {
       await this.browser.submit({...intent, remoteChapterId: found.remoteChapterId,
         title: chapter.title, content, revisionId: chapter.revisionId}, options);
-    } catch {
+    } catch (error) {
+      if (error instanceof MegaNovelSubmissionBlockedError) {
+        // Only this invocation's positive no-submit evidence plus independent
+        // exact draft readback may undo its provisional UNKNOWN reservation.
+        const observed = this.find(await this.inspect(intent, chapter.title, prior), {...chapter, content}, prior);
+        if (observed?.status === 'draft') {
+          this.store.writeMegaNovelRun({ run: {...prior, evidence: observed.evidence},
+            expectedVersion: reservation.version, eventId: randomUUID(), submissionNotStarted: true });
+          throw error.cause;
+        }
+      }
       // No mutation retry, even if the browser reports a timeout or closes before acknowledging.
     }
     return this.reconcile(intent);
@@ -163,6 +173,6 @@ export class MegaNovelPublishingAdapter {
     return next;
   }
   private write(run: MegaNovelRun, expectedVersion: number) {
-    this.store.writeMegaNovelRun({run, expectedVersion, eventId: randomUUID()});
+    return this.store.writeMegaNovelRun({run, expectedVersion, eventId: randomUUID()});
   }
 }

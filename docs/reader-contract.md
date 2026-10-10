@@ -35,6 +35,42 @@ Quality defects identify `repairScope`: `local`, `structural` or `foundation`. T
 
 A caller explicitly requesting story completion can use `reviewChapter(workId, chapter, {requireStoryClosure: true})`. This adds mandatory `story-closure` evidence, independent of nominal target chapter count. It checks the actual central outcome and its consequence, while respecting an intentional open ending and optional future possibilities. A plan, a count or 'The End' is not closure evidence. Publication receipts and platform compliance remain separate requirements.
 
+## Long-form review receipts
+
+`ChapterReviewInputs` version 2 records exactly nine authoritative file inputs. Each field is required and holds the original file text or `null` for a missing file:
+
+| Field | Source relative to the book directory |
+| --- | --- |
+| `plan` | `story/runtime/chapter-NNNN.plan.json` |
+| `authorBrief` | `story/runtime/chapter-NNNN.user-brief.md` |
+| `bookRules` | `story/book_rules.md` |
+| `bookRulesJson` | `story/book_rules.json` |
+| `authorIntent` | `story/author_intent.md` |
+| `currentFocus` | `story/current_focus.md` |
+| `styleGuide` | `story/style_guide.md` |
+| `parentCanon` | `story/parent_canon.md` |
+| `fanficCanon` | `story/fanfic_canon.md` |
+
+Capture requires lossless UTF-8 and preserves whitespace, `null` and the empty string. Creation, deletion or any text change in any of the nine fields invalidates acceptance. Invalid UTF-8 cannot produce an acceptance receipt. Version 1, missing fields and future versions are not implicitly upgraded or accepted.
+
+`reviewChapter` captures these values once. Composer's complete-context fast path and budget-limited selection path consume the same capture. When a capture override exists, a captured `null` means the source was absent; neither path rereads that source from disk. Reader-contract extraction parses the captured `bookRulesJson` through the existing book-rules and reader-contract schemas. Receipt equality compares the raw text, even when two versions parse to the same contract.
+
+The receipt separately binds `reviewPolicy: { requireStoryClosure, language }`, using the actual closure requirement and `book.language` for that review. A change to either policy value requires another review before a new submission. The persisted receipt type permits missing inputs or policy only for reading legacy records and reconciling their retained attempts; every new acceptance requires valid version 2 inputs and a valid matching policy. Receipt validity also remains tied to the retained chapter revision and source-supported review result.
+
+The autonomous path checks the captured inputs and policy after review, after publication preflight and before publication mutations. Submission has a final authorization boundary: after asynchronous browser, revision, snapshot and dialog preparation, the production Confirm path calls `beforeMutation.authorizeSubmission` synchronously to recheck the nine nullable raw inputs, review policy and current chapter's registered retained revision. The artifact, revision and source path must still match the accepted review and frozen attempt; current source bytes must equal both the retained snapshot and the frozen payload captured from the verified original draft. The current chapter title must match the frozen title, and current review observations must have no unresolved issue. The on-disk package payload and manifest must still match the captured original payload and manifest for that same package and revision.
+
+The callback also compares the actual submission payload's `packageId`, `chapterNumber`, `revisionId`, `remoteChapterId`, `title`, `content`, `scope` and `aiAssisted` with the values bound to that capture and original attempt. Its content retains the existing `chapterDocumentBody` conversion. These checks and the call issuing the Confirm request share one host call stack, with no intervening host `await`. A mismatch or unreadable input rejects authorization before that request is issued.
+
+This boundary governs the host's submission request. It does not make local file reads and a remote DOM click atomic, linearize raw file writes from other processes or prevent an external edit after authorization. These local reads are not a filesystem transaction. Authority changes and registered current-chapter revisions completed during asynchronous preparation are checked again at final authorization; no stronger cross-process or remote atomicity is claimed.
+
+A review-input or policy mismatch detected before submission returns a verified retained draft to review only through the recovery rules below. Invalidating review retains the publication start time, publication evidence, retained revision, frozen package and remote chapter identity, and does not reset the review or repair budgets. Re-reviewing the same prose reuses its existing remote draft.
+
+Publication first reconciles the retained attempt. Submitted or unknown outcomes are checked against the original frozen package and revision; changed local inputs cannot turn them into a new upload or submission. For a retained attempt, only an outcome positively identified as a draft permits validation of current review inputs before a later mutation. A rejected final authorization does not replace the original frozen package with a newer chapter revision. Completed jobs remain completed across restart. Review acceptance does not itself prove remote publication.
+
+The DOM and CDP layers use `MegaNovelSubmissionBlockedError` for a guard or preflight rejection only while they can establish that the submission request has not been invoked. The adapter may restore its original draft reservation and propagate that rejection only when this typed no-submission evidence belongs to the current attempt, a compare-and-swap check still identifies this attempt's `submit_unknown` reservation, and an independent readback proves the exact retained remote draft. Recovery preserves the package, revision and remote chapter identity. An arbitrary guard error, a transport failure after dispatch or a draft-looking remote result alone cannot clear an unknown submission; that attempt remains subject to reconciliation.
+
+The authoritative input capture covers only the nine inputs above and the separate review policy. The chapter and publication identity checks do not freeze previous chapters, role cards, current-state facts, outlines, memory or every other Composer input. Generated context and intent projections are not authoritative receipt inputs; changing them alone does not invalidate acceptance. Short-fiction caches and model configuration remain outside this mechanism.
+
 ## Research basis and boundaries
 
 The method draws on publicly accessible official openings and editorial guidance, not copied scenes or a claimed sales algorithm:
@@ -51,5 +87,7 @@ Limited opening samples support opening and early-return observations. They do n
 ## Verification
 
 `reader-contract.flow.test.ts` exercises actual schema validation, staged foundation, disk persistence, protected context, planning, writer prompt assembly, source-bound review and real reviser prompt transport with an isolated deterministic model peer. It includes legacy compatibility, author-directed override, omitted rules-field preservation, stale or unavailable evidence and explicit terminal closure. Autonomous repair routing and existing prompt-budget boundaries are covered separately.
+
+Long-form receipt regression coverage uses `review-input-receipt.flow.test.ts`, the actual Composer paths in `composer-selection-budget.test.ts` and `reader-contract.flow.test.ts`, and the autonomous and scheduler-publisher tests. It checks raw input identity, captured-value transport, policy changes, mutation guards and recovery of retained publication attempts with deterministic local fixtures.
 
 These tests prove contracts and failure behavior, not that generated prose is engaging. Before claiming content improvement, run independent blinded baseline/candidate generation and semantic reading using varied original briefs. Preserve failures and evaluate actual event clarity, motive, contribution, return and language naturalness. Do not reuse author self-ratings as independent evidence.
