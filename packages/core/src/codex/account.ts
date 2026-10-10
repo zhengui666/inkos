@@ -149,6 +149,7 @@ interface LoginAttempt {
   nativeTerminal: boolean;
   cleanupDone: boolean;
   cleanupAck: boolean;
+  cleanupNotRequired?: boolean;
   retired: boolean;
   peer?: CodexClient;
   peerPromise?: Promise<CodexClient>;
@@ -299,7 +300,7 @@ class AccountService implements CodexAccountService {
       }
     }
     const ended = !attempt.dispatched || attempt.readyCommitted || attempt.cleanupAck || attempt.retired
-      || (attempt.nativeTerminal && !!attempt.ownerSettledStamp && !attempt.closeRequested);
+      || (attempt.nativeTerminal && !!attempt.ownerSettledStamp && (!attempt.closeRequested || attempt.cleanupNotRequired));
     if (!ended) return;
     attempt.settledAt ??= Date.now();
     if (this.activeAttempt === attempt) this.activeAttempt = undefined;
@@ -496,8 +497,12 @@ class AccountService implements CodexAccountService {
         }
         if (state === 'closed') {
           if (!attempt.dispatched) cleanup = 'not-started';
-          else if (attempt.nativeTerminal && attempt.ownerSettledStamp
-            && sameStamp(attempt.ownerSettledStamp, attempt.owner?.snapshot())) cleanup = 'not-applicable';
+          else if (attempt.nativeTerminal && attempt.ownerSettledStamp?.operationId === null
+            && attempt.ownerSettledStamp.localState !== 'ready'
+            && sameStamp(attempt.ownerSettledStamp, attempt.owner?.snapshot())) {
+            // Close can precede settlement finally. Preserve this own durable terminal proof until both finish.
+            attempt.cleanupNotRequired = true; cleanup = 'not-applicable';
+          }
           else {
             cleanup = 'unconfirmed';
             const peer = attempt.peer, login = attempt.login;
