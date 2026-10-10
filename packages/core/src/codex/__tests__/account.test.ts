@@ -18,6 +18,7 @@ async function fixture() {
   const request = vi.fn(async (method: string): Promise<unknown> => {
     if (method === 'account/read') return { account: connected ? { type: 'chatgpt', email: 'synthetic@example.test' } : null, requiresOpenaiAuth: true, accessToken: 'DO NOT EXPOSE' };
     if (method === 'account/login/start') return { type: 'chatgptDeviceCode', loginId: 'l1', verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'ABCD', accessToken: 'DO NOT EXPOSE' };
+    if (method === 'account/login/cancel') return { status: 'canceled' };
     if (method === 'model/list') return { data: [{ id: 'model1', model: 'gpt-6.1-sol', displayName: 'Model', isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: 'medium' }, { reasoningEffort: 'ultra' }], serviceTiers: [{ id: 'fast' }, { id: 'priority' }], token: 'DO NOT EXPOSE' }], nextCursor: null };
     return {};
   });

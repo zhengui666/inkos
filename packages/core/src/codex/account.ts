@@ -155,6 +155,7 @@ interface LoginAttempt {
   owner?: CodexAuthenticationOwner;
   operation?: CodexAuthOperation;
   originalStamp?: CodexConnectionStamp;
+  ownerSettledStamp?: CodexConnectionStamp;
   fenceStamp?: CodexConnectionStamp;
   fenceError?: CodexLoginAttemptError;
   fenceTried?: boolean;
@@ -186,7 +187,7 @@ class AccountService implements CodexAccountService {
   private attempts = new Map<string, LoginAttempt>();
   private activeAttempt?: LoginAttempt;
   private peers = new Set<CodexClient>();
-  private peerClosures = new WeakMap<CodexClient, Promise<void>>();
+  private peerClosures = new WeakMap<CodexClient, { state: { succeeded: boolean }; promise: Promise<void> }>();
   private disposePromise?: Promise<void>;
   constructor(private options: CodexAccountServiceOptions) {}
 
@@ -200,12 +201,11 @@ class AccountService implements CodexAccountService {
           if (!this.disposed && this.clientPromise === promise) this.notification(method, params);
         });
         client.onClose(() => {
-          const attempt = this.activeAttempt;
-          if (attempt?.peer === client && !this.peerClosures.has(client)) attempt.retired = true;
-          if (!this.peerClosures.has(client)) this.peers.delete(client);
+          // Transport end is not process exit. Keep ownership until the one close settlement succeeds.
+          void this.closePeer(client).catch(() => undefined);
           if (this.clientPromise === promise) {
             this.clientPromise = undefined;
-            if (this.login?.status === 'pending') this.finishLogin(false, 'Codex disconnected before sign-in completed. Start sign-in again.');
+            if (this.login?.status === 'pending') this.finishLogin(false, 'Codex disconnected before sign-in completed. Start sign-in again.', false);
           }
         });
         return client;
@@ -225,8 +225,8 @@ class AccountService implements CodexAccountService {
     const id = text(result.loginId);
     const attempt = this.activeAttempt;
     if (attempt?.login?.loginId === id && attempt.closeRequested) {
-      // A success notification alone cannot settle a fenced attempt or release its cleanup permit.
-      if (result.success !== true) attempt.nativeTerminal = true;
+      attempt.nativeTerminal = true;
+      this.retireUnsettledTerminal(attempt);
       this.releaseAttempt(attempt);
       return;
     }
@@ -240,12 +240,12 @@ class AccountService implements CodexAccountService {
 
   getRuntimeClient(): Promise<CodexClient> { return this.getClient(); }
 
-  private finishLogin(success: boolean, error?: string): void {
+  private finishLogin(success: boolean, error?: string, nativeTerminal = true): void {
     const attempt = this.activeAttempt;
     if (!attempt?.login || !attempt.owner || !attempt.operation || !attempt.peer
       || attempt.closeRequested || !attempt.settlementDone || this.disposed) return;
     attempt.settlementDone = false;
-    if (!success) attempt.nativeTerminal = true;
+    if (nativeTerminal) attempt.nativeTerminal = true;
     const failed = () => {
       if (attempt.closeRequested || this.disposed) return;
       attempt.phase = 'failed';
@@ -255,6 +255,7 @@ class AccountService implements CodexAccountService {
     const settle = async () => {
       if (success) {
         await attempt.owner!.completeLogin(attempt.operation!, attempt.peer!, state => {
+          attempt.ownerSettledStamp = state;
           // The terminal boundary is the durable ready CAS, never the notification.
           if (state.localState === 'ready') {
             attempt.readyCommitted = true;
@@ -263,13 +264,19 @@ class AccountService implements CodexAccountService {
           }
         });
         if (!attempt.readyCommitted) failed();
-      } else { attempt.owner!.complete(attempt.operation!, 'unknown'); failed(); }
+      } else {
+        attempt.owner!.complete(attempt.operation!, 'unknown', state => { attempt.ownerSettledStamp = state; });
+        failed();
+      }
     };
-    this.ownerSettlement = settle().catch(() => { failed(); }).finally(() => {
+    this.ownerSettlement = settle().catch(error => { failed(); throw error; }).finally(() => {
       attempt.settlementDone = true;
       if (this.ownerLogin?.operation === attempt.operation) this.ownerLogin = undefined;
+      this.retireUnsettledTerminal(attempt);
       this.releaseAttempt(attempt);
     });
+    // Status and dispose still observe this settlement; background notification work must not reject unhandled.
+    void this.ownerSettlement.catch(() => undefined);
   }
 
   private pruneAttempts(): void {
@@ -282,22 +289,46 @@ class AccountService implements CodexAccountService {
   }
   private releaseAttempt(attempt: LoginAttempt): void {
     if (!attempt.startSettled || !attempt.settlementDone || !attempt.cleanupDone) return;
+    if (attempt.peer) {
+      const closure = this.peerClosures.get(attempt.peer);
+      if (closure) {
+        if (!closure.state.succeeded) return;
+        attempt.retired = true;
+        this.peers.delete(attempt.peer);
+        if (this.clientPromise === attempt.peerPromise) this.clientPromise = undefined;
+      }
+    }
     const ended = !attempt.dispatched || attempt.readyCommitted || attempt.cleanupAck || attempt.retired
-      || attempt.nativeTerminal;
+      || (attempt.nativeTerminal && !!attempt.ownerSettledStamp && !attempt.closeRequested);
     if (!ended) return;
     attempt.settledAt ??= Date.now();
     if (this.activeAttempt === attempt) this.activeAttempt = undefined;
   }
+  private retireUnsettledTerminal(attempt: LoginAttempt): void {
+    if (!attempt.peer || !attempt.nativeTerminal || attempt.readyCommitted || !attempt.settlementDone || !attempt.cleanupDone) return;
+    if (!attempt.ownerSettledStamp) {
+      void this.closePeer(attempt.peer).catch(error => { attempt.cleanupError ??= error; });
+    }
+  }
   private closePeer(peer: CodexClient): Promise<void> {
     let closure = this.peerClosures.get(peer);
     if (!closure) {
-      closure = Promise.resolve().then(() => peer.close()).then(() => {
+      const state = { succeeded: false };
+      const promise = Promise.resolve().then(() => peer.close()).then(() => {
+        state.succeeded = true;
         this.peers.delete(peer);
-        if (this.activeAttempt?.peer === peer) this.activeAttempt.retired = true;
+        const attempt = this.activeAttempt;
+        if (attempt?.peer === peer) {
+          if (this.clientPromise === attempt.peerPromise) this.clientPromise = undefined;
+          attempt.retired = true;
+          this.releaseAttempt(attempt);
+        }
       });
+      closure = { state, promise };
       this.peerClosures.set(peer, closure);
+      void promise.catch(() => undefined); // The owned set retains failed/pending peers for dispose.
     }
-    return closure;
+    return closure.promise;
   }
   private fence(attempt: LoginAttempt): 'closed' | 'already-terminal' | 'superseded' {
     if (attempt.readyCommitted) return 'already-terminal';
@@ -309,10 +340,12 @@ class AccountService implements CodexAccountService {
     try {
       const won = attempt.owner.complete(attempt.operation, 'unknown', state => { attempt.fenceStamp = state; });
       if (won) return attempt.fenceDisposition = 'closed';
-      const state = attempt.owner.snapshot(), original = attempt.originalStamp;
-      if (state?.localState === 'ready' && state.operationId === null && original
-        && state.authGeneration === original.authGeneration && state.connectionRef === original.connectionRef
-        && state.authContextRef === original.authContextRef) return attempt.fenceDisposition = 'already-terminal';
+      const state = attempt.owner.snapshot();
+      // An own non-ready settlement cleared this ticket; it is not another operation.
+      if (attempt.ownerSettledStamp && state?.localState !== 'ready' && sameStamp(attempt.ownerSettledStamp, state)) {
+        attempt.fenceStamp = attempt.ownerSettledStamp;
+        return attempt.fenceDisposition = 'closed';
+      }
       return attempt.fenceDisposition = 'superseded';
     } catch (cause) {
       attempt.fenceError ??= new CodexLoginAttemptError('CODEX_LOGIN_ATTEMPT_FENCE_FAILED', { cause });
@@ -406,7 +439,7 @@ class AccountService implements CodexAccountService {
       const login = attempt.login = projectDeviceLogin(await client.request('account/login/start', { type: 'chatgptDeviceCode' }));
       const early = this.earlyCompletions.get(login.loginId);
       this.earlyCompletions.delete(login.loginId);
-      if (early === false) attempt.nativeTerminal = true;
+      if (early !== undefined) attempt.nativeTerminal = true;
       if (attempt.closeRequested || this.disposed) {
         this.login = { loginId: login.loginId, status: 'cancelled' };
         this.checkStart(attempt);
@@ -463,13 +496,18 @@ class AccountService implements CodexAccountService {
         }
         if (state === 'closed') {
           if (!attempt.dispatched) cleanup = 'not-started';
+          else if (attempt.nativeTerminal && attempt.ownerSettledStamp
+            && sameStamp(attempt.ownerSettledStamp, attempt.owner?.snapshot())) cleanup = 'not-applicable';
           else {
             cleanup = 'unconfirmed';
             const peer = attempt.peer, login = attempt.login;
             // No unrelated await, no peer creation and no new owner operation between this final check and exact-ID dispatch.
             if (peer && login && !peer.closed && this.clientPromise === attempt.peerPromise
               && this.activeAttempt === attempt && sameStamp(attempt.fenceStamp, attempt.owner?.snapshot())) {
-              try { await peer.request('account/login/cancel', { loginId: login.loginId }); cleanup = 'cancel-acknowledged'; attempt.cleanupAck = true; }
+              try {
+                const response = object(await peer.request('account/login/cancel', { loginId: login.loginId }));
+                if (response.status === 'canceled') { cleanup = 'cancel-acknowledged'; attempt.cleanupAck = true; }
+              }
               catch (error) { attempt.cleanupError = error; }
             } else if (login && !attempt.retired) { state = 'superseded'; cleanup = 'not-applicable'; }
           }
@@ -482,6 +520,7 @@ class AccountService implements CodexAccountService {
           if (attempt.login) this.login = { loginId: attempt.login.loginId, status: 'cancelled' };
         }
         if (this.ownerLogin?.operation === attempt.operation) this.ownerLogin = undefined;
+        this.retireUnsettledTerminal(attempt);
         this.releaseAttempt(attempt);
       }
     });
@@ -555,7 +594,11 @@ class AccountService implements CodexAccountService {
       try {
         // Native requests retain their existing bounded deadlines. Never skip cleanup after a failed drain/fence.
         try { await this.queue; } catch { /* Returned to the initiating caller. */ }
-        try { await this.ownerSettlement; } catch { /* The owner remains non-ready. */ }
+        try { await this.ownerSettlement; }
+        catch (error) {
+          if (!settlementFailed) { settlementFailed = true; settlementError = error; }
+          else if (error !== settlementError) settlementError = new AggregateError([settlementError, error], 'Codex owner settlements failed');
+        }
         if (settlementFailed) throw settlementError;
       } finally {
         const promise = this.clientPromise;

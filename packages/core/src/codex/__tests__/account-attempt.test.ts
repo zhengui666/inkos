@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { createCodexAccountService, CodexLoginAttemptError, type CodexDeviceLogin } from '../account.js';
 import { CodexAuthenticationOwner } from '../../runtime/auth/codex-owner.js';
 import type { CodexClient, CodexNotificationListener } from '../app-server.js';
@@ -14,7 +16,7 @@ function deferred<T = void>() {
   return { promise, resolve, reject };
 }
 const roots: string[] = [];
-afterEach(async () => { vi.restoreAllMocks(); await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
+afterEach(async () => { vi.restoreAllMocks(); syncBuiltinESMExports(); await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
 const login = (id = 'l1') => ({ type: 'chatgptDeviceCode', loginId: id, verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'SYNTHETIC' });
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'inkos-attempt-')); roots.push(root);
@@ -24,7 +26,7 @@ async function fixture() {
     const request = vi.fn(async (method: string, _params?: unknown): Promise<unknown> => {
       if (method === 'account/login/start') return login(`l${++sequence}`);
       if (method === 'account/read') return { account: { type: 'chatgpt', email: 'fixture@example.test' } };
-      return {};
+      return method === 'account/login/cancel' ? { status: 'canceled' } : {};
     });
     const client = { cwd: root, codexHome: root, get closed() { return closed; }, request,
       onNotification(listener: CodexNotificationListener) { notice = listener; return () => {}; },
@@ -40,7 +42,7 @@ async function fixture() {
 }
 async function suspendedStart() {
   const f = await fixture(), entered = deferred(), reply = deferred<unknown>();
-  f.request.mockImplementation(async method => { if (method === 'account/login/start') { entered.resolve(); return reply.promise; } return {}; });
+  f.request.mockImplementation(async method => { if (method === 'account/login/start') { entered.resolve(); return reply.promise; } return method === 'account/login/cancel' ? { status: 'canceled' } : {}; });
   const handle = f.service.reserveDeviceLoginAttempt().attemptHandle;
   const start = f.service.startDeviceLogin({ attemptHandle: handle });
   const outcome = start.catch(error => error);
@@ -50,7 +52,7 @@ async function suspendedStart() {
 async function httpAttempt() {
   const f = await fixture(), entered = deferred(), reply = deferred<unknown>(), closeEntered = deferred();
   const handle = f.service.reserveDeviceLoginAttempt().attemptHandle;
-  f.request.mockImplementation(async method => { if (method === 'account/login/start') { entered.resolve(); return reply.promise; } return {}; });
+  f.request.mockImplementation(async method => { if (method === 'account/login/start') { entered.resolve(); return reply.promise; } return method === 'account/login/cancel' ? { status: 'canceled' } : {}; });
   let start!: Promise<CodexDeviceLogin>, outcome!: Promise<unknown>, close!: ReturnType<typeof f.service.closeDeviceLoginAttempt>;
   const server = createServer((request, response) => {
     const chunks: Buffer[] = [];
@@ -162,7 +164,7 @@ describe('exact Codex sign-in attempt', () => {
     const f = await fixture(), handle = f.service.reserveDeviceLoginAttempt().attemptHandle;
     await f.service.startDeviceLogin({ attemptHandle: handle });
     const entered = deferred(), account = deferred<unknown>();
-    f.request.mockImplementation(async method => { if (method === 'account/read') { entered.resolve(); return account.promise; } return {}; });
+    f.request.mockImplementation(async method => { if (method === 'account/read') { entered.resolve(); return account.promise; } return method === 'account/login/cancel' ? { status: 'canceled' } : {}; });
     f.notify(); await entered.promise;
     const pending = f.owner().snapshot()!;
     const close = f.service.closeDeviceLoginAttempt(handle);
@@ -200,10 +202,10 @@ describe('exact Codex sign-in attempt', () => {
     const next = f.service.reserveDeviceLoginAttempt().attemptHandle;
     await f.service.startDeviceLogin({ attemptHandle: next });
     const cancel = deferred<unknown>(), entered = deferred();
-    second.request.mockImplementation(async method => { if (method === 'account/login/cancel') { entered.resolve(); return cancel.promise; } return {}; });
+    second.request.mockImplementation(async method => { if (method === 'account/login/cancel') { entered.resolve(); return cancel.promise; } return method === 'account/login/cancel' ? { status: 'canceled' } : {}; });
     const closing = f.service.closeDeviceLoginAttempt(next); await entered.promise;
     new CodexAuthenticationOwner(second.client).begin(true); const newer = f.owner().snapshot();
-    cancel.resolve({}); expect((await closing).cleanup).toBe('cancel-acknowledged');
+    cancel.resolve({ status: 'canceled' }); expect((await closing).cleanup).toBe('cancel-acknowledged');
     expect(f.owner().snapshot()).toEqual(newer); expect(f.factory).toHaveBeenCalledTimes(2); await f.service.dispose();
   });
   it('serializes concurrent logout without using an old cleanup permit', async () => {
@@ -216,7 +218,7 @@ describe('exact Codex sign-in attempt', () => {
   it('retains unconfirmed cancellation without replaying it or allowing a new login', async () => {
     const f = await fixture(), handle = f.service.reserveDeviceLoginAttempt().attemptHandle;
     await f.service.startDeviceLogin({ attemptHandle: handle });
-    f.request.mockImplementation(async method => { if (method === 'account/login/cancel') throw new Error('private-provider-error'); return {}; });
+    f.request.mockImplementation(async method => { if (method === 'account/login/cancel') throw new Error('private-provider-error'); return method === 'account/login/cancel' ? { status: 'canceled' } : {}; });
     const result = await f.service.closeDeviceLoginAttempt(handle);
     expect(result).toMatchObject({ state: 'closed', cleanup: 'unconfirmed' }); expect(JSON.stringify(result)).not.toContain('private-provider-error');
     expect(await f.service.closeDeviceLoginAttempt(handle)).toBe(result);
@@ -283,5 +285,133 @@ describe('exact Codex sign-in attempt', () => {
     expect(() => f.service.reserveDeviceLoginAttempt()).toThrow('closed');
     await expect(f.service.startDeviceLogin({ attemptHandle: f.handle })).rejects.toThrow('closed');
     expect(f.owner().snapshot()?.localState).toBe('unknown');
+  });
+  it.each([{ status: 'canceled' }, { status: 'notFound' }, {}, undefined, { status: 'other' }])('accepts only the pinned native canceled ACK: %j', async response => {
+    const f = await fixture(), handle = f.service.reserveDeviceLoginAttempt().attemptHandle;
+    await f.service.startDeviceLogin({ attemptHandle: handle });
+    f.request.mockImplementation(async method => method === 'account/login/cancel' ? response : {});
+    const closing = f.service.closeDeviceLoginAttempt(handle), receipt = await closing;
+    expect(receipt.cleanup).toBe(response?.status === 'canceled' ? 'cancel-acknowledged' : 'unconfirmed');
+    expect(Object.isFrozen(receipt)).toBe(true); expect(f.service.closeDeviceLoginAttempt(handle)).toBe(closing);
+    expect(await f.service.closeDeviceLoginAttempt(handle)).toBe(receipt);
+    expect(f.request.mock.calls.filter(([method]) => method === 'account/login/cancel')).toEqual([['account/login/cancel', { loginId: 'l1' }]]);
+    if (response?.status !== 'canceled') await expect(f.service.startDeviceLogin()).rejects.toMatchObject({ code: 'CODEX_LOGIN_ATTEMPT_BUSY' });
+    await f.service.dispose(); expect(receipt.cleanup).toBe(response?.status === 'canceled' ? 'cancel-acknowledged' : 'unconfirmed');
+  });
+  it.each(['cancel-timeout', 'pending-protocol-error'] as const)('awaits one original process settlement after %s; a new borrowed peer cannot release it', async mode => {
+    const f = await fixture(), handle = f.service.reserveDeviceLoginAttempt().attemptHandle;
+    await f.service.startDeviceLogin({ attemptHandle: handle });
+    const exited = deferred(), second = f.peer();
+    vi.mocked(f.client.close).mockImplementation(async () => { f.disconnect(); await exited.promise; });
+    if (mode === 'cancel-timeout') {
+      f.request.mockImplementation(async method => { if (method === 'account/login/cancel') throw new Error('cancel timeout'); return {}; });
+      expect((await f.service.closeDeviceLoginAttempt(handle)).cleanup).toBe('unconfirmed');
+    }
+    f.disconnect(); await Promise.resolve();
+    expect(f.client.close).toHaveBeenCalledTimes(1);
+    f.factory.mockResolvedValueOnce(second.client); expect(await f.service.getRuntimeClient()).toBe(second.client);
+    const next = f.service.reserveDeviceLoginAttempt().attemptHandle;
+    await expect(f.service.startDeviceLogin({ attemptHandle: next })).rejects.toMatchObject({ code: 'CODEX_LOGIN_ATTEMPT_BUSY' });
+    await expect(f.service.startDeviceLogin()).rejects.toMatchObject({ code: 'CODEX_LOGIN_ATTEMPT_BUSY' });
+    expect(second.client.close).not.toHaveBeenCalled();
+    exited.resolve(); await vi.waitFor(() => expect((f.service as unknown as { activeAttempt?: unknown }).activeAttempt).toBeUndefined());
+    await f.service.startDeviceLogin({ attemptHandle: next });
+    expect(second.request.mock.calls.filter(([method]) => method === 'account/login/start')).toHaveLength(1);
+    await f.service.dispose(); expect(f.client.close).toHaveBeenCalledTimes(1); expect(second.client.close).toHaveBeenCalledTimes(1);
+  });
+  it('keeps an original failed retirement owned and BUSY until dispose observes the same error once', async () => {
+    const f = await fixture(), failure = new Error('original process cleanup failed');
+    await f.service.startDeviceLogin({ attemptHandle: f.service.reserveDeviceLoginAttempt().attemptHandle });
+    vi.mocked(f.client.close).mockRejectedValue(failure); f.disconnect();
+    await Promise.resolve(); await Promise.resolve();
+    await expect(f.service.startDeviceLogin()).rejects.toMatchObject({ code: 'CODEX_LOGIN_ATTEMPT_BUSY' });
+    await expect(f.service.dispose()).rejects.toBe(failure); expect(f.client.close).toHaveBeenCalledTimes(1);
+  });
+  it('uses the prior shared retirement proof when a closed peer is returned before attempt association', async () => {
+    const f = await fixture(), second = f.peer();
+    await f.service.getRuntimeClient(); f.disconnect();
+    await vi.waitFor(() => expect(f.client.close).toHaveBeenCalledTimes(1));
+    f.factory.mockResolvedValueOnce(f.client);
+    await expect(f.service.startDeviceLogin({ attemptHandle: f.service.reserveDeviceLoginAttempt().attemptHandle })).rejects.toMatchObject({ code: 'CODEX_LOGIN_ATTEMPT_BUSY' });
+    f.factory.mockResolvedValueOnce(second.client);
+    await f.service.startDeviceLogin({ attemptHandle: f.service.reserveDeviceLoginAttempt().attemptHandle });
+    expect(f.request.mock.calls.filter(([method]) => method === 'account/login/start')).toHaveLength(0);
+    expect(second.request.mock.calls.filter(([method]) => method === 'account/login/start')).toHaveLength(1);
+    await f.service.dispose(); expect(f.client.close).toHaveBeenCalledTimes(1);
+  });
+  it('keeps an invalid native start BUSY through a pending retirement, then allows exactly one fresh start', async () => {
+    const f = await suspendedStart(), exited = deferred(), second = f.peer();
+    vi.mocked(f.client.close).mockImplementation(async () => { f.disconnect(); await exited.promise; });
+    f.reply.resolve({ type: 'broken' });
+    await vi.waitFor(() => expect(f.client.close).toHaveBeenCalledTimes(1));
+    await expect(f.service.startDeviceLogin()).rejects.toMatchObject({ code: 'CODEX_LOGIN_ATTEMPT_BUSY' });
+    f.factory.mockResolvedValueOnce(second.client); exited.resolve(); await f.outcome;
+    await f.service.startDeviceLogin(); expect(second.request.mock.calls.filter(([method]) => method === 'account/login/start')).toHaveLength(1);
+    await f.service.dispose(); expect(f.client.close).toHaveBeenCalledTimes(1);
+  });
+  it.each(['read-error', 'account-null'] as const)('concludes its own non-ready completion after success + %s without a false ready or permanent BUSY', async mode => {
+    const f = await fixture(), handle = f.service.reserveDeviceLoginAttempt().attemptHandle;
+    await f.service.startDeviceLogin({ attemptHandle: handle });
+    f.request.mockImplementation(async method => {
+      if (method === 'account/read') { if (mode === 'read-error') throw new Error('synthetic account/read failed'); return { account: null }; }
+      if (method === 'account/login/start') return login('l2');
+      return method === 'account/login/cancel' ? { status: 'canceled' } : {};
+    });
+    f.notify(); await f.service.readAccount().catch(() => {});
+    expect(f.owner().snapshot()).toMatchObject({ localState: mode === 'read-error' ? 'unknown' : 'disconnected', operationId: null });
+    expect(await f.service.closeDeviceLoginAttempt(handle)).toMatchObject({ state: 'closed', cleanup: 'not-applicable' });
+    const before = f.owner().snapshot();
+    await f.service.startDeviceLogin({ attemptHandle: f.service.reserveDeviceLoginAttempt().attemptHandle });
+    expect(f.owner().snapshot()!.authGeneration).toBe(before!.authGeneration + 1);
+    expect(f.request.mock.calls.filter(([method]) => method === 'account/login/cancel')).toHaveLength(0);
+    expect(f.request.mock.calls.filter(([method]) => method === 'account/login/start')).toHaveLength(2); await f.service.dispose();
+  });
+  it.each(['CAS', 'file-fsync', 'directory-fsync'] as const)('retires a non-ready success after %s failure without overwriting newer state', async mode => {
+    const f = await fixture(), handle = f.service.reserveDeviceLoginAttempt().attemptHandle;
+    await f.service.startDeviceLogin({ attemptHandle: handle });
+    const exited = deferred(), failure = new Error('synthetic owner fsync failure');
+    vi.mocked(f.client.close).mockImplementation(async () => { f.disconnect(); await exited.promise; });
+    if (mode === 'CAS') {
+      const complete = CodexAuthenticationOwner.prototype.completeLogin;
+      vi.spyOn(CodexAuthenticationOwner.prototype, 'completeLogin').mockImplementationOnce(function (this: CodexAuthenticationOwner, ticket, client, written) {
+        this.begin(true); return complete.call(this, ticket, client, written);
+      });
+    } else {
+      const fsync = fs.fsyncSync; let failed = false;
+      vi.spyOn(fs, 'fsyncSync').mockImplementation(fd => {
+        if (!failed && (mode === 'file-fsync' || fs.fstatSync(fd).isDirectory())) { failed = true; throw failure; }
+        fsync(fd);
+      }); syncBuiltinESMExports();
+    }
+    f.notify(); await vi.waitFor(() => expect(f.client.close).toHaveBeenCalledTimes(1));
+    expect((f.service as unknown as { login: { status: string } }).login.status).toBe('failed');
+    const afterFailure = f.owner().snapshot();
+    expect(afterFailure?.localState).not.toBe(mode === 'directory-fsync' ? 'unknown' : 'ready');
+    await expect(f.service.startDeviceLogin()).rejects.toMatchObject({ code: 'CODEX_LOGIN_ATTEMPT_BUSY' });
+    if (mode === 'CAS' || mode === 'directory-fsync') expect((await f.service.closeDeviceLoginAttempt(handle)).state).toBe('superseded');
+    expect(f.owner().snapshot()).toEqual(afterFailure);
+    exited.resolve(); await vi.waitFor(() => expect((f.service as unknown as { activeAttempt?: unknown }).activeAttempt).toBeUndefined());
+    const dispose = f.service.dispose();
+    if (mode === 'CAS') await dispose; else await expect(dispose).rejects.toBe(failure);
+    expect(f.client.close).toHaveBeenCalledTimes(1);
+  });
+  it('lets Close fence a concurrent failed completion, then releases only after the original peer retirement', async () => {
+    const f = await fixture(), handle = f.service.reserveDeviceLoginAttempt().attemptHandle;
+    await f.service.startDeviceLogin({ attemptHandle: handle });
+    const entered = deferred(), account = deferred<unknown>(), exited = deferred(), second = f.peer();
+    f.request.mockImplementation(async method => {
+      if (method === 'account/read') { entered.resolve(); return account.promise; }
+      if (method === 'account/login/cancel') throw new Error('cancel timeout'); return {};
+    });
+    vi.mocked(f.client.close).mockImplementation(async () => { f.disconnect(); await exited.promise; });
+    f.notify(); await entered.promise;
+    const receipt = await f.service.closeDeviceLoginAttempt(handle), before = f.owner().snapshot();
+    expect(receipt).toMatchObject({ state: 'closed', cleanup: 'unconfirmed' });
+    account.reject(new Error('completion account/read failed')); await vi.waitFor(() => expect(f.client.close).toHaveBeenCalledTimes(1));
+    await expect(f.service.startDeviceLogin()).rejects.toMatchObject({ code: 'CODEX_LOGIN_ATTEMPT_BUSY' }); expect(f.owner().snapshot()).toEqual(before);
+    f.factory.mockResolvedValueOnce(second.client); exited.resolve();
+    await vi.waitFor(() => expect((f.service as unknown as { activeAttempt?: unknown }).activeAttempt).toBeUndefined());
+    await f.service.startDeviceLogin(); expect(receipt.cleanup).toBe('unconfirmed'); expect(Object.isFrozen(receipt)).toBe(true);
+    await f.service.dispose(); expect(f.client.close).toHaveBeenCalledTimes(1);
   });
 });

@@ -12,12 +12,15 @@ export interface CodexRequestOptions { signal?: AbortSignal; timeoutMs?: number 
 export interface CodexClient {
   readonly cwd: string;
   readonly codexHome: string;
+  /** Transport has ended; only close() settlement proves process exit and cleanup. */
   readonly closed: boolean;
   request<T = unknown>(method: string, params?: unknown, options?: CodexRequestOptions): Promise<T>;
   onNotification(listener: CodexNotificationListener): () => void;
   /** Return undefined for unhandled requests. The first other result is sent as the response. */
   onRequest(listener: CodexRequestListener): () => void;
+  /** Transport-end notice. This can precede process exit. */
   onClose(listener: () => void): () => void;
+  /** Idempotent shared settlement for process exit and owned workspace cleanup. */
   close(): Promise<void>;
 }
 export interface CodexClientOptions {
