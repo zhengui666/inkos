@@ -207,3 +207,57 @@ it('fences a pending success as soon as dispose starts, while it is still awaiti
   expect(owner.snapshot()).toMatchObject({ localState: 'unknown', operationId: null, authGeneration: pending.authGeneration });
   expect(request.mock.calls.filter(([method]) => method === 'account/read')).toHaveLength(0);
 });
+
+it('closes and clears the local login after pending-ticket settlement throws, retaining the original error', async () => {
+  const { service, client, request, notify } = await fixture();
+  await service.startDeviceLogin();
+  notify('account/login/completed', { loginId: 'unmatched-early', success: true });
+  const failure = new Error('Synthetic owner fsync failure');
+  const settle = vi.spyOn(CodexAuthenticationOwner.prototype, 'complete').mockImplementation(() => { throw failure; });
+  try {
+    await expect(service.dispose()).rejects.toBe(failure);
+    expect(client.close).toHaveBeenCalledTimes(1);
+    const state = service as unknown as { clientPromise?: unknown; ownerLogin?: unknown; login: unknown; earlyCompletions: Map<string, boolean> };
+    expect(state.clientPromise).toBeUndefined(); expect(state.ownerLogin).toBeUndefined(); expect(state.login).toBeNull(); expect(state.earlyCompletions.size).toBe(0);
+    notify('account/login/completed', { loginId: 'l1', success: true });
+    expect(state.earlyCompletions.size).toBe(0);
+    expect(request.mock.calls.some(([method]) => method === 'account/logout')).toBe(false);
+  } finally { settle.mockRestore(); }
+});
+
+it('retains settlement and close failures together and still clears local state', async () => {
+  const { service, client, notify } = await fixture();
+  await service.startDeviceLogin();
+  notify('account/login/completed', { loginId: 'unmatched-early', success: true });
+  const settlementFailure = new Error('Synthetic owner lock failure'), closeFailure = new Error('Synthetic peer close failure');
+  const settle = vi.spyOn(CodexAuthenticationOwner.prototype, 'complete').mockImplementation(() => { throw settlementFailure; });
+  vi.mocked(client.close).mockRejectedValueOnce(closeFailure);
+  try {
+    const failure = await service.dispose().catch(error => error);
+    expect(client.close).toHaveBeenCalledTimes(1);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(failure.errors).toEqual([settlementFailure, closeFailure]);
+    expect(failure.cause).toBe(settlementFailure);
+    const state = service as unknown as { clientPromise?: unknown; ownerLogin?: unknown; login: unknown; earlyCompletions: Map<string, boolean> };
+    expect(state.clientPromise).toBeUndefined(); expect(state.ownerLogin).toBeUndefined(); expect(state.login).toBeNull(); expect(state.earlyCompletions.size).toBe(0);
+  } finally { settle.mockRestore(); }
+});
+
+it('closes after failed old-ticket settlement without changing a newer owner operation', async () => {
+  const { service, client, notify } = await fixture();
+  const owner = new CodexAuthenticationOwner(client);
+  await service.startDeviceLogin();
+  const originalTicket = owner.snapshot()!, newer = owner.begin(true), before = owner.snapshot()!;
+  const failure = new Error('Synthetic owner read failure');
+  const settle = vi.spyOn(CodexAuthenticationOwner.prototype, 'complete').mockImplementation(operation => {
+    expect(operation).toEqual({ operationId: originalTicket.operationId, authGeneration: originalTicket.authGeneration });
+    throw failure;
+  });
+  try {
+    await expect(service.dispose()).rejects.toBe(failure);
+    expect(client.close).toHaveBeenCalledTimes(1);
+    notify('account/login/completed', { loginId: 'l1', success: true });
+    expect(owner.snapshot()).toEqual(before);
+  } finally { settle.mockRestore(); }
+  expect(owner.complete(newer, 'unknown')).toBe(true);
+});

@@ -280,10 +280,20 @@ class AccountService implements CodexAccountService {
     this.ownerLogin = undefined;
     // Closing fences callbacks, so settle our original ticket before dropping the peer.
     // complete's ticket check cannot overwrite a newer operation or a completed account.
-    if (pending) pending.owner.complete(pending.operation, 'unknown');
-    const promise = this.clientPromise;
-    this.clientPromise = undefined;
-    if (promise) await (await promise).close();
-    this.login = null; this.earlyCompletions.clear();
+    let settlementFailed = false, settlementError: unknown;
+    try {
+      if (pending) pending.owner.complete(pending.operation, 'unknown');
+    } catch (error) {
+      settlementFailed = true; settlementError = error; throw error;
+    } finally {
+      const promise = this.clientPromise;
+      this.clientPromise = undefined;
+      try { if (promise) await (await promise).close(); }
+      catch (closeError) {
+        if (settlementFailed) throw new AggregateError([settlementError, closeError],
+          'Codex login settlement and peer close both failed', { cause: settlementError });
+        throw closeError;
+      } finally { this.login = null; this.earlyCompletions.clear(); }
+    }
   }
 }
