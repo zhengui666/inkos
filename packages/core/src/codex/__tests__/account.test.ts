@@ -14,8 +14,9 @@ async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), 'inkos-account-test-')); roots.push(dir);
   let notification: CodexNotificationListener = () => undefined;
   let close: () => void = () => undefined;
+  let connected = false;
   const request = vi.fn(async (method: string): Promise<unknown> => {
-    if (method === 'account/read') return { account: null, requiresOpenaiAuth: true, accessToken: 'DO NOT EXPOSE' };
+    if (method === 'account/read') return { account: connected ? { type: 'chatgpt', email: 'synthetic@example.test' } : null, requiresOpenaiAuth: true, accessToken: 'DO NOT EXPOSE' };
     if (method === 'account/login/start') return { type: 'chatgptDeviceCode', loginId: 'l1', verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'ABCD', accessToken: 'DO NOT EXPOSE' };
     if (method === 'model/list') return { data: [{ id: 'model1', model: 'gpt-6.1-sol', displayName: 'Model', isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: 'medium' }, { reasoningEffort: 'ultra' }], serviceTiers: [{ id: 'fast' }, { id: 'priority' }], token: 'DO NOT EXPOSE' }], nextCursor: null };
     return {};
@@ -24,7 +25,7 @@ async function fixture() {
     onClose: (listener: () => void) => { close = listener; return () => undefined; }, close: vi.fn(async () => close()),
     cwd: dir, codexHome: dir, closed: false, onRequest: () => () => undefined } as unknown as CodexClient;
   const service = createCodexAccountService({ projectDir: dir, clientFactory: async () => client });
-  return { service, request, client, notify: (method: string, params: unknown) => notification(method, params), close: () => close() };
+  return { service, request, client, notify: (method: string, params: unknown) => { if (method === 'account/login/completed' && (params as { success?: boolean }).success) connected = true; notification(method, params); }, close: () => close() };
 }
 describe('Codex account service', () => {
   it('projects account/model/login data without credential leakage', async () => {

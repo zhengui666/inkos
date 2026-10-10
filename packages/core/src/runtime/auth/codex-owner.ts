@@ -20,6 +20,13 @@ const RecordSchema = z.object({
   operationId: z.string().nullable(), identityRef: IdentityRefSchema,
 }).strict().refine(record => (record.localState === 'transitioning') === (record.operationId !== null), 'Invalid authentication operation state');
 export type CodexConnectionRecord = z.infer<typeof RecordSchema>;
+/** Durable owner state, excluding account identity evidence. Captured under the owner mutex. */
+export type CodexConnectionStamp = Readonly<Pick<CodexConnectionRecord,
+  'authContextRef' | 'connectionRef' | 'authGeneration' | 'localState' | 'operationId'>>;
+function stamp(record: CodexConnectionRecord): CodexConnectionStamp {
+  const { authContextRef, connectionRef, authGeneration, localState, operationId } = record;
+  return Object.freeze({ authContextRef, connectionRef, authGeneration, localState, operationId });
+}
 export type CodexAuthOperation = Readonly<{ operationId: string; authGeneration: number }>;
 export type CodexAuthenticationTarget = Pick<RuntimeSelection, 'harnessId' | 'authContextRef' | 'connectionRef' | 'authGeneration'>;
 export interface CodexAccountObservation {
@@ -265,37 +272,40 @@ export class CodexAuthenticationOwner {
     });
   }
 
-  begin(replaceConnection = false): CodexAuthOperation {
+  begin(replaceConnection = false, onWritten?: (state: CodexConnectionStamp) => void): CodexAuthOperation {
     return this.locked(() => {
       const current = this.read() ?? this.initial();
       const next = this.bump(current, { localState: 'transitioning', operationId: randomUUID(),
         ...(replaceConnection ? { identityRef: null } : {}) });
+      onWritten?.(stamp(next));
       return Object.freeze({ operationId: next.operationId!, authGeneration: next.authGeneration });
     });
   }
-  complete(operation: CodexAuthOperation, state: 'disconnected' | 'unknown'): boolean {
+  complete(operation: CodexAuthOperation, state: 'disconnected' | 'unknown', onWritten?: (state: CodexConnectionStamp) => void): boolean {
     return this.locked(() => {
       const current = this.read();
       if (!current || current.localState !== 'transitioning' || !operation.operationId
         || current.operationId !== operation.operationId || current.authGeneration !== operation.authGeneration) return false;
-      this.write({ ...current, localState: state, operationId: null }); return true;
+      const next = this.write({ ...current, localState: state, operationId: null });
+      onWritten?.(stamp(next)); return true;
     });
   }
-  async completeLogin(operation: CodexAuthOperation, client: CodexClient): Promise<boolean> {
+  async completeLogin(operation: CodexAuthOperation, client: CodexClient, onWritten?: (state: CodexConnectionStamp) => void): Promise<boolean> {
     this.assertContext(client);
     const before = this.snapshot();
     if (!before || before.localState !== 'transitioning' || !operation.operationId
       || before.operationId !== operation.operationId || before.authGeneration !== operation.authGeneration) return false;
     let evidence: ReturnType<typeof accountEvidence>;
     try { evidence = accountEvidence(await client.request('account/read', { refreshToken: false })); }
-    catch { return this.complete(operation, 'unknown'); }
+    catch { return this.complete(operation, 'unknown', onWritten); }
     this.assertContext(client);
     return this.locked(() => {
       const current = this.read();
       if (!current || current.localState !== 'transitioning' || current.operationId !== operation.operationId
         || current.authGeneration !== operation.authGeneration) return false;
-      this.write({ ...current, localState: evidence.authenticated ? 'ready' : 'disconnected',
-        operationId: null, identityRef: evidence.identityRef }); return true;
+      const next = this.write({ ...current, localState: evidence.authenticated ? 'ready' : 'disconnected',
+        operationId: null, identityRef: evidence.identityRef });
+      onWritten?.(stamp(next)); return true;
     });
   }
   disconnect(): void {
