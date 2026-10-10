@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCodexAccountService } from '../account.js';
+import { CodexAuthenticationOwner } from '../../runtime/auth/codex-owner.js';
 import type { CodexClient, CodexNotificationListener } from '../app-server.js';
 
 const roots: string[] = [];
@@ -21,7 +22,7 @@ async function fixture() {
     onClose: (listener: () => void) => { close = listener; return () => undefined; }, close: vi.fn(async () => close()),
     cwd: dir, codexHome: dir, closed: false, onRequest: () => () => undefined } as unknown as CodexClient;
   const service = createCodexAccountService({ projectDir: dir, clientFactory: async () => client });
-  return { service, request, notify: (method: string, params: unknown) => notification(method, params), close: () => close() };
+  return { service, request, client, notify: (method: string, params: unknown) => notification(method, params), close: () => close() };
 }
 describe('Codex account service', () => {
   it('projects account/model/login data without credential leakage', async () => {
@@ -63,13 +64,200 @@ describe('Codex account service', () => {
   });
 });
 
-it('shares catalog aliases/default fallback/speed projection with runtime settings validation', async () => {
+it('shares catalog aliases/explicit native default/speed projection with runtime settings validation', async () => {
   const { service, request } = await fixture();
-  request.mockImplementation(async (method: string) => method === 'model/list' ? { data: [{ id: 'alias', model: 'canonical', displayName: 'Model', isDefault: false,
+  request.mockImplementation(async (method: string) => method === 'model/list' ? { data: [{ id: 'alias', model: 'canonical', displayName: 'Model', isDefault: true,
     supportedReasoningEfforts: [{ reasoningEffort: 'medium' }, { reasoningEffort: 'ultra' }], serviceTiers: [{ id: 'fast', name: 'Fast' }], additionalSpeedTiers: ['fast', 'priority'] }], nextCursor: null } : {});
   expect((await service.listModels())[0]?.serviceTiers.map(tier => tier.id)).toEqual(['fast', 'priority']);
   await expect(service.updateSettings({ model: 'alias', serviceTier: 'priority' })).resolves.toMatchObject({ model: 'alias', serviceTier: 'priority' });
   await expect(service.updateSettings({ model: null, serviceTier: 'default' })).resolves.toEqual({ reasoningEffort: 'ultra', serviceTier: 'default' });
   await expect(service.readSettings()).resolves.toEqual({ reasoningEffort: 'ultra', serviceTier: 'default' });
   await service.dispose();
+});
+
+it('routes legacy login/cancel/logout through the same owner and ignores a cancelled late success', async () => {
+  const { service, request, client, notify } = await fixture();
+  const original = request.getMockImplementation()!;
+  request.mockImplementation(async method => method === 'account/read'
+    ? { account: { type: 'chatgpt', email: 'synthetic@example.test' } } : original(method));
+  const owner = new CodexAuthenticationOwner(client), admitted = await owner.admit(client);
+  const initial = owner.snapshot()!;
+  let stateAtStart: string | undefined;
+  request.mockImplementation(async method => {
+    if (method === 'account/login/start') stateAtStart = owner.snapshot()?.localState;
+    return method === 'account/read' ? { account: { type: 'chatgpt', email: 'synthetic@example.test' } } : original(method);
+  });
+  await service.startDeviceLogin();
+  expect(stateAtStart).toBe('transitioning');
+  expect(owner.snapshot()!.authGeneration).toBeGreaterThan(initial.authGeneration);
+  await expect(owner.guard({ ...admitted, ...admitted.connection }, client)).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+  await service.cancelLogin('l1');
+  const cancelled = owner.snapshot()!;
+  notify('account/login/completed', { loginId: 'l1', success: true });
+  expect((await service.readAccount()).login?.status).toBe('cancelled');
+  expect(owner.snapshot()).toEqual(cancelled);
+  await service.startDeviceLogin();
+  notify('account/login/completed', { loginId: 'l1', success: true });
+  await service.readAccount();
+  expect(owner.snapshot()?.localState).toBe('ready');
+  const ready = owner.snapshot()!;
+  await service.logout();
+  expect(owner.snapshot()).toMatchObject({ localState: 'disconnected', authGeneration: ready.authGeneration + 1 });
+  await service.dispose();
+});
+
+it('discards an account read that crossed logout instead of publishing a stale connection', async () => {
+  const { service, request, client } = await fixture();
+  const owner = new CodexAuthenticationOwner(client);
+  request.mockImplementation(async method => method === 'account/read' ? { account: { type: 'chatgpt', email: 'first@example.test' } } : {});
+  await owner.admit(client);
+  let entered!: () => void, finish!: (value: unknown) => void;
+  const began = new Promise<void>(resolve => { entered = resolve; });
+  request.mockImplementation(async method => {
+    if (method !== 'account/read') return {};
+    entered(); return new Promise(resolve => { finish = resolve; });
+  });
+  const status = service.readAccount(); await began;
+  await service.logout();
+  finish({ account: { type: 'chatgpt', email: 'first@example.test' } });
+  expect((await status).connected).toBe(false);
+  expect(owner.snapshot()?.localState).toBe('disconnected');
+  await service.dispose();
+});
+
+it('leaves the owner non-ready after a login RPC failure', async () => {
+  const { service, request, client } = await fixture();
+  const owner = new CodexAuthenticationOwner(client);
+  request.mockImplementation(async () => { throw new Error('Synthetic RPC deadline'); });
+  await expect(service.startDeviceLogin()).rejects.toThrow('Synthetic RPC deadline');
+  expect(owner.snapshot()).toMatchObject({ localState: 'unknown', operationId: null });
+  await service.dispose();
+});
+
+it('refuses to guess the first catalog model when native default evidence is absent', async () => {
+  const { service, request } = await fixture();
+  request.mockImplementation(async method => method === 'model/list' ? { data: [{ id: 'alias', model: 'canonical', isDefault: false,
+    supportedReasoningEfforts: [{ reasoningEffort: 'ultra' }], serviceTiers: [{ id: 'priority' }] }] } : {});
+  await expect(service.updateSettings({ model: null })).rejects.toMatchObject({ code: 'CODEX_MODEL_UNAVAILABLE' });
+  await service.dispose();
+});
+
+it('rejects ambiguous native defaults instead of choosing whichever catalog row appeared first', async () => {
+  const { service, request } = await fixture();
+  request.mockImplementation(async method => method === 'model/list' ? { data: ['one', 'two'].map(model => ({ id: model, model, isDefault: true,
+    supportedReasoningEfforts: [{ reasoningEffort: 'ultra' }], serviceTiers: [{ id: 'priority' }] })) } : {});
+  await expect(service.updateSettings({ model: null })).rejects.toMatchObject({ code: 'CODEX_MODEL_UNAVAILABLE' });
+  await service.dispose();
+});
+
+
+it('settles the original pending login ticket on dispose, fences late success, and allows fresh reconciliation', async () => {
+  const { service, request, client, notify } = await fixture();
+  const owner = new CodexAuthenticationOwner(client);
+  await service.startDeviceLogin();
+  const pending = owner.snapshot()!;
+  expect(pending.localState).toBe('transitioning');
+  await service.dispose();
+  const disposed = owner.snapshot()!;
+  expect(disposed).toMatchObject({ localState: 'unknown', operationId: null, authGeneration: pending.authGeneration });
+  notify('account/login/completed', { loginId: 'l1', success: true });
+  expect(owner.snapshot()).toEqual(disposed);
+  expect(request.mock.calls.some(([method]) => method === 'account/logout')).toBe(false);
+  request.mockImplementation(async method => method === 'account/read' ? { account: { type: 'chatgpt', email: 'fresh@example.test' } } : {});
+  const fresh = createCodexAccountService({ projectDir: client.cwd, clientFactory: async () => client });
+  expect((await fresh.readAccount()).connected).toBe(true);
+  expect((await owner.admit(client)).ready).toBe(true);
+  await fresh.dispose();
+});
+
+it('does not let disposing an old pending login overwrite a newer operation', async () => {
+  const { service, client, notify } = await fixture();
+  const owner = new CodexAuthenticationOwner(client);
+  await service.startDeviceLogin();
+  const newer = owner.begin(true), before = owner.snapshot()!;
+  await service.dispose();
+  notify('account/login/completed', { loginId: 'l1', success: true });
+  expect(owner.snapshot()).toEqual(before);
+  expect(owner.complete(newer, 'unknown')).toBe(true);
+});
+
+it('keeps a completed account ready when its service is disposed', async () => {
+  const { service, request, client, notify } = await fixture();
+  const original = request.getMockImplementation()!;
+  request.mockImplementation(async method => method === 'account/read' ? { account: { type: 'chatgpt', email: 'ready@example.test' } } : original(method));
+  await service.startDeviceLogin();
+  notify('account/login/completed', { loginId: 'l1', success: true });
+  await service.readAccount();
+  const owner = new CodexAuthenticationOwner(client), ready = owner.snapshot()!;
+  expect(ready.localState).toBe('ready');
+  await service.dispose();
+  expect(owner.snapshot()).toEqual(ready);
+  expect(request.mock.calls.some(([method]) => method === 'account/logout')).toBe(false);
+});
+
+it('fences a pending success as soon as dispose starts, while it is still awaiting its queue', async () => {
+  const { service, request, client, notify } = await fixture();
+  await service.startDeviceLogin();
+  const owner = new CodexAuthenticationOwner(client), pending = owner.snapshot()!;
+  request.mockImplementation(async method => method === 'account/read' ? { account: { type: 'chatgpt', email: 'late@example.test' } } : {});
+  const closing = service.dispose();
+  // dispose has marked itself closed, but its first await has not resumed yet.
+  notify('account/login/completed', { loginId: 'l1', success: true });
+  await closing;
+  expect(owner.snapshot()).toMatchObject({ localState: 'unknown', operationId: null, authGeneration: pending.authGeneration });
+  expect(request.mock.calls.filter(([method]) => method === 'account/read')).toHaveLength(0);
+});
+
+it('closes and clears the local login after pending-ticket settlement throws, retaining the original error', async () => {
+  const { service, client, request, notify } = await fixture();
+  await service.startDeviceLogin();
+  notify('account/login/completed', { loginId: 'unmatched-early', success: true });
+  const failure = new Error('Synthetic owner fsync failure');
+  const settle = vi.spyOn(CodexAuthenticationOwner.prototype, 'complete').mockImplementation(() => { throw failure; });
+  try {
+    await expect(service.dispose()).rejects.toBe(failure);
+    expect(client.close).toHaveBeenCalledTimes(1);
+    const state = service as unknown as { clientPromise?: unknown; ownerLogin?: unknown; login: unknown; earlyCompletions: Map<string, boolean> };
+    expect(state.clientPromise).toBeUndefined(); expect(state.ownerLogin).toBeUndefined(); expect(state.login).toBeNull(); expect(state.earlyCompletions.size).toBe(0);
+    notify('account/login/completed', { loginId: 'l1', success: true });
+    expect(state.earlyCompletions.size).toBe(0);
+    expect(request.mock.calls.some(([method]) => method === 'account/logout')).toBe(false);
+  } finally { settle.mockRestore(); }
+});
+
+it('retains settlement and close failures together and still clears local state', async () => {
+  const { service, client, notify } = await fixture();
+  await service.startDeviceLogin();
+  notify('account/login/completed', { loginId: 'unmatched-early', success: true });
+  const settlementFailure = new Error('Synthetic owner lock failure'), closeFailure = new Error('Synthetic peer close failure');
+  const settle = vi.spyOn(CodexAuthenticationOwner.prototype, 'complete').mockImplementation(() => { throw settlementFailure; });
+  vi.mocked(client.close).mockRejectedValueOnce(closeFailure);
+  try {
+    const failure = await service.dispose().catch(error => error);
+    expect(client.close).toHaveBeenCalledTimes(1);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(failure.errors).toEqual([settlementFailure, closeFailure]);
+    expect(failure.cause).toBe(settlementFailure);
+    const state = service as unknown as { clientPromise?: unknown; ownerLogin?: unknown; login: unknown; earlyCompletions: Map<string, boolean> };
+    expect(state.clientPromise).toBeUndefined(); expect(state.ownerLogin).toBeUndefined(); expect(state.login).toBeNull(); expect(state.earlyCompletions.size).toBe(0);
+  } finally { settle.mockRestore(); }
+});
+
+it('closes after failed old-ticket settlement without changing a newer owner operation', async () => {
+  const { service, client, notify } = await fixture();
+  const owner = new CodexAuthenticationOwner(client);
+  await service.startDeviceLogin();
+  const originalTicket = owner.snapshot()!, newer = owner.begin(true), before = owner.snapshot()!;
+  const failure = new Error('Synthetic owner read failure');
+  const settle = vi.spyOn(CodexAuthenticationOwner.prototype, 'complete').mockImplementation(operation => {
+    expect(operation).toEqual({ operationId: originalTicket.operationId, authGeneration: originalTicket.authGeneration });
+    throw failure;
+  });
+  try {
+    await expect(service.dispose()).rejects.toBe(failure);
+    expect(client.close).toHaveBeenCalledTimes(1);
+    notify('account/login/completed', { loginId: 'l1', success: true });
+    expect(owner.snapshot()).toEqual(before);
+  } finally { settle.mockRestore(); }
+  expect(owner.complete(newer, 'unknown')).toBe(true);
 });

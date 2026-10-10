@@ -7,7 +7,7 @@ import { guessServiceFromBaseUrl, resolveServicePreset, resolveServiceProviderFa
 import { isApiKeyOptionalForEndpoint } from "./llm-endpoint-auth.js";
 import { mergedLLMEnv, studioIgnoredEnv, type LLMEnvLayers, type LLMEnvMap } from "./llm-env.js";
 import type { LLMApiFormat } from "../llm/api-format.js";
-import { readCodexSettings } from "../codex/settings.js";
+import { readAgentSettings } from "../runtime/settings.js";
 
 export type LLMConsumer = "studio" | "cli" | "daemon" | "deploy";
 export type LLMConfigMode = "studio-project" | "cli-project" | "environment" | "codex";
@@ -143,7 +143,8 @@ async function resolveCodexProjectConfig(
   raw: Record<string, unknown>,
   input: ResolveEffectiveLLMConfigInput,
 ): Promise<EffectiveLLMConfigResult> {
-  const settings = await readCodexSettings(input.projectRoot);
+  const settings = await readAgentSettings(input.projectRoot);
+  if (settings.selectedHarnessId !== 'codex') throw Object.assign(new Error('The selected Pi harness is not connected to this execution path'), { code: 'RUNTIME_HARNESS_NOT_CONNECTED' });
   const legacy = objectValue(raw.llm);
   const config = ProjectConfigSchema.parse({
     ...raw,
@@ -153,7 +154,7 @@ async function resolveCodexProjectConfig(
     modelOverrides: undefined,
     llm: {
       service: "codex", provider: "openai", configSource: input.consumer === "studio" ? "studio" : "env",
-      model: settings.model ?? "codex-default", apiKey: "",
+      model: settings.harnessPreferences.codex.model ?? "codex-default", apiKey: "",
       // Required by the legacy LLMConfig shape, but no HTTP client is constructed
       // for this service and this reserved invalid endpoint is never contacted.
       baseUrl: "https://example.invalid/v1", apiFormat: "responses", stream: true,

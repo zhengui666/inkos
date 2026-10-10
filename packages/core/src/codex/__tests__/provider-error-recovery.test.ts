@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Type } from '@sinclair/typebox';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Agent } from '../agent.js';
@@ -17,11 +18,14 @@ import { SchedulerStore } from '../../pipeline/scheduler-store.js';
 import { runWorkerAgent, runWorkerAgentTool } from '../../agent/worker-agent.js';
 import { isCreationTransientFailure } from '../../creation/transient.js';
 import type { LLMClient } from '../../llm/provider.js';
+import { withCodexExecution } from '../../runtime/execution.js';
 
 const mocks = vi.hoisted(() => ({ create: vi.fn() }));
 vi.mock('../client.js', () => ({ createCodexClient: mocks.create }));
 
 class FailureClient {
+  closed = false;
+  readonly closes = new Set<() => void>();
   readonly cwd = '/offline-fixture';
   notifications = new Set<(method: string, params: unknown) => void>();
   run: () => void | Promise<void> = () => {};
@@ -41,8 +45,8 @@ class FailureClient {
   async tool() {
     return await this.handler!('item/tool/call', { threadId: 'thread', turnId: 'turn', callId: 'call', tool: 'submit', arguments: { value: 7 } });
   }
-  onClose() { return () => {}; }
-  close = vi.fn(async () => {});
+  onClose(fn: () => void) { this.closes.add(fn); return () => { this.closes.delete(fn); }; }
+  close = vi.fn(async () => { this.closed = true; for (const fn of this.closes) fn(); this.closes.clear(); });
   notify(method: string, params: object) {
     for (const listener of this.notifications) listener(method, { threadId: 'thread', turnId: 'turn', ...params });
   }
@@ -53,13 +57,38 @@ class FailureClient {
     else this.notify(source, { turn: { id: 'turn', status: 'failed', error } });
   }
 }
-const clientOptions: LLMClient = { provider: 'openai', apiFormat: 'chat', stream: false,
+let clientOptions: LLMClient = { provider: 'openai', apiFormat: 'chat', stream: false,
   defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
-  _codex: { projectRoot: '/offline-fixture', settings: { model: 'fixture', reasoningEffort: 'high', serviceTier: 'default' } } };
+  _codex: { projectRoot: '', settings: { model: 'fixture', reasoningEffort: 'high', serviceTier: 'default' } } };
 const resultTool = { name: 'submit', label: 'Submit', description: 'Offline result', parameters: Type.Object({ value: Type.Integer() }) };
 const run = () => runWorkerAgent(clientOptions, 'fixture', [{ role: 'user', content: 'Offline fixture only' }]);
-let client: FailureClient;
-beforeEach(() => { client = new FailureClient(); mocks.create.mockReset().mockResolvedValue(client); });
+let client: FailureClient, fixtureRoot: string;
+beforeEach(async () => {
+  fixtureRoot = await mkdtemp(join(tmpdir(), 'inkos-provider-recovery-'));
+  vi.stubEnv('INKOS_CODEX_HOME', ''); delete process.env.INKOS_CODEX_HOME;
+  vi.stubEnv('INKOS_CODEX_STATE_ROOT', ''); delete process.env.INKOS_CODEX_STATE_ROOT;
+  client = new FailureClient();
+  clientOptions = { ...clientOptions, _codex: { ...clientOptions._codex, projectRoot: fixtureRoot } };
+  mocks.create.mockReset().mockImplementation(async (projectRoot: string) => {
+    const codexHome = join(projectRoot, '.inkos', 'codex', 'home');
+    mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+    const legacyPath = join(projectRoot, '.inkos', 'codex-config.json');
+    try { writeFileSync(legacyPath, JSON.stringify({ model: 'fixture', reasoningEffort: 'high', serviceTier: 'default' }), { flag: 'wx' }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+    let used = false, closed = false;
+    const closes = new Set<() => void>();
+    return { cwd: client.cwd, codexHome, get closed() { return closed || used && client.closed; },
+      request: async (method: string, params?: unknown, options?: unknown) => {
+        if (method === 'thread/start') { used = true; client.closed = false; }
+        return Reflect.apply(client.request, client, [method, params, options]);
+      },
+      onNotification: client.onNotification.bind(client), onRequest: client.onRequest.bind(client),
+      onClose: (fn: () => void) => { closes.add(fn); client.closes.add(fn); return () => { closes.delete(fn); client.closes.delete(fn); }; },
+      close: async () => { closed = true; if (used) await client.close(); else for (const fn of closes) { client.closes.delete(fn); fn(); } },
+    };
+  });
+});
+afterEach(async () => { await rm(fixtureRoot, { recursive: true, force: true }); vi.unstubAllEnvs(); });
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
 for (const source of ['error', 'turn/completed'] as const) describe(`native provider recovery via ${source}`, () => {
@@ -152,7 +181,7 @@ it.each(['error', 'turn/completed'] as const)('does not retry uncertain peer cle
 });
 
 it('does not carry a prior native failure into the next successful Agent invocation', async () => {
-  const agent = new Agent({ projectRoot: '/offline-fixture', settings: clientOptions._codex!.settings,
+  const agent = new Agent({ projectRoot: fixtureRoot, settings: clientOptions._codex!.settings,
     initialState: { model: resolveCodexModel(), systemPrompt: '', messages: [], tools: [] } });
   client.run = () => client.terminal('rateLimitExceeded', 'turn/completed');
   await agent.prompt('First offline turn');
@@ -173,7 +202,9 @@ it.each(['rateLimitExceeded', 'usageLimitExceeded'])('preserves foundation polic
   let coordinator = new CreationTaskCoordinator(root, pipeline, scheduler, 1000);
   client.run = () => client.terminal(info);
   const generate = vi.spyOn(ArchitectAgent.prototype, 'generateFoundation').mockImplementation(async () => {
-    await run(); throw new Error('Unexpected native success');
+    await runWorkerAgent({ ...clientOptions, _codex: { ...clientOptions._codex, projectRoot: root } }, 'fixture',
+      [{ role: 'user', content: 'Offline fixture only' }]);
+    throw new Error('Unexpected native success');
   });
   try {
     const request = { id: '11111111-1111-4111-8111-111111111111', kind: 'short' as const, brief: 'Offline native recovery fixture.' };
@@ -265,7 +296,8 @@ it.each([null, 503, ['failed'], { status: 'failed', token: 'fixture-secret' }, '
   expect(JSON.stringify(failure)).not.toContain('fixture-secret');
 });
 
-it.each(['error', 'turn/completed'] as const)('preserves cleanup uncertainty over a worker deadline after %s', async source => {
+// Admit on real I/O before fake clocks exercise the original RPC/cleanup deadline assertions.
+it.each(['error', 'turn/completed'] as const)('preserves cleanup uncertainty over a worker deadline after %s', async source  => withCodexExecution(fixtureRoot, async () => {
   vi.useFakeTimers();
   client.run = () => client.terminal('serverOverloaded', source);
   client.close.mockImplementation(async () => {
@@ -278,10 +310,10 @@ it.each(['error', 'turn/completed'] as const)('preserves cleanup uncertainty ove
   expect(failure).toBeInstanceOf(AggregateError);
   expect(failure.cause).toMatchObject({ code: 'MODEL_UNAVAILABLE', providerFailure: { source } });
   expect(isCreationTransientFailure(failure)).toBe(false);
-});
+}, { settings: clientOptions._codex!.settings }));
 
 
-it.each(['error', 'turn/completed'] as const)('keeps accepted-tool uncertainty blocked when a deadline expires during %s cleanup', async source => {
+it.each(['error', 'turn/completed'] as const)('keeps accepted-tool uncertainty blocked when a deadline expires during %s cleanup', async source  => withCodexExecution(fixtureRoot, async () => {
   vi.useFakeTimers();
   const validate = vi.fn((value: { value: number }) => value);
   client.run = async () => { await client.tool(); client.terminal('rateLimitExceeded', source); };
@@ -293,16 +325,16 @@ it.each(['error', 'turn/completed'] as const)('keeps accepted-tool uncertainty b
   expect(validate).toHaveBeenCalledOnce();
   expect(failure).toMatchObject({ code: 'WORKER_MODEL_ERROR', hostToolCalls: 1, providerFailure: { source } });
   expect(isCreationTransientFailure(failure)).toBe(false);
-});
+}, { settings: clientOptions._codex!.settings }));
 
-it.each(['error', 'turn/completed'] as const)('does not downgrade an account failure to timeout during %s cleanup', async source => {
+it.each(['error', 'turn/completed'] as const)('does not downgrade an account failure to timeout during %s cleanup', async source  => withCodexExecution(fixtureRoot, async () => {
   vi.useFakeTimers();
   client.run = () => client.terminal('usageLimitExceeded', source);
   client.close.mockImplementation(async () => { await new Promise(resolve => setTimeout(resolve, 20)); });
   const pending = runWorkerAgent(clientOptions, 'fixture', [{ role: 'user', content: 'Offline' }], { timeoutMs: 10 }).catch(error => error);
   await vi.advanceTimersByTimeAsync(30);
   expect(await pending).toMatchObject({ code: 'WORKER_MODEL_ERROR', providerFailure: { source, codexErrorInfo: 'usageLimitExceeded' } });
-});
+}, { settings: clientOptions._codex!.settings }));
 
 
 for (const source of ['error', 'turn/completed'] as const) {
@@ -326,7 +358,7 @@ for (const source of ['error', 'turn/completed'] as const) {
   });
 }
 
-it.each([false, true])('does not downgrade retained failed completion during pending turn/start, prior tool=%s', async priorTool => {
+it.each([false, true])('does not downgrade retained failed completion during pending turn/start, prior tool=%s', async priorTool  => withCodexExecution(fixtureRoot, async () => {
   vi.useFakeTimers();
   const ordinaryRequest = client.request.getMockImplementation()!;
   const validate = vi.fn((value: { value: number }) => value);
@@ -346,10 +378,10 @@ it.each([false, true])('does not downgrade retained failed completion during pen
   if (priorTool) expect(validate).toHaveBeenCalledOnce();
   expect(failure).toMatchObject({ code: 'WORKER_MODEL_ERROR', providerFailure: { source: 'turn/completed' } });
   expect(isCreationTransientFailure(failure)).toBe(false);
-});
+}, { settings: clientOptions._codex!.settings }));
 
 
-it.each([false, true])('preserves a bound failed completion during pending turn/start, prior tool=%s', async priorTool => {
+it.each([false, true])('preserves a bound failed completion during pending turn/start, prior tool=%s', async priorTool  => withCodexExecution(fixtureRoot, async () => {
   vi.useFakeTimers();
   const ordinaryRequest = client.request.getMockImplementation()!;
   const validate = vi.fn((value: { value: number }) => value);
@@ -370,11 +402,11 @@ it.each([false, true])('preserves a bound failed completion during pending turn/
   if (priorTool) expect(validate).toHaveBeenCalledOnce();
   expect(failure).toMatchObject({ code: 'WORKER_MODEL_ERROR', providerFailure: { source: 'turn/completed' } });
   expect(isCreationTransientFailure(failure)).toBe(false);
-});
+}, { settings: clientOptions._codex!.settings }));
 
 
 for (const source of ['error', 'turn/completed'] as const) {
-  it.each([false, true])('does not cancel the correct pending start for an unrelated ' + source + ' notification, already bound=%s', async bound => {
+  it.each([false, true])('does not cancel the correct pending start for an unrelated ' + source + ' notification, already bound=%s', async bound  => withCodexExecution(fixtureRoot, async () => {
     vi.useFakeTimers();
     const ordinaryRequest = client.request.getMockImplementation()!;
     client.request.mockImplementation(async method => {
@@ -398,9 +430,9 @@ for (const source of ['error', 'turn/completed'] as const) {
     await vi.advanceTimersByTimeAsync(10);
     await expect(pending).resolves.toMatchObject({ content: 'Correct turn completed' });
     expect(client.request.mock.calls.filter(([method]) => method === 'turn/interrupt')).toHaveLength(0);
-  });
+  }, { settings: clientOptions._codex!.settings }));
 
-  it('binds an early ' + source + ' notification only after the matching start response', async () => {
+  it('binds an early ' + source + ' notification only after the matching start response', async ()  => withCodexExecution(fixtureRoot, async () => {
     vi.useFakeTimers();
     const ordinaryRequest = client.request.getMockImplementation()!;
     client.request.mockImplementation(async method => {
@@ -414,10 +446,10 @@ for (const source of ['error', 'turn/completed'] as const) {
     expect(client.request.mock.calls.filter(([method]) => method === 'turn/interrupt')).toHaveLength(0);
     await vi.advanceTimersByTimeAsync(10);
     expect(await pending).toMatchObject({ code: 'RATE_LIMITED', turnIdConfirmed: true, providerFailure: { source } });
-  });
+  }, { settings: clientOptions._codex!.settings }));
 }
 
-it('keeps an unbound failed terminal explicitly uncertain when the start RPC never identifies the turn', async () => {
+it('keeps an unbound failed terminal explicitly uncertain when the start RPC never identifies the turn', async ()  => withCodexExecution(fixtureRoot, async () => {
   vi.useFakeTimers();
   const ordinaryRequest = client.request.getMockImplementation()!;
   client.request.mockImplementation(async method => {
@@ -431,9 +463,9 @@ it('keeps an unbound failed terminal explicitly uncertain when the start RPC nev
   expect(await pending).toMatchObject({ code: 'WORKER_MODEL_ERROR', turnIdConfirmed: false,
     providerFailure: { source: 'turn/completed', turnStatus: 'failed', codexErrorInfo: 'rateLimitExceeded' } });
   expect(client.request.mock.calls.filter(([method]) => method === 'turn/interrupt')).toHaveLength(0);
-});
+}, { settings: clientOptions._codex!.settings }));
 
-it('preserves explicit caller cancellation during a pending start after a bound failed completion', async () => {
+it('preserves explicit caller cancellation during a pending start after a bound failed completion', async ()  => withCodexExecution(fixtureRoot, async () => {
   vi.useFakeTimers();
   const controller = new AbortController(), reason = Object.assign(new Error('User cancelled'), { code: 'USER_CANCELLED' });
   const ordinaryRequest = client.request.getMockImplementation()!;
@@ -451,9 +483,9 @@ it('preserves explicit caller cancellation during a pending start after a bound 
   await vi.advanceTimersByTimeAsync(30);
   expect(await pending).toBe(reason);
   expect(client.request.mock.calls.filter(([method]) => method === 'turn/start')).toHaveLength(1);
-});
+}, { settings: clientOptions._codex!.settings }));
 
-it.each([false, true])('retains native cause and cleanup uncertainty after pending start failure, bound=%s', async bound => {
+it.each([false, true])('retains native cause and cleanup uncertainty after pending start failure, bound=%s', async bound  => withCodexExecution(fixtureRoot, async () => {
   vi.useFakeTimers();
   const ordinaryRequest = client.request.getMockImplementation()!;
   const cleanup = Object.assign(new Error('Offline close failed'), { code: 'ECONNRESET' });
@@ -473,7 +505,7 @@ it.each([false, true])('retains native cause and cleanup uncertainty after pendi
     providerFailure: { source: 'turn/completed', codexErrorInfo: 'usageLimitExceeded' } });
   expect(failure.errors).toContain(cleanup);
   expect(isCreationTransientFailure(failure)).toBe(false);
-});
+}, { settings: clientOptions._codex!.settings }));
 
 it('blocks conflicting notification and start-response turn identities without claiming a retryable provider outcome', async () => {
   const ordinaryRequest = client.request.getMockImplementation()!;
@@ -492,7 +524,7 @@ it('blocks conflicting notification and start-response turn identities without c
 
 it('does not hide transcript persistence failure behind an earlier transient provider failure', async () => {
   const persistence = Object.assign(new Error('Offline transcript persistence failed'), { code: 'PERSISTENCE_FAILED' });
-  const agent = new Agent({ projectRoot: '/offline-fixture', settings: clientOptions._codex!.settings,
+  const agent = new Agent({ projectRoot: fixtureRoot, settings: clientOptions._codex!.settings,
     initialState: { model: resolveCodexModel(), systemPrompt: '', messages: [], tools: [] } });
   agent.subscribe(event => { if (event.type === 'message_end' && event.message.role === 'assistant') throw persistence; });
   client.run = () => client.terminal('rateLimitExceeded', 'turn/completed');
@@ -503,7 +535,7 @@ it('does not hide transcript persistence failure behind an earlier transient pro
   expect(isCreationTransientFailure(failure)).toBe(false);
 });
 
-it('does not downgrade a turn-identity conflict to a retryable deadline during close', async () => {
+it('does not downgrade a turn-identity conflict to a retryable deadline during close', async ()  => withCodexExecution(fixtureRoot, async () => {
   vi.useFakeTimers();
   const ordinaryRequest = client.request.getMockImplementation()!;
   client.request.mockImplementation(async method => {
@@ -519,10 +551,10 @@ it('does not downgrade a turn-identity conflict to a retryable deadline during c
   const failure = await pending;
   expect(failure).toMatchObject({ code: 'WORKER_MODEL_ERROR', cause: { code: 'RATE_LIMITED' } });
   expect(isCreationTransientFailure(failure)).toBe(false);
-});
+}, { settings: clientOptions._codex!.settings }));
 
 
-it('preserves an authoritative transient code rather than replacing it with a late start deadline', async () => {
+it('preserves an authoritative transient code rather than replacing it with a late start deadline', async ()  => withCodexExecution(fixtureRoot, async () => {
   vi.useFakeTimers();
   const ordinaryRequest = client.request.getMockImplementation()!;
   client.request.mockImplementation(async method => {
@@ -536,9 +568,9 @@ it('preserves an authoritative transient code rather than replacing it with a la
   await vi.advanceTimersByTimeAsync(30);
   expect(await pending).toMatchObject({ code: 'RATE_LIMITED', turnIdConfirmed: true,
     providerFailure: { source: 'turn/completed', codexErrorInfo: 'rateLimitExceeded' } });
-});
+}, { settings: clientOptions._codex!.settings }));
 
-it.each(['dynamic', 'outputSchema'])('preserves earlier %s validation uncertainty through a later pending start deadline', async transport => {
+it.each(['dynamic', 'outputSchema'])('preserves earlier %s validation uncertainty through a later pending start deadline', async transport  => withCodexExecution(fixtureRoot, async () => {
   vi.useFakeTimers();
   let turn = 0, retainedCandidates = 0;
   const ordinaryRequest = client.request.getMockImplementation()!;
@@ -569,13 +601,13 @@ it.each(['dynamic', 'outputSchema'])('preserves earlier %s validation uncertaint
   expect(retainedCandidates).toBe(1);
   expect(validate).toHaveBeenCalledOnce();
   expect(client.request.mock.calls.filter(([method]) => method === 'turn/start')).toHaveLength(2);
-});
+}, { settings: clientOptions._codex!.settings }));
 
 it('serializes the authoritative response identity check behind queued turn notifications', async () => {
   let release!: () => void, entered!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const started = new Promise<void>(resolve => { entered = resolve; });
-  const agent = new Agent({ projectRoot: '/offline-fixture', settings: clientOptions._codex!.settings,
+  const agent = new Agent({ projectRoot: fixtureRoot, settings: clientOptions._codex!.settings,
     initialState: { model: resolveCodexModel(), systemPrompt: '', messages: [], tools: [] } });
   agent.subscribe(event => {
     if (event.type === 'message_start' && event.message.role === 'assistant') { entered(); return gate; }
@@ -598,7 +630,7 @@ it('serializes the authoritative response identity check behind queued turn noti
 });
 
 
-it.each([false, true])('retains failure provenance when the pending start RPC resolves after the deadline, bound=%s', async bound => {
+it.each([false, true])('retains failure provenance when the pending start RPC resolves after the deadline, bound=%s', async bound  => withCodexExecution(fixtureRoot, async () => {
   vi.useFakeTimers();
   const ordinaryRequest = client.request.getMockImplementation()!;
   client.request.mockImplementation(async method => {
@@ -614,10 +646,10 @@ it.each([false, true])('retains failure provenance when the pending start RPC re
   expect(failure).toMatchObject({ code: 'WORKER_MODEL_ERROR', turnIdConfirmed: bound,
     providerFailure: { source: 'turn/completed', codexErrorInfo: 'usageLimitExceeded' } });
   expect(isCreationTransientFailure(failure)).toBe(false);
-});
+}, { settings: clientOptions._codex!.settings }));
 
 
-it('preserves a queued host failure that cancels pending start before a later worker deadline', async () => {
+it('preserves a queued host failure that cancels pending start before a later worker deadline', async ()  => withCodexExecution(fixtureRoot, async () => {
   vi.useFakeTimers();
   const persistence = Object.assign(new Error('Offline host subscriber failure'), { code: 'ECONNRESET' });
   const ordinaryRequest = client.request.getMockImplementation()!;
@@ -637,7 +669,7 @@ it('preserves a queued host failure that cancels pending start before a later wo
   expect(failure.cause).toBe(persistence);
   expect(failure.errors).toContainEqual(expect.objectContaining({ code: 'RATE_LIMITED' }));
   expect(isCreationTransientFailure(failure)).toBe(false);
-});
+}, { settings: clientOptions._codex!.settings }));
 
 it('does not replace a distinct un-aborted start RPC failure with a retryable completed-turn error', async () => {
   const rpcFailure = new Error('Offline independent start RPC failure');
@@ -656,7 +688,7 @@ it('does not replace a distinct un-aborted start RPC failure with a retryable co
   expect(isCreationTransientFailure(failure)).toBe(false);
 });
 
-it('rejects a contradictory successful start response after a bound terminal error already aborted', async () => {
+it('rejects a contradictory successful start response after a bound terminal error already aborted', async ()  => withCodexExecution(fixtureRoot, async () => {
   vi.useFakeTimers();
   const ordinaryRequest = client.request.getMockImplementation()!;
   client.request.mockImplementation(async method => {
@@ -671,7 +703,7 @@ it('rejects a contradictory successful start response after a bound terminal err
   const failure = await pending;
   expect(failure).toMatchObject({ code: 'WORKER_MODEL_ERROR' });
   expect(isCreationTransientFailure(failure)).toBe(false);
-});
+}, { settings: clientOptions._codex!.settings }));
 
 
 it('checks a contradictory response already resolved before the queued terminal error is observed', async () => {
@@ -688,7 +720,7 @@ it('checks a contradictory response already resolved before the queued terminal 
   expect(client.request.mock.calls.filter(([method]) => method === 'turn/interrupt')).toHaveLength(1);
 });
 
-it('preserves explicit caller cancellation despite an already-aborted terminal error and conflicting response', async () => {
+it('preserves explicit caller cancellation despite an already-aborted terminal error and conflicting response', async ()  => withCodexExecution(fixtureRoot, async () => {
   vi.useFakeTimers();
   const controller = new AbortController(), reason = Object.assign(new Error('User cancelled'), { code: 'USER_CANCELLED' });
   const ordinaryRequest = client.request.getMockImplementation()!;
@@ -706,10 +738,10 @@ it('preserves explicit caller cancellation despite an already-aborted terminal e
   await vi.advanceTimersByTimeAsync(30);
   expect(await pending).toBe(reason);
   expect(client.request.mock.calls.filter(([method]) => method === 'turn/interrupt')).toHaveLength(1);
-});
+}, { settings: clientOptions._codex!.settings }));
 
 it('coalesces interrupts for one turn and resets cancellation ownership for the next invocation', async () => {
-  const agent = new Agent({ projectRoot: '/offline-fixture', settings: clientOptions._codex!.settings,
+  const agent = new Agent({ projectRoot: fixtureRoot, settings: clientOptions._codex!.settings,
     initialState: { model: resolveCodexModel(), systemPrompt: '', messages: [], tools: [] } });
   client.run = () => client.terminal('usageLimitExceeded', 'error');
   for (let invocation = 1; invocation <= 2; invocation++) {

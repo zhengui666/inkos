@@ -1,4 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Type } from "@sinclair/typebox";
 import { Agent, encodeContext } from "../agent.js";
 import { resolveCodexModel } from "../model.js";
@@ -49,10 +52,17 @@ class FakeClient {
   }
 }
 
-let client: FakeClient;
-beforeEach(() => { client = new FakeClient(); mocks.create.mockReset().mockResolvedValue(client as unknown as CodexClient); });
+let client: FakeClient, projectRoot: string;
+beforeEach(async () => {
+  projectRoot = await mkdtemp(join(tmpdir(), "inkos-agent-bridge-"));
+  client = new FakeClient(); client.codexHome = join(projectRoot, ".inkos", "codex", "home");
+  await mkdir(client.codexHome, { recursive: true, mode: 0o700 });
+  await writeFile(join(projectRoot, ".inkos", "codex-config.json"), JSON.stringify({ model: "fixture", reasoningEffort: "medium", serviceTier: "default" }));
+  mocks.create.mockReset().mockImplementation(async () => { client.closed = false; return client as unknown as CodexClient; });
+});
+afterEach(async () => { await rm(projectRoot, { recursive: true, force: true }); });
 const make = (execute: (_id: string, args: { value: string }) => Promise<AgentToolResult> = vi.fn(async (_id: string, args: { value: string }) => ({ content: [{ type: "text" as const, text: args.value }], details: args }))) => new Agent({
-  projectRoot: "/project", initialState: { model: resolveCodexModel(), systemPrompt: "Host rules", messages: [],
+  projectRoot, initialState: { model: resolveCodexModel(), systemPrompt: "Host rules", messages: [],
     tools: [{ name: "submit", label: "Submit", description: "Submit", parameters: Type.Object({ value: Type.String() }), execute }] },
 });
 
@@ -60,7 +70,7 @@ describe("Codex Agent bridge", () => {
   it("sends a large initial payload intact and lets native compaction notifications complete", async () => {
     const payload = "原".repeat(119500);
     const rules = "Author-approved rules " + "规".repeat(2000);
-    const agent = new Agent({ projectRoot: "/project", initialState: { ...make().state, systemPrompt: rules } });
+    const agent = new Agent({ projectRoot, initialState: { ...make().state, systemPrompt: rules } });
     client.run = async () => {
       client.notify("item/started", { item: { id: "compact-1", type: "contextCompaction" } });
       client.notify("thread/tokenUsage/updated", { tokenUsage: { modelContextWindow: 258400,
@@ -94,7 +104,7 @@ describe("Codex Agent bridge", () => {
 
   it("bounds model silence after a failed tool without retrying the tool", async () => {
     const execute = vi.fn(async () => { throw new Error("fixture tool failure"); });
-    const agent = new Agent({ projectRoot: "/project", initialState: make(execute).state, idleTimeoutMs: 30 });
+    const agent = new Agent({ projectRoot, initialState: make(execute).state, idleTimeoutMs: 30 });
     client.run = async () => { await client.tool("one"); };
     await expect(agent.prompt("Go")).rejects.toMatchObject({ code: "AGENT_MODEL_STALLED", failedToolCalls: 1, lastEvent: "tool-response" });
     expect(execute).toHaveBeenCalledOnce();
@@ -106,14 +116,14 @@ describe("Codex Agent bridge", () => {
       await new Promise(resolve => setTimeout(resolve, 80));
       return { content: [{ type: "text" as const, text: "saved" }], details: {} };
     });
-    const agent = new Agent({ projectRoot: "/project", initialState: make(execute).state, idleTimeoutMs: 25 });
+    const agent = new Agent({ projectRoot, initialState: make(execute).state, idleTimeoutMs: 25 });
     client.run = async () => { await client.tool("one"); client.finish(); };
     await agent.prompt("Go");
     expect(execute).toHaveBeenCalledOnce();
   });
 
   it("refreshes the silence deadline for actual model activity", async () => {
-    const agent = new Agent({ projectRoot: "/project", initialState: make().state, idleTimeoutMs: 60 });
+    const agent = new Agent({ projectRoot, initialState: make().state, idleTimeoutMs: 60 });
     client.run = async () => {
       for (let i = 0; i < 5; i++) {
         await new Promise(resolve => setTimeout(resolve, 20));
@@ -130,7 +140,7 @@ describe("Codex Agent bridge", () => {
     let release!: () => void, started!: () => void;
     const startedWork = new Promise<void>(resolve => { started = resolve; });
     const heldWork = new Promise<void>(resolve => { release = resolve; });
-    const agent = new Agent({ projectRoot: "/project", signal: controller.signal,
+    const agent = new Agent({ projectRoot, signal: controller.signal,
       initialState: make(async () => { started(); await heldWork; return { content: [], details: {} }; }).state,
     });
     client.run = async () => { await client.tool("one").catch(() => {}); };
@@ -161,7 +171,7 @@ describe("Codex Agent bridge", () => {
   });
 
   it("interrupts oversized streamed answers instead of accepting an ignored output budget", async () => {
-    const agent = new Agent({ projectRoot: "/project", initialState: make().state, maxOutputTokens: 4 });
+    const agent = new Agent({ projectRoot, initialState: make().state, maxOutputTokens: 4 });
     client.run = async () => { client.text("x".repeat(100)); client.finish(); };
     await expect(agent.prompt("Go")).rejects.toMatchObject({ code: "MODEL_OUTPUT_LIMIT", stopReason: "length" });
     expect(client.closed).toBe(true);
@@ -169,7 +179,7 @@ describe("Codex Agent bridge", () => {
 
   it("rejects oversized generated arguments before any domain tool executes", async () => {
     const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "done" }], details: {} }));
-    const agent = new Agent({ projectRoot: "/project", initialState: make(execute).state, maxOutputTokens: 8 });
+    const agent = new Agent({ projectRoot, initialState: make(execute).state, maxOutputTokens: 8 });
     client.run = async () => { await client.tool("huge", { value: "x".repeat(100) }).catch(() => {}); };
     await expect(agent.prompt("Go")).rejects.toMatchObject({ code: "MODEL_OUTPUT_LIMIT" });
     expect(execute).not.toHaveBeenCalled();
@@ -203,7 +213,7 @@ describe("Codex Agent bridge", () => {
     let active = 0; let completed = false;
     const execute = vi.fn(async () => { expect(active++).toBe(0); await Promise.resolve(); active--; completed = true;
       return { content: [{ type: "text" as const, text: "done" }], details: {} }; });
-    const agent = new Agent({ projectRoot: "/project", initialState: make(execute).state, shouldStop: () => completed });
+    const agent = new Agent({ projectRoot, initialState: make(execute).state, shouldStop: () => completed });
     client.run = async () => { await Promise.all([client.tool("one"), client.tool("two")]); client.finish(); };
     await agent.prompt("Go");
     expect(execute).toHaveBeenCalledTimes(1);
@@ -232,7 +242,7 @@ describe("Codex Agent bridge", () => {
 
   it("signals and drains in-flight host work when the Codex peer exits", async () => {
     let settled = false;
-    const agent = new Agent({ projectRoot: "/project", initialState: { ...make().state, tools: [{
+    const agent = new Agent({ projectRoot, initialState: { ...make().state, tools: [{
       name: "submit", label: "Submit", description: "Submit", parameters: Type.Object({ value: Type.String() }),
       async execute(_id, _args, signal) {
         await new Promise<void>(resolve => signal!.addEventListener("abort", () => { settled = true; resolve(); }, { once: true }));
@@ -265,16 +275,16 @@ describe("Codex Agent bridge", () => {
   });
 
   it("rejects unsupported effort/speed without invoking the model", async () => {
-    const agent = new Agent({ projectRoot: "/project", initialState: make().state,
+    const agent = new Agent({ projectRoot, initialState: make().state,
       settings: { model: "fixture", reasoningEffort: "ultra", serviceTier: "fast" } });
-    await expect(agent.prompt("Go")).rejects.toMatchObject({ code: "CODEX_SETTINGS_UNSUPPORTED" });
+    await expect(agent.prompt("Go")).rejects.toMatchObject({ code: "RUNTIME_CAPABILITY_INVALID" });
     expect(client.request.mock.calls.some(([method]) => method === "turn/start")).toBe(false);
   });
 
   it("fails closed for malformed account replies instead of treating process connectivity as login", async () => {
     const original = client.request.getMockImplementation()!;
     client.request.mockImplementation(async (method, params) => method === "account/read" ? {} : original(method, params));
-    await expect(make().prompt("Go")).rejects.toMatchObject({ code: "CODEX_AUTH_REQUIRED" });
+    await expect(make().prompt("Go")).rejects.toMatchObject({ code: "RUNTIME_AUTH_REVOKED" });
     expect(client.request.mock.calls.some(([method]) => method === "thread/start")).toBe(false);
     expect(client.closed).toBe(true);
   });

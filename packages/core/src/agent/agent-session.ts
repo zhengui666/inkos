@@ -3,7 +3,9 @@ import { join } from "node:path";
 import { Agent } from "../codex/agent.js";
 import { finalizeAgentRequest } from "./request-lifecycle.js";
 import { withAgentRequestDeadline } from "./execution-deadline.js";
-import { readCodexSettings } from "../codex/settings.js";
+import { guardCodexExecution, withCodexExecution } from "../runtime/execution.js";
+import { currentCodexRun, runWithCodexContext } from "../runtime/run-context.js";
+import { appendRunSelection, type RunHistoryBinding } from "../runtime/run-history.js";
 import { resolveCodexModel } from "../codex/model.js";
 import { preserveToolArgumentTypes } from "./tool-arguments.js";
 import { createTurnCompletionTool, TurnArtifactDeliveries, TURN_COMPLETION_GUIDANCE, TURN_COMPLETION_TOOL, TurnCompletionSchema, parseTurnCompletion, type TurnCompletion } from "./turn-completion.js";
@@ -723,7 +725,7 @@ export async function runAgentSession(
   config: AgentSessionConfig,
   userMessage: string,
 ): Promise<AgentSessionResult> {
-  return runInAgentSessionQueue(config.projectRoot, config.sessionId, () => withAgentRequestDeadline(config.signal, async signal => {
+  return runInAgentSessionQueue(config.projectRoot, config.sessionId, () => withAgentRequestDeadline(config.signal, signal => withCodexExecution(config.projectRoot, async () => {
     let currentConfig = { ...config, signal };
     const visited = new Set<string>();
     let result = await runAgentSessionUnlocked(currentConfig, userMessage);
@@ -749,7 +751,7 @@ export async function runAgentSession(
       result = await runAgentSessionUnlocked(currentConfig, userMessage);
     }
     return result;
-  }));
+  }, { signal, model: config.codexModel })));
 }
 
 interface AgentWorkTransition {
@@ -798,9 +800,9 @@ async function runAgentSessionUnlocked(
     requestedSkills: config.requestedSkills,
     disabledSkills: config.disabledSkills,
   });
-  const codexSettings = { ...await readCodexSettings(projectRoot), ...(config.codexModel ? { model: config.codexModel } : {}) };
-  const model = resolveCodexModel(codexSettings);
-  const requestedModelIdentity = JSON.stringify(codexSettings);
+  const runtime = currentCodexRun()!;
+  const model = resolveCodexModel({ model: runtime.selection.modelId });
+  const requestedModelIdentity = JSON.stringify(runtime.selection);
   const allowSystemFileRead = config.allowSystemFileRead ?? envFlagEnabled(process.env.INKOS_AGENT_ALLOW_SYSTEM_READ, false);
   const suppressProductionTools = config.suppressProductionTools ?? false;
   const profiles = createBuiltInWorkProfileRegistry(projectRoot);
@@ -1036,7 +1038,6 @@ async function runAgentSessionUnlocked(
       : "";
     const agent = new Agent({
       projectRoot,
-      settings: codexSettings,
       maxOutputTokens: agentOutputBudget(model),
       outputSchema: JSON.parse(JSON.stringify(TurnCompletionSchema)),
       beforeToolCall: preserveToolArgumentTypes,
@@ -1287,10 +1288,16 @@ async function runAgentSessionUnlocked(
     cached.episodeStore.append({episodeId: episodeHandle.episode.id, workId: episodeHandle.episode.workId,
       type: "trajectory-started", payload: {conversationId}});
 
+    const history: RunHistoryBinding = Object.freeze({ store: cached.episodeStore, episodeId: episodeHandle.episode.id,
+      sessionId, coreRequestId: requestId });
+    appendRunSelection(history, { schemaVersion: 1, kind: "selection", sessionId, coreRequestId: requestId,
+      saved: { ...runtime.saved, harnessId: runtime.selection.harnessId, revision: runtime.selection.configRevision },
+      selection: runtime.selection });
+
     // ----- Execute the turn -----
     config.signal?.addEventListener("abort", abortContainingWorkflow, { once: true });
     config.signal?.throwIfAborted();
-    await withExecutionEvidence((type, payload) => cached!.harnessRuntime.episodes.append({
+    await runWithCodexContext({ ...runtime, history }, () => withExecutionEvidence((type, payload) => cached!.harnessRuntime.episodes.append({
       episodeId: episodeHandle.episode.id, workId: episodeHandle.episode.workId, type, payload,
     }), () => runWithAgentTrajectory({
       conversationId,
@@ -1316,9 +1323,11 @@ async function runAgentSessionUnlocked(
           if (!completionTool) throw new Error("The host completion validator is unavailable.");
           // Run the identical domain validator, without inventing a model tool
           // call or replaying any production action from the final response.
+          await guardCodexExecution(config.signal);
           await completionTool.execute("native-completion", parameters, config.signal);
           config.signal?.throwIfAborted();
         } catch (error) {
+          if ((error as { code?: string }).code === "RUNTIME_AUTH_REVOKED") throw error;
           config.signal?.throwIfAborted();
           completionError = error instanceof Error ? error : new Error(String(error));
           recordExecutionEvidence("turn-completion-rejected", { code: completionError.code ?? "TURN_COMPLETION_INVALID" });
@@ -1351,7 +1360,7 @@ async function runAgentSessionUnlocked(
         agent.state.messages.push(receipt);
         await persistAgentEvent({ type: "message_end", message: receipt });
       }
-    }));
+    })));
 
     config.signal?.throwIfAborted();
     finalAssistant = lastAssistantMessage(agent.state.messages);

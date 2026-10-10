@@ -24,15 +24,25 @@ const legacyConfig = () => Object.entries(CODEX_ISOLATED_CONFIG)
   .map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join('\n') + '\nmcp_servers = {}\nplugins = {}\n';
 // A stdio protocol peer with no filesystem or network calls in its implementation.
 const peer = `
-const rl = require('node:readline').createInterface({input: process.stdin});
-rl.on('line', line => {
-  const message = JSON.parse(line);
-  if (!('id' in message)) return;
-  const result = message.method === 'account/read'
-    ? {account: {type:'chatgpt', email: null, planType:'fixture'}, requiresOpenaiAuth:true}
-    : message.method === 'probe' ? {argv:process.argv.slice(1), home:process.env.CODEX_HOME} : {};
-  process.stdout.write(JSON.stringify({id:message.id, result}) + '\\n');
-});`;
+const { readSync, writeSync } = require('node:fs');
+const buffer = Buffer.alloc(65536);
+let pending = '';
+for (;;) {
+  const count = readSync(0, buffer, 0, buffer.length, null);
+  if (!count) break;
+  pending += buffer.subarray(0, count).toString();
+  let newline;
+  while ((newline = pending.indexOf('\\n')) >= 0) {
+    const message = JSON.parse(pending.slice(0, newline));
+    pending = pending.slice(newline + 1);
+    if (!('id' in message)) continue;
+    const result = message.method === 'account/read'
+      ? {account: {type:'chatgpt', email: null, planType:'fixture'}, requiresOpenaiAuth:true}
+      : message.method === 'probe' ? {argv:process.argv.slice(1), home:process.env.CODEX_HOME} : {};
+    writeSync(1, JSON.stringify({id:message.id, result}) + '\\n');
+  }
+}
+`;
 async function fixture(config: string | null = legacyConfig()) {
   const root = await fs.mkdtemp(join(tmpdir(), 'inkos-startup-test-')); roots.push(root);
   const projectRoot = join(root, 'project');
@@ -41,7 +51,7 @@ async function fixture(config: string | null = legacyConfig()) {
   await fs.mkdir(codexHome, { recursive: true, mode: 0o700 });
   if (config !== null) await fs.writeFile(join(codexHome, 'config.toml'), config, { mode: 0o600 });
   await fs.writeFile(join(codexHome, 'auth.json'), 'fixture sentinel, not credentials', { mode: 0o600 });
-  const options = { stateRoot, codexHome, command: process.execPath, args: ['-e', peer, '--'], requestTimeoutMs: 2000 };
+  const options = { stateRoot, codexHome, command: process.execPath, args: ['--input-type=commonjs', '-e', peer, '--'], requestTimeoutMs: 2000 };
   return { root, projectRoot, stateRoot, codexHome, options };
 }
 function assertNoStateMutation(stateRoot: string) {
@@ -58,8 +68,11 @@ async function snapshot(path: string) {
 }
 
 describe('Codex startup config is process-local', () => {
-  it('pins the requested model, reasoning and fast startup defaults without provider overrides', () => {
-    expect(CODEX_ISOLATED_CONFIG).toMatchObject({ model: 'gpt-6.1-sol', model_reasoning_effort: 'ultra', service_tier: 'fast' });
+  it('leaves native model, effort and speed defaults while retaining isolation', () => {
+    expect(CODEX_ISOLATED_CONFIG).not.toHaveProperty('model');
+    expect(CODEX_ISOLATED_CONFIG).not.toHaveProperty('model_reasoning_effort');
+    expect(CODEX_ISOLATED_CONFIG).not.toHaveProperty('service_tier');
+    expect(CODEX_ISOLATED_CONFIG).toMatchObject({ 'features.shell_tool': false, web_search: 'disabled' });
     expect(CODEX_ISOLATED_CONFIG).not.toHaveProperty('model_provider');
   });
   it('uses plain project-local homes and gives explicit recorded homes priority', () => {
