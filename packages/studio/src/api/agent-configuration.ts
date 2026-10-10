@@ -1,10 +1,10 @@
 import { Hono } from "hono";
 import { randomUUID } from "node:crypto";
 import {
-  AgentSettingsConflictError, AgentSettingsPatchSchema, RuntimeCapabilityError,
+  AgentSettingsConflictError, AgentSettingsPatchSchema, CodexAuthenticationOwner, RuntimeCapabilityError,
   RuntimeAuthenticationError, observeCodexRuntime, bindCodexModelConnection,
   parseHarnessCapabilityCatalog, readAgentSettings, updateAgentSettings,
-  type HarnessCapabilityCatalog, type HarnessId, type CodexAccountService, type CodexDeviceLogin,
+  type HarnessCapabilityCatalog, type HarnessId, type CodexAccountService, type CodexDeviceLogin, type CodexConnectionRecord,
 } from "@actalk/inkos-core";
 import { ApiError } from "./errors.js";
 import { catalogMatchesState, unavailableHarnessState, validScope, type HarnessState, type SettingsUpdate,
@@ -31,6 +31,10 @@ function publicLogin(login: StudioCodexLogin | null): StudioCodexLogin | null {
       ? { verificationUrl: login.verificationUrl, userCode: login.userCode } : {}),
     ...(login.status === "failed" ? { error: LOGIN_FAILURE } : {}) };
 }
+function ownerStamp(record: Pick<CodexConnectionRecord, "authContextRef" | "connectionRef" | "authGeneration" | "localState" | "operationId"> | null | undefined): string {
+  // Compare only the existing durable owner version, never credential or identity evidence.
+  return JSON.stringify(record ? [record.authContextRef, record.connectionRef, record.authGeneration, record.localState, record.operationId] : null);
+}
 
 /** Borrow the service's peer; the account service alone manages its lifecycle. */
 export function createAgentConfigurationDependencies(projectRoot: string, accountService: CodexAccountService): AgentConfigurationRouteDependencies {
@@ -40,10 +44,31 @@ export function createAgentConfigurationDependencies(projectRoot: string, accoun
     observeHarness: async (id, signal) => {
       if (id === "pi") return unavailableHarnessState(id);
       signal?.throwIfAborted();
+      const initialClient = await accountService.getRuntimeClient();
+      const initialStamp = ownerStamp(new CodexAuthenticationOwner(initialClient).snapshot());
       const status = await accountService.readAccount();
       signal?.throwIfAborted();
       const client = await accountService.getRuntimeClient();
+      if (client !== initialClient || initialClient.closed) return unavailableHarnessState(id);
       const observation = await observeCodexRuntime(client, signal);
+      const owner = new CodexAuthenticationOwner(client);
+      const probeStamp = ownerStamp(owner.snapshot());
+      // Login ID/status/code can all be reused. Fence the entire composite read
+      // by the durable owner version captured before its first account read.
+      if (initialStamp !== probeStamp) return unavailableHarnessState(id);
+      // A cold ready probe has no durable owner yet; null must also match null.
+      if (observation.account && ownerStamp(observation.owner) !== probeStamp) return unavailableHarnessState(id);
+      const confirmed = await accountService.readAccount();
+      signal?.throwIfAborted();
+      // Core fences each individual probe. This extra account read also confirms
+      // the earlier service login without claiming that its provider ID identifies
+      // an owner generation. A change after the probe invalidates the whole envelope.
+      if (client.closed || probeStamp !== ownerStamp(owner.snapshot())) return unavailableHarnessState(id);
+      const accountUnchanged = status.connected === confirmed.connected && JSON.stringify(status.account) === JSON.stringify(confirmed.account);
+      if (observation.account && (!accountUnchanged || !confirmed.connected || confirmed.account?.type !== "chatgpt")) return unavailableHarnessState(id);
+      // The probe redacts identity, but its visible plan must still corroborate
+      // the service account. Match Core's existing absent-plan normalization.
+      if (observation.account && (observation.account.planType || "unknown") !== confirmed.account?.planType) return unavailableHarnessState(id);
       // A fresh probe tag binds these catalogue values to this observation only.
       const scope = { harnessId: id, authContextRef: observation.authContextRef, ownerGeneration: observation.owner?.authGeneration ?? null,
         adapterVersion: observation.descriptor?.adapterVersion ?? "unobserved", catalogVersion: `probe-${randomUUID()}` };
@@ -51,11 +76,13 @@ export function createAgentConfigurationDependencies(projectRoot: string, accoun
       const ownership = observation.catalogOwnership;
       const matched = catalog && ownership && ownership.authContextRef === scope.authContextRef
         && ownership.authGeneration === scope.ownerGeneration && ownership.adapterVersion === scope.adapterVersion;
-      const login = publicLogin(status.login);
+      const oldLogin = publicLogin(status.login), currentLogin = publicLogin(confirmed.login);
+      const loginUnchanged = JSON.stringify(oldLogin) === JSON.stringify(currentLogin);
+      const login = loginUnchanged ? currentLogin : null;
       // These reasons follow two matching live ChatGPT reads; only owner admission remains blocked.
-      const connected = !!observation.account || (status.connected && status.account?.type === "chatgpt"
+      const connected = !!observation.account || (accountUnchanged && confirmed.connected && confirmed.account?.type === "chatgpt"
         && observation.readyReasons.some(reason => reason === "owner-disconnected" || reason === "owner-unknown"));
-      const phase = observation.account ? "signed-in" : login?.status === "pending" ? "signing-in" : connected ? "signed-in"
+      const phase = observation.account ? "signed-in" : !loginUnchanged ? "uncertain" : login?.status === "pending" ? "signing-in" : connected ? "signed-in"
         : login?.status === "failed" ? "failed" : status.connected ? "uncertain" : "signed-out";
       return { harnessId: id, availability: "available", scope, installation: client.closed ? "unknown" : "installed",
         account: connected ? { type: "chatgpt", ...(observation.account?.planType ? { label: `ChatGPT · ${observation.account.planType}` } : {}) } : null,

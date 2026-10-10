@@ -4,9 +4,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createCodexAccountService, readAgentSettings, type CodexClient, type CodexAccountService } from "@actalk/inkos-core";
-import type { DeviceLoginAttemptService } from "../api/agent-configuration";
-import type { DeviceLoginAttemptCloseResult } from "../shared/agent-configuration";
+import { CodexAuthenticationOwner, createCodexAccountService, readAgentSettings, type CodexClient } from "@actalk/inkos-core";
 import { createStudioServer, shutdownStudioServer } from "../api/server";
 import { createAgentConfigurationController, createAgentConfigurationTransport } from "../hooks/agent-configuration-controller";
 import { AgentSettings } from "./AgentSettings";
@@ -14,8 +12,8 @@ import { ProjectSettings } from "./ProjectSettings";
 import type { TFunction } from "../hooks/use-i18n";
 
 // Replace only the React subscription boundary. Every intent uses the real controller,
-// HTTP transport, mounted production routes and filesystem CAS. Attempt settlement
-// is an explicit approved-contract fixture until the new Core implementation is imported.
+// HTTP transport, mounted production routes, real Core attempts/SQLite owner and filesystem CAS.
+// The synthetic protocol peer proves no OAuth, native process or model execution.
 const holder = vi.hoisted(() => ({ controller: null as ReturnType<typeof createAgentConfigurationController> | null }));
 vi.mock("../hooks/use-agent-configuration", () => ({ useAgentConfiguration: () => {
   const controller = holder.controller!;
@@ -26,20 +24,29 @@ vi.mock("../hooks/use-agent-configuration", () => ({ useAgentConfiguration: () =
 class UiPeer implements CodexClient {
   readonly codexHome: string;
   closed = false;
+  closeCount = 0;
   authenticated = false;
+  cancelResponse: unknown = { status: "canceled" };
   readonly calls: string[] = [];
+  readonly rpc: Array<{ method: string; params: unknown }> = [];
+  private lastLoginId = "";
+  private nextLogin = 0;
   private readonly notifications = new Set<(method: string, params: unknown) => void>();
+  private readonly closes = new Set<() => void>();
   constructor(readonly cwd: string) { this.codexHome = join(cwd, ".inkos", "codex", "home"); }
-  async request<T>(method: string, _params?: unknown, options?: { signal?: AbortSignal }): Promise<T> {
-    options?.signal?.throwIfAborted(); this.calls.push(method);
+  async request<T>(method: string, params: unknown = {}, options?: { signal?: AbortSignal }): Promise<T> {
+    options?.signal?.throwIfAborted(); this.calls.push(method); this.rpc.push({ method, params });
+    if (this.closed) throw new Error("synthetic-private-RPC-error");
     let result: unknown;
     switch (method) {
       case "account/read": result = { account: this.authenticated ? { type: "chatgpt", email: "hidden@example.test", planType: "fixture" } : null, requiresOpenaiAuth: true }; break;
       case "model/list": result = { data: ["fixture-default", "fixture-other"].map((model, index) => ({ id: model, model, isDefault: index === 0,
         defaultReasoningEffort: "high", defaultServiceTier: "default", supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "high" }], serviceTiers: [{ id: "fast" }] })), nextCursor: null }; break;
       case "config/read": result = { config: {} }; break;
-      case "account/login/start": result = { type: "chatgptDeviceCode", loginId: "ui-attempt", verificationUrl: "https://auth.openai.com/codex/device", userCode: "UI-CODE" }; break;
-      case "account/login/cancel": result = {}; break;
+      case "account/login/start":
+        this.lastLoginId = ++this.nextLogin === 1 ? "ui-attempt" : `ui-attempt-${this.nextLogin}`;
+        result = { type: "chatgptDeviceCode", loginId: this.lastLoginId, verificationUrl: "https://auth.openai.com/codex/device", userCode: "UI-CODE" }; break;
+      case "account/login/cancel": result = this.cancelResponse; break;
       case "account/logout": this.authenticated = false; result = {}; break;
       default: throw new Error(`Unexpected fixture method ${method}`);
     }
@@ -47,48 +54,13 @@ class UiPeer implements CodexClient {
   }
   onNotification(listener: (method: string, params: unknown) => void) { this.notifications.add(listener); return () => { this.notifications.delete(listener); }; }
   onRequest() { return () => {}; }
-  onClose() { return () => {}; }
-  async close() { this.closed = true; }
-  complete() { this.authenticated = true; for (const listener of this.notifications) listener("account/login/completed", { loginId: "ui-attempt", success: true }); }
-}
-
-/** Offline contract injection only. New Core attempt management must be re-tested after its import. */
-function installAttemptContractFixture(service: CodexAccountService) {
-  const start = service.startDeviceLogin.bind(service), cancel = service.cancelLogin.bind(service);
-  const attempts = new Map<string, { expiresAt: number; closed: boolean; loginId?: string;
-    pending?: ReturnType<typeof start>; cleanup?: Promise<void> }>();
-  let nextHandle = 0;
-  const fixture: DeviceLoginAttemptService = {
-    reserveDeviceLoginAttempt() {
-      const attemptHandle = `fixture-attempt-${++nextHandle}`, expiresAt = Date.now() + 60_000;
-      attempts.set(attemptHandle, { expiresAt, closed: false });
-      return { attemptHandle, expiresAt };
-    },
-    startDeviceLogin({ attemptHandle }) {
-      const attempt = attempts.get(attemptHandle);
-      if (!attempt || attempt.closed || attempt.expiresAt <= Date.now()) return Promise.reject(new Error("The fixture attempt is no longer startable"));
-      attempt.pending ??= start().then(async login => {
-        attempt.loginId = login.loginId;
-        if (attempt.closed) { attempt.cleanup ??= cancel(login.loginId); await attempt.cleanup; }
-        return login;
-      });
-      return attempt.pending;
-    },
-    async closeDeviceLoginAttempt(attemptHandle): Promise<DeviceLoginAttemptCloseResult> {
-      const attempt = attempts.get(attemptHandle);
-      if (!attempt || attempt.expiresAt <= Date.now()) return { attemptHandle, state: "unknown-or-expired", cleanup: "not-applicable" };
-      const repeated = attempt.closed; attempt.closed = true;
-      if (!attempt.pending) return { attemptHandle, state: repeated ? "already-terminal" : "closed", cleanup: "not-started" };
-      if (!attempt.loginId) {
-        // Fence immediately; the pending fixture start performs its exact-ID cleanup when it resolves.
-        return { attemptHandle, state: repeated ? "already-terminal" : "closed", cleanup: "unconfirmed" };
-      }
-      attempt.cleanup ??= cancel(attempt.loginId);
-      try { await attempt.cleanup; return { attemptHandle, state: repeated ? "already-terminal" : "closed", cleanup: "cancel-acknowledged" }; }
-      catch { return { attemptHandle, state: "closed", cleanup: "unconfirmed" }; }
-    },
-  };
-  Object.assign(service, fixture); // Same injected service object; production code never supplies this shim.
+  onClose(listener: () => void) { this.closes.add(listener); return () => { this.closes.delete(listener); }; }
+  disconnect() { if (!this.closed) { this.closed = true; for (const listener of this.closes) listener(); } }
+  async close() { this.closeCount++; this.disconnect(); }
+  complete(success = true) {
+    if (success) this.authenticated = true;
+    for (const listener of this.notifications) listener("account/login/completed", { loginId: this.lastLoginId, success });
+  }
 }
 
 type Element = ReactElement<Record<string, unknown>>;
@@ -122,7 +94,7 @@ function choose(label: string, value: string) {
   (control!.props.onChange as (event: { target: { value: string } }) => void)({ target: { value } });
 }
 
-describe("native UI → API → Core observations/CAS and approved attempt-contract fixture (offline)", () => {
+describe("native UI → production API → real Core attempts/SQLite owner/CAS with offline protocol peer", () => {
   let root: string;
   let peer: UiPeer;
   let app: ReturnType<typeof createStudioServer>;
@@ -133,9 +105,8 @@ describe("native UI → API → Core observations/CAS and approved attempt-contr
     vi.stubEnv("INKOS_CODEX_HOME", ""); delete process.env.INKOS_CODEX_HOME;
     vi.stubEnv("INKOS_CODEX_STATE_ROOT", ""); delete process.env.INKOS_CODEX_STATE_ROOT;
     root = await mkdtemp(join(tmpdir(), "inkos-native-ui-")); await mkdir(join(root, ".inkos", "codex", "home"), { recursive: true, mode: 0o700 });
-    peer = new UiPeer(root); factory = vi.fn(async (): Promise<CodexClient> => peer);
+    peer = new UiPeer(root); factory = vi.fn(async (): Promise<CodexClient> => { if (peer.closed) peer = new UiPeer(root); return peer; });
     const service = createCodexAccountService({ projectDir: root, clientFactory: factory });
-    installAttemptContractFixture(service);
     app = createStudioServer({} as never, root, { codexAccountService: service });
     const fetchImpl: typeof fetch = async (input, init) => {
       const request = new Request(new URL(String(input), "http://localhost"), init);
@@ -146,6 +117,7 @@ describe("native UI → API → Core observations/CAS and approved attempt-contr
   });
   afterEach(async () => { controller.dispose(); holder.controller = null; await shutdownStudioServer(app); await rm(root, { recursive: true, force: true }); vi.unstubAllEnvs(); });
   const settled = () => vi.waitFor(() => expect(controller.getSnapshot().authBusy).toBeNull());
+  const owner = () => new CodexAuthenticationOwner(peer);
   async function signIn() {
     click("Sign in with ChatGPT"); await settled();
     expect(renderToStaticMarkup(tree())).toContain("UI-CODE");
@@ -193,12 +165,61 @@ describe("native UI → API → Core observations/CAS and approved attempt-contr
   });
 
   it("dispatches explicit Close and logout through native buttons, preserving unverified execution", async () => {
-    click("Sign in with ChatGPT"); await settled(); click("Close and cancel sign-in"); await settled();
+    click("Sign in with ChatGPT"); await settled(); const pending = owner().snapshot()!;
+    click("Close and cancel sign-in"); await settled();
     expect(peer.calls.filter(method => method === "account/login/cancel")).toHaveLength(1);
+    expect(peer.rpc.filter(call => call.method === "account/login/cancel")).toEqual([{ method: "account/login/cancel", params: { loginId: "ui-attempt" } }]);
     expect(controller.getSnapshot().state?.connection?.login?.status).toBe("cancelled");
+    expect(controller.getSnapshot().authCloseResult).toMatchObject({ state: "closed", cleanup: "cancel-acknowledged" });
+    expect(owner().snapshot()).toMatchObject({ localState: "unknown", operationId: null, authGeneration: pending.authGeneration });
     await signIn(); click("Sign out of ChatGPT"); await settled();
     expect(peer.calls.filter(method => method === "account/logout")).toHaveLength(1);
+    expect(peer.calls.filter(method => method === "account/login/start")).toHaveLength(2); expect(peer.closeCount).toBe(0); expect(factory).toHaveBeenCalledTimes(1);
+    expect(owner().snapshot()?.localState).toBe("disconnected");
     expect(controller.getSnapshot().state?.account).toBeNull(); expect(controller.getSnapshot().state?.execution).toBeNull();
     expect(renderToStaticMarkup(tree())).toContain('role="status"'); expect(renderToStaticMarkup(tree())).toContain('aria-live="polite"');
+  });
+
+  it("renders native completion failure without readiness and starts a fresh attempt through the actual Connect button", async () => {
+    click("Sign in with ChatGPT"); await settled(); const pending = owner().snapshot()!;
+    peer.complete(false);
+    await vi.waitFor(async () => {
+      await controller.refreshState(); expect(controller.getSnapshot().state?.connection?.login?.status).toBe("failed");
+    });
+    const failed = owner().snapshot()!;
+    expect(failed).toMatchObject({ localState: "unknown", operationId: null, authGeneration: pending.authGeneration });
+    expect(controller.getSnapshot().state).toMatchObject({ account: null, catalog: null, execution: null });
+    expect(renderToStaticMarkup(tree())).toContain('role="alert"'); expect(button("Sign in with ChatGPT").props.disabled).toBeFalsy();
+    click("Sign in with ChatGPT"); await settled();
+    expect(controller.getSnapshot().state?.connection?.login).toMatchObject({ loginId: "ui-attempt-2", status: "pending" });
+    expect(owner().snapshot()).toMatchObject({ localState: "transitioning", authGeneration: failed.authGeneration + 1 });
+    expect(peer.calls.filter(method => method === "account/login/start")).toHaveLength(2);
+    expect(peer.calls).not.toContain("account/login/cancel"); expect(peer.calls).not.toContain("account/logout"); expect(peer.closeCount).toBe(0);
+    expect((await readAgentSettings(root)).modelConnectionRef).toBeNull(); expect(factory).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders unconfirmed Close, reuses its cached receipt and unlocks native Connect only after original-peer retirement", async () => {
+    peer.cancelResponse = {}; const oldPeer = peer;
+    click("Sign in with ChatGPT"); await settled(); click("Close and cancel sign-in"); await settled();
+    const receipt = controller.getSnapshot().authCloseResult, fenced = owner().snapshot()!;
+    expect(receipt).toMatchObject({ state: "closed", cleanup: "unconfirmed" });
+    expect(fenced.localState).toBe("unknown"); expect(renderToStaticMarkup(tree())).toContain("provider cleanup is unconfirmed");
+    click("Check this Close again"); await settled();
+    expect(controller.getSnapshot().authCloseResult).toEqual(receipt); expect(owner().snapshot()).toEqual(fenced);
+    expect(peer.rpc.filter(call => call.method === "account/login/cancel")).toEqual([{ method: "account/login/cancel", params: { loginId: "ui-attempt" } }]);
+    click("Sign in with ChatGPT"); await settled();
+    expect(peer.calls.filter(method => method === "account/login/start")).toHaveLength(1); expect(owner().snapshot()).toEqual(fenced);
+    expect(renderToStaticMarkup(tree())).toContain("Authentication outcome is uncertain");
+    oldPeer.disconnect(); await vi.waitFor(() => expect(oldPeer.closeCount).toBe(1));
+    click("Refresh settings and observations"); await vi.waitFor(() => expect(controller.getSnapshot().loading).toBe(false));
+    expect(peer).not.toBe(oldPeer); expect(owner().snapshot()).toEqual(fenced); expect(factory).toHaveBeenCalledTimes(2);
+    const oldCalls = [...oldPeer.rpc];
+    click("Sign in with ChatGPT"); await settled();
+    expect(controller.getSnapshot().state?.connection?.login?.status).toBe("pending");
+    expect(peer.calls.filter(method => method === "account/login/start")).toHaveLength(1);
+    const current = owner().snapshot()!; oldPeer.complete();
+    expect(owner().snapshot()).toEqual(current); expect(oldPeer.rpc).toEqual(oldCalls); expect(oldPeer.closeCount).toBe(1);
+    expect(peer.calls).not.toContain("account/login/cancel"); expect(peer.calls).not.toContain("account/logout");
+    expect((await readAgentSettings(root)).modelConnectionRef).toBeNull(); expect(controller.getSnapshot().state?.execution).toBeNull();
   });
 });

@@ -8,8 +8,6 @@ import {
   type CodexClient, type CodexAccountService,
 } from "@actalk/inkos-core";
 import { createStudioServer, shutdownStudioServer } from "./server.js";
-import type { DeviceLoginAttemptService } from "./agent-configuration.js";
-import type { DeviceLoginAttemptCloseResult } from "../shared/agent-configuration";
 import { createAgentConfigurationController, createAgentConfigurationTransport } from "../hooks/agent-configuration-controller";
 import { adaptAgentConfiguration, toSelection } from "../pages/agent-configuration-adapter";
 
@@ -18,9 +16,13 @@ class ProtocolPeer implements CodexClient {
   readonly codexHome: string;
   closed = false;
   closeCount = 0;
+  retirementFinished = false;
   authenticated = true;
+  cancelResponse: unknown = { status: "canceled" };
+  nativeLoginResponse?: unknown;
   readonly calls: Array<{ method: string; params: unknown }> = [];
   beforeRequest?: (method: string) => Promise<void>;
+  beforeClose?: () => Promise<void>;
   private nextLogin = 0;
   private readonly notifications = new Set<(method: string, params: unknown) => void>();
   private readonly closes = new Set<() => void>();
@@ -45,10 +47,10 @@ class ProtocolPeer implements CodexClient {
         break;
       case "config/read": result = { config: {}, privateRpc: "synthetic-private-token" }; break;
       case "account/login/start":
-        result = { type: "chatgptDeviceCode", loginId: `login-${++this.nextLogin}`,
+        result = this.nativeLoginResponse ?? { type: "chatgptDeviceCode", loginId: `login-${++this.nextLogin}`,
           verificationUrl: "https://auth.openai.com/codex/device", userCode: "FIXTURE-CODE", accessToken: "synthetic-private-token" };
         break;
-      case "account/login/cancel": result = {}; break;
+      case "account/login/cancel": result = this.cancelResponse; break;
       case "account/logout": this.authenticated = false; result = {}; break;
       default: throw new Error(`Unexpected protocol fixture method: ${method}`);
     }
@@ -59,7 +61,7 @@ class ProtocolPeer implements CodexClient {
   onClose(listener: () => void) { this.closes.add(listener); return () => { this.closes.delete(listener); }; }
   notify(method: string, params: unknown) { for (const listener of this.notifications) listener(method, params); }
   disconnect() { if (!this.closed) { this.closed = true; for (const listener of this.closes) listener(); } }
-  async close() { this.closeCount++; this.disconnect(); }
+  async close() { this.closeCount++; this.disconnect(); await this.beforeClose?.(); this.retirementFinished = true; }
   count(method: string) { return this.calls.filter(call => call.method === method).length; }
 }
 
@@ -69,52 +71,12 @@ const post = (body: unknown = {}) => ({ method: "POST", headers: { "Content-Type
 const put = (body: unknown) => ({ ...post(body), method: "PUT" });
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done; }); return { promise, resolve }; }
 
-/** Offline contract injection only. New Core attempt management must be re-tested after its import. */
-function installAttemptContractFixture(service: CodexAccountService) {
-  const start = service.startDeviceLogin.bind(service), cancel = service.cancelLogin.bind(service);
-  const attempts = new Map<string, { expiresAt: number; closed: boolean; loginId?: string;
-    pending?: ReturnType<typeof start>; cleanup?: Promise<void> }>();
-  let nextHandle = 0;
-  const fixture: DeviceLoginAttemptService = {
-    reserveDeviceLoginAttempt() {
-      const attemptHandle = `fixture-attempt-${++nextHandle}`, expiresAt = Date.now() + 60_000;
-      attempts.set(attemptHandle, { expiresAt, closed: false });
-      return { attemptHandle, expiresAt };
-    },
-    startDeviceLogin({ attemptHandle }) {
-      const attempt = attempts.get(attemptHandle);
-      if (!attempt || attempt.closed || attempt.expiresAt <= Date.now()) return Promise.reject(new Error("The fixture attempt is no longer startable"));
-      attempt.pending ??= start().then(async login => {
-        attempt.loginId = login.loginId;
-        if (attempt.closed) { attempt.cleanup ??= cancel(login.loginId); await attempt.cleanup; }
-        return login;
-      });
-      return attempt.pending;
-    },
-    async closeDeviceLoginAttempt(attemptHandle): Promise<DeviceLoginAttemptCloseResult> {
-      const attempt = attempts.get(attemptHandle);
-      if (!attempt || attempt.expiresAt <= Date.now()) return { attemptHandle, state: "unknown-or-expired", cleanup: "not-applicable" };
-      const repeated = attempt.closed; attempt.closed = true;
-      if (!attempt.pending) return { attemptHandle, state: repeated ? "already-terminal" : "closed", cleanup: "not-started" };
-      if (!attempt.loginId) {
-        // Fence immediately; the pending fixture start performs its exact-ID cleanup when it resolves.
-        return { attemptHandle, state: repeated ? "already-terminal" : "closed", cleanup: "unconfirmed" };
-      }
-      attempt.cleanup ??= cancel(attempt.loginId);
-      try { await attempt.cleanup; return { attemptHandle, state: repeated ? "already-terminal" : "closed", cleanup: "cancel-acknowledged" }; }
-      catch { return { attemptHandle, state: "closed", cleanup: "unconfirmed" }; }
-    },
-  };
-  Object.assign(service, fixture); // Same injected service object; production code never supplies this shim.
-}
-
-describe("mounted Studio public Core configuration + offline future-attempt contract fixture", () => {
+describe("mounted Studio routes with real Core account/attempt/SQLite owner and offline protocol peer", () => {
   let root: string;
   let peer: ProtocolPeer;
   let service: CodexAccountService;
   let factory: ReturnType<typeof vi.fn<(projectDir: string) => Promise<CodexClient>>>;
   let app: ReturnType<typeof createStudioServer>;
-  let hasAttemptFixture: boolean;
   const additionalApps: ReturnType<typeof createStudioServer>[] = [];
   const additionalRoots: string[] = [];
   const controllers: ReturnType<typeof createAgentConfigurationController>[] = [];
@@ -127,7 +89,6 @@ describe("mounted Studio public Core configuration + offline future-attempt cont
     factory = vi.fn(async (_projectDir: string): Promise<CodexClient> => { if (peer.closed) peer = new ProtocolPeer(root); return peer; });
     service = createCodexAccountService({ projectDir: root, clientFactory: factory });
     app = createStudioServer({} as never, root, { codexAccountService: service });
-    hasAttemptFixture = false;
   });
   afterEach(async () => {
     for (const controller of controllers.splice(0)) controller.dispose();
@@ -144,15 +105,13 @@ describe("mounted Studio public Core configuration + offline future-attempt cont
   };
   const owner = () => new CodexAuthenticationOwner(peer);
   const bind = (expectedRevision = 0) => app.request(`${prefix}/harnesses/codex/bind`, post({ expectedRevision }));
-  const enableAttemptFixture = () => { if (!hasAttemptFixture) { installAttemptContractFixture(service); hasAttemptFixture = true; } };
-  const reserveFixture = async () => {
-    enableAttemptFixture(); const response = await app.request(`${prefix}/harnesses/codex/login/reserve`, post());
+  const reserveAttempt = async () => {
+    const response = await app.request(`${prefix}/harnesses/codex/login/reserve`, post());
     expect(response.status).toBe(200); return (await response.json()).reservation.attemptHandle as string;
   };
-  const startFixture = async (handle?: string) => app.request(`${prefix}/harnesses/codex/login`, post({ attemptHandle: handle ?? await reserveFixture() }));
-  const closeFixture = (handle: string) => app.request(`${prefix}/harnesses/codex/login/close`, post({ attemptHandle: handle }));
+  const startAttempt = async (handle?: string) => app.request(`${prefix}/harnesses/codex/login`, post({ attemptHandle: handle ?? await reserveAttempt() }));
+  const closeAttempt = (handle: string) => app.request(`${prefix}/harnesses/codex/login/close`, post({ attemptHandle: handle }));
   const ui = () => {
-    enableAttemptFixture();
     const httpCalls: Array<{ method: string; path: string; status: number }> = [];
     const fetchImpl: typeof fetch = async (input, init) => {
       const request = input instanceof Request ? new Request(input, init) : new Request(new URL(String(input), "http://localhost"), init);
@@ -177,36 +136,42 @@ describe("mounted Studio public Core configuration + offline future-attempt cont
     expect(existsSync(join(peer.codexHome, "inkos-connection.json"))).toBe(false);
   });
 
-  it("fails closed on the actual older Core service instead of falling back to legacy start/cancel/logout", async () => {
-    for (const [action, body] of [["login/reserve", {}], ["login", { attemptHandle: "fixture-attempt" }], ["login/close", { attemptHandle: "fixture-attempt" }]] as const) {
-      const response = await app.request(`${prefix}/harnesses/codex/${action}`, post(body));
-      expect(response.status).toBe(503); expect((await response.json()).error.code).toBe("AGENT_CONFIGURATION_ATTEMPT_CONTRACT_UNAVAILABLE");
-    }
+  it("uses the actual public attempt contract and rejects a foreign handle without borrowing a peer", async () => {
+    const handle = await reserveAttempt(); expect(handle).toMatch(/^[0-9a-f-]{36}$/);
+    expect((await startAttempt("foreign-attempt")).status).toBe(503);
+    expect(await (await closeAttempt("foreign-attempt")).json()).toEqual({ result: {
+      attemptHandle: "foreign-attempt", state: "unknown-or-expired", cleanup: "not-applicable",
+    } });
     expect(factory).not.toHaveBeenCalled(); expect(peer.calls).toEqual([]); expect(owner().snapshot()).toBeUndefined();
     expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();
   });
 
-  it("offline attempt fixture: reserve and Close before start create no peer, owner operation or OAuth request", async () => {
-    const handle = await reserveFixture();
+  it("real reserve and cached Close before start create no peer, owner operation or OAuth request", async () => {
+    const handle = await reserveAttempt();
     expect(factory).not.toHaveBeenCalled(); expect(owner().snapshot()).toBeUndefined();
-    expect(await (await closeFixture(handle)).json()).toEqual({ result: { attemptHandle: handle, state: "closed", cleanup: "not-started" } });
-    expect(await (await closeFixture(handle)).json()).toEqual({ result: { attemptHandle: handle, state: "already-terminal", cleanup: "not-started" } });
-    expect((await startFixture(handle)).status).toBe(503);
+    expect(await (await closeAttempt(handle)).json()).toEqual({ result: { attemptHandle: handle, state: "closed", cleanup: "not-started" } });
+    expect(await (await closeAttempt(handle)).json()).toEqual({ result: { attemptHandle: handle, state: "closed", cleanup: "not-started" } });
+    expect((await startAttempt(handle)).status).toBe(503);
     expect(factory).not.toHaveBeenCalled(); expect(peer.calls).toEqual([]); expect(owner().snapshot()).toBeUndefined();
   });
 
-  it("offline attempt fixture: an aborted start response can still be closed by its pre-reserved handle before the native ID arrives", async () => {
-    peer.authenticated = false; const handle = await reserveFixture();
+  it("fences an aborted held start immediately and shares exact-ID Close settlement after the native ID arrives", async () => {
+    peer.authenticated = false; const handle = await reserveAttempt();
     const entered = deferred<void>(); const release = deferred<void>(); const abort = new AbortController();
     peer.beforeRequest = async method => { if (method === "account/login/start") { entered.resolve(); await release.promise; } };
     const pending = app.request(new Request(`http://localhost${prefix}/harnesses/codex/login`, { ...post({ attemptHandle: handle }), signal: abort.signal }));
-    await entered.promise; abort.abort();
-    const closed = await closeFixture(handle);
-    expect(await closed.json()).toEqual({ result: { attemptHandle: handle, state: "closed", cleanup: "unconfirmed" } });
-    expect(peer.count("account/login/cancel")).toBe(0);
-    release.resolve(); expect((await pending).status).toBe(200);
+    await entered.promise; const before = owner().snapshot()!; abort.abort();
+    const closed = closeAttempt(handle), repeated = closeAttempt(handle);
+    try {
+      await vi.waitFor(() => expect(owner().snapshot()).toMatchObject({ localState: "unknown", operationId: null, authGeneration: before.authGeneration }));
+      expect(peer.count("account/login/cancel")).toBe(0);
+    } finally { release.resolve(); }
+    expect((await pending).status).toBe(503);
+    const receipt = { result: { attemptHandle: handle, state: "closed", cleanup: "cancel-acknowledged" } };
+    expect(await (await closed).json()).toEqual(receipt); expect(await (await repeated).json()).toEqual(receipt);
+    expect(await (await closeAttempt(handle)).json()).toEqual(receipt);
     expect(peer.calls.filter(call => call.method === "account/login/cancel").map(call => call.params)).toEqual([{ loginId: "login-1" }]);
-    expect(owner().snapshot()).toMatchObject({ localState: "disconnected", operationId: null });
+    expect(owner().snapshot()).toMatchObject({ localState: "unknown", operationId: null, authGeneration: before.authGeneration });
     expect((await state()).connection.login.status).toBe("cancelled");
     expect(peer.count("account/login/start")).toBe(1); expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();
   });
@@ -219,7 +184,7 @@ describe("mounted Studio public Core configuration + offline future-attempt cont
     expect(observed.catalog.value.nativeDefaults).toMatchObject({ modelId: "gpt-6.1-sol", effort: "ultra", serviceTier: "priority" });
     expect(observed.catalog.scope).toEqual(observed.scope);
     expect(JSON.stringify(observed)).not.toMatch(/private@example|synthetic-private|codexHome|identityRef|workspaceRouting|raw|request/);
-    expect(peer.calls.map(call => call.method).sort()).toEqual(["account/read", "account/read", "account/read", "config/read", "model/list"]);
+    expect(peer.calls.map(call => call.method).sort()).toEqual(["account/read", "account/read", "account/read", "account/read", "config/read", "model/list"]);
     expect(owner().snapshot()).toBeUndefined(); expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();
     expect(peer.closeCount).toBe(0); expect(factory).toHaveBeenCalledTimes(1);
   });
@@ -327,7 +292,7 @@ describe("mounted Studio public Core configuration + offline future-attempt cont
 
   it("deduplicates parallel logins and recovers the pending attempt through a subsequent GET", async () => {
     peer.authenticated = false;
-    const handle = await reserveFixture(); const starts = await Promise.all([startFixture(handle), startFixture(handle)]);
+    const handle = await reserveAttempt(); const starts = await Promise.all([startAttempt(handle), startAttempt(handle)]);
     expect(starts.map(response => response.status)).toEqual([200, 200]);
     const results = await Promise.all(starts.map(response => response.json()));
     expect(results[0]).toEqual(results[1]); expect(results[0].login).toMatchObject({ loginId: "login-1", status: "pending", userCode: "FIXTURE-CODE" });
@@ -336,32 +301,42 @@ describe("mounted Studio public Core configuration + offline future-attempt cont
     expect(owner().snapshot()?.localState).toBe("transitioning"); expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();
   });
 
-  it("offline attempt fixture: unknown Close cannot cancel the pending owner, repeated exact Close fences late success", async () => {
+  it("unknown Close cannot cancel the pending owner and cached exact Close fences late success without a new generation", async () => {
     peer.authenticated = false;
-    const handle = await reserveFixture(); await startFixture(handle); const pending = owner().snapshot()!;
-    const unknown = await closeFixture("unknown"); expect(unknown.status).toBe(200);
+    const handle = await reserveAttempt(); await startAttempt(handle); const pending = owner().snapshot()!;
+    const unknown = await closeAttempt("unknown"); expect(unknown.status).toBe(200);
     expect(await unknown.json()).toEqual({ result: { attemptHandle: "unknown", state: "unknown-or-expired", cleanup: "not-applicable" } });
     expect(peer.count("account/login/cancel")).toBe(0); expect(owner().snapshot()).toEqual(pending);
-    expect((await closeFixture(handle)).status).toBe(200); expect((await closeFixture(handle)).status).toBe(200);
-    const cancelled = owner().snapshot()!; expect(cancelled).toMatchObject({ localState: "disconnected", operationId: null, authGeneration: pending.authGeneration + 1 });
+    const receipt = { result: { attemptHandle: handle, state: "closed", cleanup: "cancel-acknowledged" } };
+    expect(await (await closeAttempt(handle)).json()).toEqual(receipt); expect(await (await closeAttempt(handle)).json()).toEqual(receipt);
+    const cancelled = owner().snapshot()!; expect(cancelled).toMatchObject({ localState: "unknown", operationId: null, authGeneration: pending.authGeneration });
     peer.authenticated = true; peer.notify("account/login/completed", { loginId: "login-1", success: true, accessToken: "synthetic-private-token" });
     const observed = await state(); expect(observed.account).toEqual({ type: "chatgpt" }); expect(observed.catalog).toBeNull(); expect(observed.execution).toBeNull();
     expect(observed.connection.login.status).toBe("cancelled"); expect(owner().snapshot()).toEqual(cancelled);
     expect(peer.count("account/login/cancel")).toBe(1); expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();
+    expect((await startAttempt()).status).toBe(200); const newer = owner().snapshot()!, calls = [...peer.calls];
+    expect(await (await closeAttempt(handle)).json()).toEqual(receipt);
+    expect(owner().snapshot()).toEqual(newer); expect(peer.calls).toEqual(calls); expect(peer.count("account/login/start")).toBe(2);
   });
 
   it("settles a successful login in the same owner without automatically binding settings or verifying execution", async () => {
-    peer.authenticated = false; await startFixture(); const pending = owner().snapshot()!;
+    peer.authenticated = false; const handle = await reserveAttempt(); await startAttempt(handle); const pending = owner().snapshot()!;
     peer.authenticated = true; peer.notify("account/login/completed", { loginId: "login-1", success: true });
     const observed = await state();
     expect(owner().snapshot()).toMatchObject({ localState: "ready", authGeneration: pending.authGeneration, operationId: null });
     expect(observed).toMatchObject({ scope: { ownerGeneration: pending.authGeneration }, connection: { phase: "signed-in", login: { status: "completed" } }, execution: null });
     expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();
+    const ready = owner().snapshot()!, calls = [...peer.calls];
+    const receipt = { result: { attemptHandle: handle, state: "already-terminal", cleanup: "not-applicable" } };
+    expect(await (await closeAttempt(handle)).json()).toEqual(receipt); expect(await (await closeAttempt(handle)).json()).toEqual(receipt);
+    expect(owner().snapshot()).toEqual(ready); expect(peer.calls).toEqual(calls);
+    expect(peer.count("account/login/cancel")).toBe(0); expect(peer.count("account/logout")).toBe(0); expect(peer.closeCount).toBe(0);
+    expect(existsSync(join(peer.codexHome, ".write.lock.guard.sqlite"))).toBe(true);
     expect((await bind()).status).toBe(200); expect(factory).toHaveBeenCalledTimes(1);
   });
 
-  it("logout cancels the pending login and revokes its generation even if completion arrives later", async () => {
-    peer.authenticated = false; await startFixture(); const pending = owner().snapshot()!;
+  it("pending logout revokes late completion and unlocks a fresh handle on the same healthy peer", async () => {
+    peer.authenticated = false; const handle = await reserveAttempt(); await startAttempt(handle); const pending = owner().snapshot()!;
     expect((await app.request(`${prefix}/harnesses/codex/logout`, post())).status).toBe(200);
     const loggedOut = owner().snapshot()!; expect(loggedOut).toMatchObject({ localState: "disconnected", authGeneration: pending.authGeneration + 1, operationId: null });
     expect(peer.calls.filter(call => call.method === "account/login/cancel").map(call => call.params)).toEqual([{ loginId: "login-1" }]);
@@ -369,10 +344,74 @@ describe("mounted Studio public Core configuration + offline future-attempt cont
     peer.authenticated = true; peer.notify("account/login/completed", { loginId: "login-1", success: true });
     expect((await state()).connection.login).toBeNull(); expect(owner().snapshot()).toEqual(loggedOut);
     expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();
+    peer.authenticated = false; const nextHandle = await reserveAttempt();
+    const nextResponse = await startAttempt(nextHandle);
+    if (nextResponse.status === 503) {
+      // Confirm the genuine Core cause, rather than treating a generic HTTP
+      // unavailable envelope as proof that every failure is an attempt deadlock.
+      await expect(service.startDeviceLogin({ attemptHandle: nextHandle })).rejects.toMatchObject({ code: "CODEX_LOGIN_ATTEMPT_BUSY" });
+    }
+    expect(nextResponse.status).toBe(200);
+    expect(peer.count("account/login/start")).toBe(2); expect(peer.count("account/login/cancel")).toBe(1);
+    expect(peer.count("account/logout")).toBe(1); expect(peer.closeCount).toBe(0); expect(factory).toHaveBeenCalledTimes(1);
+    expect(owner().snapshot()).toMatchObject({ localState: "transitioning", authGeneration: loggedOut.authGeneration + 1 });
+    const nextOwner = owner().snapshot()!, oldCalls = [...peer.calls];
+    expect(await (await closeAttempt(handle)).json()).toEqual({ result: { attemptHandle: handle, state: "superseded", cleanup: "not-applicable" } });
+    expect(owner().snapshot()).toEqual(nextOwner); expect(peer.calls).toEqual(oldCalls); expect(peer.closeCount).toBe(0);
+  });
+
+  it.each(["native failure", "signed-out completion", "account read failure"])("settles %s as non-ready, caches terminal Close and unlocks the next exact handle", async failure => {
+    peer.authenticated = false; const handle = await reserveAttempt(); await startAttempt(handle);
+    const pending = owner().snapshot()!;
+    if (failure === "account read failure") {
+      let failOnce = true;
+      peer.beforeRequest = async method => { if (method === "account/read" && failOnce) { failOnce = false; throw new Error("synthetic-private-account-read"); } };
+    }
+    peer.notify("account/login/completed", { loginId: "login-1", success: failure !== "native failure" });
+    const observed = await state(), settled = owner().snapshot()!;
+    expect(settled).toMatchObject({ localState: failure === "signed-out completion" ? "disconnected" : "unknown", operationId: null, authGeneration: pending.authGeneration });
+    expect(observed.connection.login.status).toBe("failed"); expect(observed.account).toBeNull(); expect(observed.catalog).toBeNull(); expect(observed.execution).toBeNull();
+    const calls = [...peer.calls], receipt = { result: { attemptHandle: handle, state: "closed", cleanup: "not-applicable" } };
+    expect(await (await closeAttempt(handle)).json()).toEqual(receipt); expect(await (await closeAttempt(handle)).json()).toEqual(receipt);
+    expect(peer.calls).toEqual(calls); expect(owner().snapshot()).toEqual(settled); expect(peer.closeCount).toBe(0);
+    expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();
+    expect((await startAttempt()).status).toBe(200); expect(peer.count("account/login/start")).toBe(2); expect(factory).toHaveBeenCalledTimes(1);
+    const newer = owner().snapshot()!, nativeCalls = [...peer.calls];
+    expect(await (await closeAttempt(handle)).json()).toEqual(receipt); expect(owner().snapshot()).toEqual(newer); expect(peer.calls).toEqual(nativeCalls);
+  });
+
+  it("keeps an unconfirmed cached Close busy until the original peer retirement settles, without mutating a fresh peer", async () => {
+    peer.authenticated = false; peer.cancelResponse = {}; const oldPeer = peer;
+    const handle = await reserveAttempt(); await startAttempt(handle); const pending = owner().snapshot()!;
+    const receipt = { result: { attemptHandle: handle, state: "closed", cleanup: "unconfirmed" } };
+    expect(await (await closeAttempt(handle)).json()).toEqual(receipt); const fenced = owner().snapshot()!;
+    expect(fenced).toMatchObject({ localState: "unknown", operationId: null, authGeneration: pending.authGeneration });
+    const next = await reserveAttempt(); expect((await startAttempt(next)).status).toBe(503);
+    expect(await (await closeAttempt(handle)).json()).toEqual(receipt); expect(peer.count("account/login/cancel")).toBe(1);
+    const entered = deferred<void>(), retirement = deferred<void>();
+    oldPeer.beforeClose = async () => { entered.resolve(); await retirement.promise; };
+    oldPeer.disconnect(); await entered.promise;
+    try {
+      const observed = await state(); expect(peer).not.toBe(oldPeer); expect(factory).toHaveBeenCalledTimes(2);
+      expect(observed).toMatchObject({ catalog: null, execution: null }); expect(owner().snapshot()).toEqual(fenced);
+      const newCalls = [...peer.calls], oldCalls = [...oldPeer.calls];
+      expect((await startAttempt(next)).status).toBe(503);
+      expect(await (await closeAttempt(handle)).json()).toEqual(receipt);
+      expect(peer.calls).toEqual(newCalls); expect(oldPeer.calls).toEqual(oldCalls); expect(owner().snapshot()).toEqual(fenced);
+      expect(oldPeer.retirementFinished).toBe(false); expect(oldPeer.closeCount).toBe(1);
+    } finally { retirement.resolve(); }
+    await vi.waitFor(() => expect(oldPeer.retirementFinished).toBe(true));
+    expect((await startAttempt(next)).status).toBe(200);
+    const newer = owner().snapshot()!, oldCalls = [...oldPeer.calls], newCalls = [...peer.calls];
+    oldPeer.notify("account/login/completed", { loginId: "login-1", success: true });
+    expect(await (await closeAttempt(handle)).json()).toEqual(receipt);
+    expect(owner().snapshot()).toEqual(newer); expect(oldPeer.calls).toEqual(oldCalls); expect(peer.calls).toEqual(newCalls);
+    expect(oldPeer.closeCount).toBe(1); expect(peer.count("account/login/start")).toBe(1); expect(peer.count("account/logout")).toBe(0);
+    expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();
   });
 
   it("a peer failure marks the pending attempt failed and borrows a fresh peer without restoring ready", async () => {
-    peer.authenticated = false; await startFixture(); const oldPeer = peer; const pending = owner().snapshot()!;
+    peer.authenticated = false; await startAttempt(); const oldPeer = peer; const pending = owner().snapshot()!;
     oldPeer.disconnect();
     const observed = await state();
     expect(factory).toHaveBeenCalledTimes(2); expect(peer).not.toBe(oldPeer);
@@ -385,7 +424,7 @@ describe("mounted Studio public Core configuration + offline future-attempt cont
   });
 
   it("production shutdown settles a pending ticket and closes the owned peer once, fencing late completion", async () => {
-    peer.authenticated = false; await startFixture(); const pending = owner().snapshot()!;
+    peer.authenticated = false; await startAttempt(); const pending = owner().snapshot()!;
     await shutdownStudioServer(app); const settled = owner().snapshot()!;
     expect(settled).toMatchObject({ localState: "unknown", operationId: null, authGeneration: pending.authGeneration });
     expect(peer.closed).toBe(true); expect(peer.closeCount).toBe(1);
@@ -394,12 +433,17 @@ describe("mounted Studio public Core configuration + offline future-attempt cont
     await shutdownStudioServer(app); expect(peer.closeCount).toBe(1);
   });
 
-  it("sanitizes login RPC failure, settles unknown and closes the peer through the same service", async () => {
-    peer.beforeRequest = async method => { if (method === "account/login/start") throw new Error("synthetic-private-RPC-error"); };
-    const response = await startFixture();
+  it.each(["RPC failure", "invalid reply"])("sanitizes %s, settles unknown and retires the original peer before unlocking retry", async failure => {
+    const oldPeer = peer;
+    if (failure === "RPC failure") peer.beforeRequest = async method => { if (method === "account/login/start") throw new Error("synthetic-private-RPC-error"); };
+    else peer.nativeLoginResponse = { type: "chatgptDeviceCode", accessToken: "synthetic-private-token" };
+    const response = await startAttempt();
     expect(response.status).toBe(503); expect(await response.text()).not.toContain("synthetic-private");
     expect(owner().snapshot()).toMatchObject({ localState: "unknown", operationId: null }); expect(peer.closeCount).toBe(1);
     expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();
+    expect(oldPeer.retirementFinished).toBe(true); const originalCalls = [...oldPeer.calls];
+    expect((await startAttempt()).status).toBe(200); expect(peer).not.toBe(oldPeer); expect(factory).toHaveBeenCalledTimes(2);
+    expect(oldPeer.calls).toEqual(originalCalls); expect(oldPeer.closeCount).toBe(1);
   });
 
   it("an aborted bind cannot commit or admit after the account RPC returns", async () => {
@@ -464,7 +508,7 @@ describe("mounted Studio public Core configuration + offline future-attempt cont
     await vi.waitFor(() => expect(controller.getSnapshot().state?.connection?.login?.status).toBe("cancelled"));
     expect(peer.count("account/login/start")).toBe(1);
     expect(peer.calls.filter(call => call.method === "account/login/cancel").map(call => call.params)).toEqual([{ loginId: "login-1" }]);
-    expect(owner().snapshot()).toMatchObject({ localState: "disconnected", operationId: null });
+    expect(owner().snapshot()).toMatchObject({ localState: "unknown", operationId: null });
     expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();
   });
 
