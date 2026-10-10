@@ -9,6 +9,7 @@ export interface AgentConfigurationPanelProps {
   readonly view: ConfigurationView;
   readonly isZh: boolean;
   readonly disabled?: boolean;
+  readonly connectDisabled?: boolean;
   readonly canSave: boolean;
   readonly hasChanges: boolean;
   readonly onHarnessChange: (harness: HarnessId) => void;
@@ -17,13 +18,13 @@ export interface AgentConfigurationPanelProps {
   readonly onSaveIntent: (intent: SaveIntent) => void;
 }
 
-export function AgentConfigurationPanel({ id, view, isZh, disabled, canSave, hasChanges, onHarnessChange, onConnectionIntent, onSelectionIntent, onSaveIntent }: AgentConfigurationPanelProps) {
+export function AgentConfigurationPanel({ id, view, isZh, disabled, connectDisabled, canSave, hasChanges, onHarnessChange, onConnectionIntent, onSelectionIntent, onSaveIntent }: AgentConfigurationPanelProps) {
   const saving = sameTarget(view.target, view.save.target) && view.save.phase === "saving";
   const saveDisabled = disabled || !canSave || !hasChanges || saving;
   return <section className={sectionClass} aria-label={text(isZh, "Agent 默认配置", "Agent defaults")}>
     <h2 className="text-base font-bold">{text(isZh, "ChatGPT Agent 配置", "ChatGPT agent configuration")}</h2>
     <HarnessSelector name={`${id}-harness`} value={view.target.harness} isZh={isZh} disabled={disabled} onChange={onHarnessChange} />
-    <ChatGptConnectionCard target={view.target} connection={view.connection} isZh={isZh} disabled={disabled} onIntent={onConnectionIntent} />
+    <ChatGptConnectionCard target={view.target} connection={view.connection} isZh={isZh} disabled={disabled} connectDisabled={connectDisabled} onIntent={onConnectionIntent} />
     <ModelOptions id={`${id}-options`} target={view.target} catalog={view.catalog} selection={view.selection} isZh={isZh} disabled={disabled} onIntent={onSelectionIntent} />
     <ConfigurationStatus view={view} isZh={isZh} />
     <p id={`${id}-save-help`} className="text-xs text-muted-foreground">{hasChanges

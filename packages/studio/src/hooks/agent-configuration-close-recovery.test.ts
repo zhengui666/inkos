@@ -202,6 +202,43 @@ function expectRealStartAbort(value: ReturnType<typeof setup>) {
 }
 
 describe("unknown-start Close receipts describe an attempt independently of the current connection", () => {
+  it("a requested Close stays attempt-only when a delayed first observation later reports the returned login ID cancelled at generation five", async () => {
+    const value = setup(); value.held.add("close"); value.state(observed("signed-out", 3)); await value.controller.refresh(); value.edit("close-before-observation-draft");
+    const originalFetch = value.fetchImpl.getMockImplementation()!; let holdFirstState = true; let releaseState!: (value: HarnessState) => void;
+    value.fetchImpl.mockImplementation((input, init) => {
+      if (holdFirstState && String(input).endsWith("/state")) {
+        holdFirstState = false;
+        // This already-issued read can arrive late; its old epoch must not bind the closed attempt.
+        return new Promise<Response>(resolve => { releaseState = state => resolve(Response.json({ state })); cleanups.push(() => releaseState(observed("signed-out", 3))); });
+      }
+      return originalFetch(input, init);
+    });
+    value.connect(); await flush(); expect(value.action("start")).toHaveLength(1); expect(value.controller.getSnapshot().authBlocking).toBe("login");
+    value.controller.closeConnection(); await flush(); expect(value.action("close")).toHaveLength(1);
+    const observedFive = observed("signed-out", 5);
+    const currentState: HarnessState = { ...observedFive, connection: { ...observedFive.connection!, login: { ...login, status: "cancelled" } } };
+    value.state(currentState); releaseState(currentState); await flush(); await value.controller.refreshState(); await flush();
+    expect(value.controller.getSnapshot().ownerGeneration).toBe(5); expect(value.controller.getSnapshot().state).toEqual(currentState);
+    expectAttemptScope(value.controller); expect(value.controller.getSnapshot().authBlocking).toBeNull();
+    expect(value.controller.getSnapshot().draft.model).toBe("close-before-observation-draft"); expect(value.controller.getSnapshot().revision).toBe(0);
+    value.controller.closeConnection(); value.controller.closeConnection(); await flush(); expect(mutationCounts(value)).toEqual([1, 1, 1]);
+    value.action("close")[0]!.reply({ result: closed }); await flush();
+    expectAttemptScope(value.controller); expect(value.controller.getSnapshot().authCloseResult).toEqual(closed); expect(value.controller.getSnapshot().authBlocking).toBeNull();
+    expect(value.controller.getSnapshot().ownerGeneration).toBe(5); expect(value.controller.getSnapshot().state).toEqual(currentState);
+    await value.controller.refreshState(); await flush(); value.controller.closeConnection(); await flush();
+    expectAttemptScope(value.controller); expect(value.controller.getSnapshot().authCloseResult).toEqual(closed); expect(value.controller.getSnapshot().authBlocking).toBeNull();
+    expect(value.controller.getSnapshot().state).toEqual(currentState); expect(value.controller.getSnapshot().draft.model).toBe("close-before-observation-draft");
+    expect(value.controller.getSnapshot().revision).toBe(0); expect(mutationCounts(value)).toEqual([1, 1, 1]);
+  });
+  it("normal matching-login observation before Close still establishes a blocking connection-scoped Close", async () => {
+    const value = setup(); value.held.add("close"); value.state(observed("signed-out", 3)); await value.controller.refresh(); value.edit("normally-correlated-draft");
+    value.state(observed("signing-in", 5)); value.connect(); await flush();
+    expect(value.controller.getSnapshot().ownerGeneration).toBe(5); expect(value.controller.getSnapshot().state?.connection?.login?.loginId).toBe(login.loginId);
+    expect(value.controller.getSnapshot().authBlocking).toBeNull(); value.controller.closeConnection(); await flush();
+    expect(value.controller.getSnapshot().authCloseScope).toBe("connection"); expect(value.controller.getSnapshot().authBlocking).toBe("cancel");
+    expect(value.controller.getSnapshot().draft.model).toBe("normally-correlated-draft"); expect(value.controller.getSnapshot().revision).toBe(0);
+    expect(mutationCounts(value)).toEqual([1, 1, 1]);
+  });
   it.each(["context", "harness"] as const)("an actual %s mismatch invalidates unknown-start recovery and prevents another Close POST", async mismatch => {
     const value = setup(); await beginUnknownStartClose(value); const actual = observed("signed-in", 4);
     value.state(mismatch === "context" ? { ...actual, scope: { ...actual.scope!, authContextRef: "different-server-context" } }

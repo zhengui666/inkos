@@ -138,6 +138,27 @@ describe("ChatGPT connections and target-bound intents", () => {
       expect(html).toContain('aria-atomic="true"');
     }
   });
+  it("allows an explicit Connect override while keeping other connection intents disabled", () => {
+    const onIntent = vi.fn();
+    const props = { target: piFixtureTarget, isZh: false, disabled: true, connectDisabled: false, onIntent };
+    const tree = ChatGptConnectionCard({ ...props, connection: offlinePiSaved.connection });
+    expect(button(tree, "Sign in with ChatGPT").props.disabled).toBe(false);
+    expect(button(tree, "Check status").props.disabled).toBe(true);
+    click(button(tree, "Sign in with ChatGPT")); click(button(tree, "Check status"));
+    const signedIn = ChatGptConnectionCard({ ...props, target: codexFixtureTarget, connection: offlineCodexSignedIn.connection });
+    const pending = ChatGptConnectionCard({ ...props, connection: { ...offlinePiSaved.connection, phase: "signing-in", attemptKey: "old-attempt" } });
+    click(button(signedIn, "Sign out of ChatGPT")); click(button(pending, "Cancel sign-in"));
+    expect(onIntent).toHaveBeenCalledExactlyOnceWith({ action: "connect", target: piFixtureTarget });
+  });
+  it("blocks Connect's native control and emit when authentication blocks only Connect", () => {
+    const onIntent = vi.fn();
+    const tree = ChatGptConnectionCard({ target: piFixtureTarget, connection: offlinePiSaved.connection, isZh: false,
+      disabled: false, connectDisabled: true, onIntent });
+    expect(button(tree, "Sign in with ChatGPT").props.disabled).toBe(true);
+    expect(button(tree, "Check status").props.disabled).toBe(false);
+    click(button(tree, "Sign in with ChatGPT")); click(button(tree, "Check status"));
+    expect(onIntent).toHaveBeenCalledExactlyOnceWith({ action: "refresh-connection", target: piFixtureTarget });
+  });
 });
 
 describe("ModelOptions controlled catalog choices", () => {

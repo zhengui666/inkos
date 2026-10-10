@@ -57,7 +57,10 @@ export interface AgentConfigurationSnapshot {
   readonly hasChanges: boolean;
   readonly canSave: boolean;
   readonly reviewable: boolean;
+  /** Includes settlement of an original attempt without claiming current connection ownership. */
   readonly authBusy: "login" | "cancel" | "logout" | "bind" | null;
+  /** Current authentication work; attempt-only Close settlement does not block a new Connect. */
+  readonly authBlocking: "login" | "cancel" | "logout" | "bind" | null;
   readonly authDetail?: TextView;
   readonly authCloseResult?: DeviceLoginAttemptCloseResult;
   readonly authCloseScope?: "connection" | "attempt";
@@ -141,6 +144,9 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     return "value" in attempt.generation && observedScope && sameTarget(observedScope.target, attempt.target)
       && attempt.generation.value === observedScope.generation;
   }
+  function blockingAuthentication(): AgentConfigurationSnapshot["authBlocking"] {
+    return authentication?.action ?? (closing && current(closing.token) && projectsConnection(closing.attempt) ? "cancel" : null);
+  }
   function matchesAttempt(attempt: LoginAttempt | undefined) {
     if (contextInvalid || !attempt || !sameTarget(attempt.target, target)) return false;
     if (authentication && authentication.attempt !== attempt) return false;
@@ -176,7 +182,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     const hasChanges = baseline !== null && (baseline.selectedHarnessId !== target.harness || !samePreferences(currentDraft.preferences, baseline.harnessPreferences[target.harness]));
     const closeAttempt = closeReceiptOwner?.attempt ?? (closing && current(closing.token) ? closing.attempt : undefined);
     snapshot = Object.freeze({ target, ownerGeneration, baseline, revision: currentDraft.baselineRevision, draft: currentDraft.preferences, retainedDrafts: currentDraft.retained ?? Object.freeze([]), state, submitted, loading, savePhase, detail, hasChanges, reviewable,
-      authBusy: closing && current(closing.token) ? "cancel" : authentication?.action ?? null, authDetail, authCloseResult,
+      authBusy: closing && current(closing.token) ? "cancel" : authentication?.action ?? null, authBlocking: blockingAuthentication(), authDetail, authCloseResult,
       authCloseScope: closeAttempt ? projectsConnection(closeAttempt) ? "connection" : "attempt" : undefined, canCloseConnection: canCloseAttempt(knownAttempt()),
       canSave: baseline !== null && currentDraft.baselineRevision !== null && !["saving", "conflict", "uncertain"].includes(savePhase) });
     for (const listener of listeners) listener();
@@ -262,8 +268,9 @@ export function createAgentConfigurationController(transport: AgentConfiguration
         }
         const attempt = knownAttempt();
         // A returned provider ID plus the exact local attempt can establish its
-        // generation. A numeric GET alone cannot associate an unknown start.
-        if (attempt && sameTarget(attempt.target, target) && attempt.generation.source === "unobserved-start"
+        // generation before Close. Afterwards a retained login record cannot
+        // associate the original attempt with a later observation's generation.
+        if (attempt && !attempt.closeRequested && sameTarget(attempt.target, target) && attempt.generation.source === "unobserved-start"
           && attempts.get(key(attempt.target)) === attempt && attempt.loginId && value.connection?.login?.loginId === attempt.loginId) {
           attempt.generation = { source: "matching-login", value: value.scope.ownerGeneration };
         }
@@ -405,7 +412,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     return observeClose(attempt, attempt.closeToken ?? { ...capture(), target: attempt.target }, true) ?? attempt.closePromise;
   }
   async function accountAction(action: "login" | "logout") {
-    if (disposed || authentication || (closing && current(closing.token) && projectsConnection(closing.attempt)) || target.harness !== "codex") return;
+    if (disposed || blockingAuthentication() !== null || target.harness !== "codex") return;
     if ((action === "login" && (!transport.reserveLogin || !transport.startLogin || !transport.closeLogin)) || (action === "logout" && !transport.logout)) {
       authDetail = { zh: "认证接口不可用，请核对连接状态。", en: "Authentication endpoints are unavailable. Check connection status." }; publish(); return;
     }

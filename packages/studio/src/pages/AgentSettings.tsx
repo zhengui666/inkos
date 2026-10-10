@@ -12,7 +12,7 @@ export function AgentSettings({ isZh }: { readonly isZh: boolean }) {
   const login = view.connection.phase === "signing-in" ? snapshot.state?.connection?.login : null;
   const bound = snapshot.state?.connection?.connectionRef && snapshot.state.connection.connectionRef === snapshot.baseline?.modelConnectionRef;
   return <div className="space-y-3">
-    <AgentConfigurationPanel id="agent-settings" view={view} isZh={isZh} canSave={snapshot.canSave} hasChanges={snapshot.hasChanges} disabled={snapshot.authBusy !== null}
+    <AgentConfigurationPanel id="agent-settings" view={view} isZh={isZh} canSave={snapshot.canSave} hasChanges={snapshot.hasChanges} disabled={snapshot.authBusy !== null} connectDisabled={snapshot.authBlocking !== null}
       onHarnessChange={harness => { controller.selectTarget({ harness, contextKey: "unobserved" }); void controller.refresh(); }}
       onConnectionIntent={controller.connectionIntent} onSelectionIntent={controller.edit} onSaveIntent={intent => { void controller.save(intent); }} />
     {login?.status === "pending" && login.verificationUrl && isCodexVerificationUrl(login.verificationUrl) && <div role="status" aria-live="polite" className="rounded-lg border border-border p-3 space-y-2">

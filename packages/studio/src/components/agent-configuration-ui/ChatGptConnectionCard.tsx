@@ -6,17 +6,19 @@ export interface ChatGptConnectionCardProps {
   readonly connection: ConnectionView;
   readonly isZh: boolean;
   readonly disabled?: boolean;
+  readonly connectDisabled?: boolean;
   readonly onIntent: (intent: ConnectionIntent) => void;
 }
 
-export function ChatGptConnectionCard({ target, connection, isZh, disabled, onIntent }: ChatGptConnectionCardProps) {
+export function ChatGptConnectionCard({ target, connection, isZh, disabled, connectDisabled, onIntent }: ChatGptConnectionCardProps) {
   const matches = sameTarget(target, connection.target);
   const phase = matches ? connection.phase : "unverified";
   const signedIn = phase === "signed-in";
   const pending = phase === "signing-in";
   const canConnect = matches && !["unverified", "uncertain"].includes(phase);
   const error = ["expired", "failed", "uncertain"].includes(phase) || !matches || (pending && !connection.attemptKey);
-  const emit = (intent: ConnectionIntent) => { if (!disabled) onIntent(intent); };
+  const connectBlocked = connectDisabled ?? disabled;
+  const emit = (intent: ConnectionIntent) => { if (!(intent.action === "connect" ? connectBlocked : disabled)) onIntent(intent); };
   return <section className={sectionClass} aria-label={`${harnessLabel(target.harness)} · ${text(isZh, "ChatGPT 连接", "ChatGPT connection")}`}>
     <h3 className="text-sm font-medium">{harnessLabel(target.harness)} · ChatGPT</h3>
     <p role="status" aria-live="polite" aria-atomic="true" className="text-sm">
@@ -34,7 +36,7 @@ export function ChatGptConnectionCard({ target, connection, isZh, disabled, onIn
           ? <button type="button" className={buttonClass} disabled={disabled || !connection.attemptKey} onClick={() => {
             if (matches && connection.attemptKey) emit({ action: "cancel-sign-in", target: { ...connection.target }, attemptKey: connection.attemptKey });
           }}>{text(isZh, "取消登录", "Cancel sign-in")}</button>
-          : <button type="button" className={buttonClass} disabled={disabled || !canConnect} onClick={() => { if (canConnect) emit({ action: "connect", target: { ...target } }); }}>{text(isZh, "使用 ChatGPT 登录", "Sign in with ChatGPT")}</button>}
+          : <button type="button" className={buttonClass} disabled={connectBlocked || !canConnect} onClick={() => { if (canConnect) emit({ action: "connect", target: { ...target } }); }}>{text(isZh, "使用 ChatGPT 登录", "Sign in with ChatGPT")}</button>}
       <button type="button" className={buttonClass} disabled={disabled} aria-label={`${harnessLabel(target.harness)} · ${text(isZh, "核对连接状态", "Check connection status")}`}
         onClick={() => emit({ action: "refresh-connection", target: { ...target } })}>{text(isZh, "核对状态", "Check status")}</button>
     </div>
