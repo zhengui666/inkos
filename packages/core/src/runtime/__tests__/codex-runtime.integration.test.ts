@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -48,6 +48,8 @@ class Peer implements CodexClient {
 }
 
 beforeEach(async () => {
+  vi.stubEnv('INKOS_CODEX_HOME', ''); delete process.env.INKOS_CODEX_HOME;
+  vi.stubEnv('INKOS_CODEX_STATE_ROOT', ''); delete process.env.INKOS_CODEX_STATE_ROOT;
   root = mkdtempSync(join(tmpdir(), 'inkos-codex-runtime-'));
   mkdirSync(join(root, '.inkos', 'codex', 'home'), { recursive: true, mode: 0o700 });
   nativeTier = null; ack = 'known';
@@ -72,7 +74,7 @@ describe('Codex runtime core boundary (authenticated protocol fixture)', () => {
     expect(observed).toMatchObject({ ready: true, owner: null,
       account: { type: 'chatgpt', planType: 'fixture', identityPresent: true },
       catalogOwnership: { harnessId: 'codex', authContextRef: observed.authContextRef, authGeneration: null, operationId: null },
-      nativeDefaultsEvidence: { model: 'model/list-default', effort: 'model/list-default', serviceTier: 'model/list-default' } });
+      nativeDefaultsEvidence: { model: 'model/list-default', effort: 'model/list-default', serviceTier: 'unknown' } });
     expect(observed.catalogOwnership?.adapterVersion).toBe(observed.descriptor?.adapterVersion);
     expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();
     expect(JSON.stringify(observed)).not.toMatch(/private@example.test|synthetic-secret/);
@@ -96,6 +98,64 @@ describe('Codex runtime core boundary (authenticated protocol fixture)', () => {
     const bound = await bindCodexModelConnection(root, client, { expectedRevision: 2 });
     expect(bound.modelConnectionRef).toBe(before.connectionRef);
     expect(owner.snapshot()?.authGeneration).toBe(before.authGeneration);
+  });
+
+  it('rejects an external project client without modifying either project settings or the external owner', async () => {
+    const otherRoot = join(root, 'other-project'); mkdirSync(join(otherRoot, '.inkos', 'codex', 'home'), { recursive: true });
+    const other = new Peer(otherRoot), otherOwner = new CodexAuthenticationOwner(other);
+    await otherOwner.admit(other);
+    const settingsPath = join(root, '.inkos', 'agent-config.json'), ownerPath = join(other.codexHome, 'inkos-connection.json');
+    const settingsBefore = readFileSync(settingsPath), ownerBefore = readFileSync(ownerPath);
+    const before = await readAgentSettings(root), requestCount = other.calls.length;
+    await expect(bindCodexModelConnection(root, other, { expectedRevision: before.revision })).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+    expect(other.calls).toHaveLength(requestCount);
+    expect(readFileSync(settingsPath)).toEqual(settingsBefore);
+    expect(await readAgentSettings(root)).toEqual(before);
+    expect(readFileSync(ownerPath)).toEqual(ownerBefore);
+    expect(existsSync(join(root, '.inkos', 'codex', 'home', 'inkos-connection.json'))).toBe(false);
+  });
+
+  it('rejects a trusted project home switch during account/read before writing settings or an owner admission', async () => {
+    const client = new Peer(root), otherHome = join(root, 'replacement-home'); mkdirSync(otherHome);
+    const settingsPath = join(root, '.inkos', 'agent-config.json'), bytes = readFileSync(settingsPath), before = await readAgentSettings(root);
+    const request = client.request.bind(client);
+    client.request = async <T = unknown>(method: string, parameters?: unknown): Promise<T> => {
+      const result = await request<T>(method, parameters);
+      if (method === 'account/read') vi.stubEnv('INKOS_CODEX_HOME', otherHome);
+      return result;
+    };
+    await expect(bindCodexModelConnection(root, client, { expectedRevision: before.revision })).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+    expect(readFileSync(settingsPath)).toEqual(bytes); expect(await readAgentSettings(root)).toEqual(before);
+    expect(existsSync(join(client.codexHome, 'inkos-connection.json'))).toBe(false);
+    expect(existsSync(join(otherHome, 'inkos-connection.json'))).toBe(false);
+  });
+
+  it('accepts a same-physical-home alias without requiring an isolated peer cwd to equal the project', async () => {
+    const client = new Peer(root), alias = join(root, 'home-alias'); symlinkSync(client.codexHome, alias, 'dir');
+    vi.stubEnv('INKOS_CODEX_HOME', alias);
+    Object.defineProperty(client, 'cwd', { value: join(root, 'isolated-worker') });
+    const bound = await bindCodexModelConnection(root, client, { expectedRevision: 1 });
+    expect(bound.modelConnectionRef).toBe(new CodexAuthenticationOwner(client).snapshot()?.connectionRef);
+    expect(bound.revision).toBe(2);
+  });
+
+  it('reports an absent default service tier as unknown rather than inventing catalog evidence', async () => {
+    const client = new Peer(root), request = client.request.bind(client);
+    client.request = async <T = unknown>(method: string, parameters?: unknown): Promise<T> => {
+      const result = await request<T>(method, parameters);
+      if (method === 'model/list') for (const model of (result as unknown as { data: Record<string, unknown>[] }).data) delete model.defaultServiceTier;
+      return result;
+    };
+    const observed = await observeCodexRuntime(client);
+    expect(observed.ready).toBe(true);
+    expect(observed.descriptor?.capabilities?.nativeDefaults.serviceTier).toBeNull();
+    expect(observed.nativeDefaultsEvidence?.serviceTier).toBe('unknown');
+    mocks.create.mockResolvedValue(client);
+    await withCodexExecution(root, async () => {
+      const result = await executeBoundary();
+      expect(result.turn.requested.serviceTier).toBeNull();
+      expect(result.peer.calls.find(call => call.method === 'turn/start')!.params).not.toHaveProperty('serviceTierForTurn');
+    });
   });
 
   it('resolves all three saved nulls to native values, keeps saved bytes/preferences, and exposes only actual ACK fields', async () => {

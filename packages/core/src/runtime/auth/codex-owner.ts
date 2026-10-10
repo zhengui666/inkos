@@ -7,12 +7,17 @@ import { withBookLockGuard } from '../../state/book-lock-guard.js';
 import type { ModelConnectionAdmission, RuntimeSelection } from '../contracts.js';
 
 const OWNER_FILE = 'inkos-connection.json';
+const DigestRefSchema = z.string().regex(/^[a-f0-9]{64}$/);
+const IdentityRefsSchema = z.object({ email: DigestRefSchema.nullable(), accountId: DigestRefSchema.nullable() }).strict();
+type IdentityRefs = z.infer<typeof IdentityRefsSchema>;
+// Legacy v1 records used one prefixed hash; retain their version, generation and ref.
+const IdentityRefSchema = z.union([z.string().regex(/^(email|account):[a-f0-9]{64}$/), IdentityRefsSchema]).nullable();
 const RecordSchema = z.object({
   schemaVersion: z.literal(1), harnessId: z.literal('codex'),
   authContextRef: z.string().min(1), connectionRef: z.string().min(1),
   authGeneration: z.number().int().positive().safe(),
   localState: z.enum(['ready', 'disconnected', 'transitioning', 'unknown']),
-  operationId: z.string().nullable(), identityRef: z.string().nullable(),
+  operationId: z.string().nullable(), identityRef: IdentityRefSchema,
 }).strict().refine(record => (record.localState === 'transitioning') === (record.operationId !== null), 'Invalid authentication operation state');
 export type CodexConnectionRecord = z.infer<typeof RecordSchema>;
 export type CodexAuthOperation = Readonly<{ operationId: string; authGeneration: number }>;
@@ -45,17 +50,32 @@ export function codexAuthenticationContext(client: Pick<CodexClient, 'codexHome'
   return Object.freeze({ home, harnessId: 'codex', authContextRef: `codex-context-${digest(home)}` });
 }
 
-function accountEvidence(value: unknown): { authenticated: boolean; identityRef: string | null } {
+function identities(value: z.infer<typeof IdentityRefSchema>): IdentityRefs {
+  if (value === null) return { email: null, accountId: null };
+  if (typeof value !== 'string') return value;
+  if (value.startsWith('email:')) return { email: value.slice(6), accountId: null };
+  if (value.startsWith('account:')) return { email: null, accountId: value.slice(8) };
+  throw new RuntimeAuthenticationError('Cannot compare the legacy Codex account identity');
+}
+function accountEvidence(value: unknown): { authenticated: boolean; identityRef: IdentityRefs } {
   const response = object(value), account = object(response.account), routing = object(response.workspaceRouting);
   // requiresOpenaiAuth=false never exempts this check, including loopback providers.
   const authenticated = account.type === 'chatgpt';
-  const identity = typeof routing.chatgptAccountId === 'string' && routing.chatgptAccountId
-    ? `account:${routing.chatgptAccountId}`
-    : typeof account.email === 'string' && account.email ? `email:${account.email}` : null;
-  return { authenticated, identityRef: authenticated && identity ? `${identity.split(':', 1)[0]}:${digest(identity)}` : null };
+  return { authenticated, identityRef: {
+    email: authenticated && typeof account.email === 'string' && account.email ? digest(`email:${account.email}`) : null,
+    accountId: authenticated && typeof routing.chatgptAccountId === 'string' && routing.chatgptAccountId ? digest(`account:${routing.chatgptAccountId}`) : null,
+  } };
 }
-const changedIdentity = (before: string | null, after: string | null) => before !== null && after !== null
-  && before.split(':', 1)[0] === after.split(':', 1)[0] && before !== after;
+function changedIdentity(before: z.infer<typeof IdentityRefSchema>, after: z.infer<typeof IdentityRefSchema>): boolean {
+  const previous = identities(before), next = identities(after);
+  const keys = ['email', 'accountId'] as const;
+  const comparable = keys.filter(key => previous[key] !== null && next[key] !== null);
+  if (comparable.some(key => previous[key] !== next[key])) return true;
+  // Two known but disjoint identity kinds cannot prove continuity. All-null account
+  // metadata remains valid; learning an ID alongside the same email remains valid.
+  return comparable.length === 0 && keys.some(key => previous[key] !== null) && keys.some(key => next[key] !== null);
+}
+const hasIdentity = (value: z.infer<typeof IdentityRefSchema>) => Object.values(identities(value)).some(identity => identity !== null);
 
 /**
  * Shared non-secret application revocation record. This is not a provider token
@@ -105,11 +125,10 @@ export class CodexAuthenticationOwner {
     return this.write({ ...record, ...patch, authGeneration: record.authGeneration + 1 });
   }
   /** A newly available identity improves later comparisons without revoking this epoch. */
-  private learnIdentity(record: CodexConnectionRecord, identityRef: string | null): CodexConnectionRecord {
-    if (identityRef !== null && (record.identityRef === null
-      || (record.identityRef.startsWith('email:') && identityRef.startsWith('account:')))) {
-      return this.write({ ...record, identityRef });
-    }
+  private learnIdentity(record: CodexConnectionRecord, identityRef: IdentityRefs): CodexConnectionRecord {
+    const previous = identities(record.identityRef);
+    const merged = { email: identityRef.email ?? previous.email, accountId: identityRef.accountId ?? previous.accountId };
+    if (merged.email !== previous.email || merged.accountId !== previous.accountId) return this.write({ ...record, identityRef: merged });
     return record;
   }
   snapshot(): CodexConnectionRecord | undefined { return this.locked(() => this.read()); }
@@ -126,8 +145,9 @@ export class CodexAuthenticationOwner {
   }
 
   /** Explicit execution admission/revalidation. An in-progress operation stays blocked. */
-  async admit(client: CodexClient, signal?: AbortSignal): Promise<ModelConnectionAdmission> {
+  async admit(client: CodexClient, signal?: AbortSignal, assertTrustedContext?: () => void): Promise<ModelConnectionAdmission> {
     signal?.throwIfAborted();
+    assertTrustedContext?.();
     this.assertContext(client);
     const before = this.snapshot();
     let evidence: ReturnType<typeof accountEvidence>;
@@ -135,6 +155,7 @@ export class CodexAuthenticationOwner {
     catch { signal?.throwIfAborted(); throw new RuntimeAuthenticationError('Codex authentication could not be admitted'); }
     signal?.throwIfAborted();
     this.assertContext(client);
+    assertTrustedContext?.();
     if (before?.localState === 'transitioning') throw new RuntimeAuthenticationError('A Codex authentication operation is still pending; reconcile it without replaying login');
     const record = this.locked(() => {
       const current = this.read();
@@ -147,7 +168,7 @@ export class CodexAuthenticationOwner {
         identityRef: evidence.identityRef });
       if (value.localState === 'ready') return this.learnIdentity(value, evidence.identityRef);
       // unknown is reconciled only by a fresh execution admission, never by retrying OAuth.
-      return this.write({ ...value, localState: 'ready', operationId: null, identityRef: evidence.identityRef ?? value.identityRef });
+      return this.write({ ...value, localState: 'ready', operationId: null, identityRef: hasIdentity(evidence.identityRef) ? evidence.identityRef : value.identityRef });
     });
     if (record.localState !== 'ready') throw new RuntimeAuthenticationError('Sign in with ChatGPT before starting a text task');
     return this.admission(record);
@@ -171,7 +192,7 @@ export class CodexAuthenticationOwner {
       const current = this.read();
       if (current?.localState === 'ready' && (!evidence.authenticated || changedIdentity(current.identityRef, evidence.identityRef))) {
         this.bump(current, { localState: 'disconnected', operationId: null,
-          ...(evidence.identityRef ? { identityRef: evidence.identityRef } : {}) });
+          ...(hasIdentity(evidence.identityRef) ? { identityRef: evidence.identityRef } : {}) });
       } else if (current?.localState === 'ready') this.learnIdentity(current, evidence.identityRef);
     });
   }
@@ -197,7 +218,7 @@ export class CodexAuthenticationOwner {
         if (current?.localState === 'ready' && (!first.authenticated || !last.authenticated
           || changedIdentity(first.identityRef, last.identityRef) || changedIdentity(current.identityRef, last.identityRef))) {
           this.bump(current, { localState: 'disconnected', operationId: null,
-            ...(last.identityRef ? { identityRef: last.identityRef } : {}) });
+            ...(hasIdentity(last.identityRef) ? { identityRef: last.identityRef } : {}) });
           return unknown('account-changed-during-probe');
         }
         if (!first.authenticated || !last.authenticated || changedIdentity(first.identityRef, last.identityRef)) return unknown('chatgpt-account-unverified');
@@ -209,7 +230,7 @@ export class CodexAuthenticationOwner {
           localState: current.localState, operationId: current.operationId }) : null;
         return Object.freeze({ harnessId: 'codex', authContextRef: this.context.authContextRef, owner,
           account: Object.freeze({ type: 'chatgpt', planType: typeof account.planType === 'string' ? account.planType : null,
-            identityPresent: last.identityRef !== null }), value, ready: true, readyReasons: Object.freeze([]) });
+            identityPresent: hasIdentity(last.identityRef) }), value, ready: true, readyReasons: Object.freeze([]) });
       });
     } catch (error) {
       signal?.throwIfAborted();
@@ -218,8 +239,9 @@ export class CodexAuthenticationOwner {
     }
   }
   /** Read/version -> live account/read -> unchanged read/version, with no network under lock. */
-  async guard(target: CodexAuthenticationTarget, client: CodexClient, signal?: AbortSignal): Promise<void> {
+  async guard(target: CodexAuthenticationTarget, client: CodexClient, signal?: AbortSignal, assertTrustedContext?: () => void): Promise<void> {
     signal?.throwIfAborted();
+    assertTrustedContext?.();
     this.assertContext(client);
     if (!this.matches(this.snapshot(), target)) throw new RuntimeAuthenticationError();
     let evidence: ReturnType<typeof accountEvidence>;
@@ -227,6 +249,7 @@ export class CodexAuthenticationOwner {
     catch (error) { signal?.throwIfAborted(); throw new RuntimeAuthenticationError('Codex authentication could not be revalidated'); }
     signal?.throwIfAborted();
     this.assertContext(client);
+    assertTrustedContext?.();
     this.locked(() => {
       const current = this.read();
       if (!this.matches(current, target)) throw new RuntimeAuthenticationError();

@@ -8,7 +8,7 @@ export const CODEX_ADAPTER_VERSION = `codex-app-server-${CODEX_APP_SERVER_VERSIO
 export interface CodexNativeDefaultsEvidence {
   readonly model: 'config/read' | 'model/list-default';
   readonly effort: 'config/read' | 'model/list-default';
-  readonly serviceTier: 'config/read' | 'model/list-default';
+  readonly serviceTier: 'config/read' | 'model/list-default' | 'unknown';
 }
 const object = (value: unknown): Record<string, unknown> => value && typeof value === 'object' ? value as Record<string, unknown> : {};
 
@@ -32,7 +32,9 @@ export class CodexRuntimeAdapter implements HarnessAdapter {
     const tier = typeof config.service_tier === 'string' ? config.service_tier : native.defaultServiceTier;
     this.nativeDefaultsEvidence = Object.freeze({ model: typeof config.model === 'string' && config.model ? 'config/read' : 'model/list-default',
       effort: typeof config.model_reasoning_effort === 'string' ? 'config/read' : 'model/list-default',
-      serviceTier: typeof config.service_tier === 'string' ? 'config/read' : 'model/list-default' });
+      // readCodexModels normalizes absent/malformed defaults to null. That null
+      // carries no catalog provenance and cannot be advertised as an observed default.
+      serviceTier: typeof config.service_tier === 'string' ? 'config/read' : native.defaultServiceTier !== null ? 'model/list-default' : 'unknown' });
     return HarnessDescriptorSchema.parse({ harnessId: 'codex', adapterVersion: this.adapterVersion,
       runtimeVersion: CODEX_APP_SERVER_VERSION, installation: 'installed', deployment: 'supported', ready: true, readyReasons: [],
       capabilities: { harnessId: 'codex', adapterVersion: this.adapterVersion,

@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -147,9 +147,58 @@ describe('managed Codex authentication owner', () => {
     f.setAccount({ account: { type: 'chatgpt', email: 'first@example.test' } });
     await f.owner.guard(target(admitted), f.client);
     expect(f.owner.snapshot()?.authGeneration).toBe(admitted.authGeneration);
-    expect(f.owner.snapshot()?.identityRef).toMatch(/^email:/);
+    expect(f.owner.snapshot()?.identityRef).toEqual({ email: expect.stringMatching(/^[a-f0-9]{64}$/), accountId: null });
     f.setAccount({ account: { type: 'chatgpt', email: 'second@example.test' } });
     await expect(f.owner.guard(target(admitted), f.client)).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
     expect(f.owner.snapshot()?.authGeneration).toBe(admitted.authGeneration + 1);
+  });
+
+  it.each(['admit', 'observe', 'probe', 'guard'] as const)('revokes a changed email when an account ID first appears (%s)', async method => {
+    const f = fixture(); f.setAccount({ account: { type: 'chatgpt', email: 'a@example.test' } });
+    const admitted = await f.owner.admit(f.client), selected = target(admitted);
+    const changed = { account: { type: 'chatgpt', email: 'b@example.test' }, workspaceRouting: { chatgptAccountId: 'account-b' } };
+    f.setAccount(changed);
+    if (method === 'guard') await expect(f.owner.guard(selected, f.client)).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+    if (method === 'admit') expect((await f.owner.admit(f.client)).authGeneration).toBe(admitted.authGeneration + 1);
+    if (method === 'observe') f.owner.observe(f.client, changed);
+    if (method === 'probe') expect((await f.owner.probe(f.client, async () => ({}))).ready).toBe(false);
+    expect(f.owner.snapshot()).toMatchObject({ connectionRef: admitted.connection.connectionRef, authGeneration: admitted.authGeneration + 1 });
+    await expect(f.owner.guard(selected, f.client)).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+    expect(readFileSync(join(f.home, 'inkos-connection.json'), 'utf8')).not.toMatch(/a@example.test|b@example.test|account-b/);
+  });
+
+  it.each(['admit', 'observe', 'probe', 'guard'] as const)('learns a new account ID alongside the same email without discarding that email (%s)', async method => {
+    const f = fixture(); f.setAccount({ account: { type: 'chatgpt', email: 'a@example.test' } });
+    const admitted = await f.owner.admit(f.client), selected = target(admitted);
+    const richer = { account: { type: 'chatgpt', email: 'a@example.test' }, workspaceRouting: { chatgptAccountId: 'account-a' } };
+    f.setAccount(richer);
+    if (method === 'guard') await f.owner.guard(selected, f.client);
+    if (method === 'admit') expect(await f.owner.admit(f.client)).toEqual(admitted);
+    if (method === 'observe') f.owner.observe(f.client, richer);
+    if (method === 'probe') expect((await f.owner.probe(f.client, async () => ({}))).ready).toBe(true);
+    expect(f.owner.snapshot()).toMatchObject({ authGeneration: admitted.authGeneration,
+      identityRef: { email: expect.stringMatching(/^[a-f0-9]{64}$/), accountId: expect.stringMatching(/^[a-f0-9]{64}$/) } });
+    f.setAccount({ account: { type: 'chatgpt', email: 'a@example.test' } });
+    await f.owner.guard(selected, f.client);
+    expect(f.owner.snapshot()?.authGeneration).toBe(admitted.authGeneration);
+    f.setAccount({ account: { type: 'chatgpt', email: 'b@example.test' } });
+    await expect(f.owner.guard(selected, f.client)).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+    expect(f.owner.snapshot()?.authGeneration).toBe(admitted.authGeneration + 1);
+  });
+
+  it('reads a legacy one-identity record without losing its generation, connection ref or comparable email', async () => {
+    const f = fixture(); f.setAccount({ account: { type: 'chatgpt', email: 'a@example.test' } });
+    const admitted = await f.owner.admit(f.client), record = f.owner.snapshot()!;
+    const email = typeof record.identityRef === 'object' ? record.identityRef!.email : null;
+    writeFileSync(join(f.home, 'inkos-connection.json'), JSON.stringify({ ...record, identityRef: `email:${email}` }));
+    const original = readFileSync(join(f.home, 'inkos-connection.json'));
+    const restarted = new CodexAuthenticationOwner(f.client);
+    expect(restarted.snapshot()).toMatchObject({ connectionRef: admitted.connection.connectionRef, authGeneration: admitted.authGeneration });
+    expect(readFileSync(join(f.home, 'inkos-connection.json'))).toEqual(original);
+    f.setAccount({ account: { type: 'chatgpt', email: 'a@example.test' }, workspaceRouting: { chatgptAccountId: 'account-a' } });
+    expect(await restarted.admit(f.client)).toEqual(admitted);
+    f.setAccount({ account: { type: 'chatgpt', email: 'b@example.test' }, workspaceRouting: { chatgptAccountId: 'account-a' } });
+    await expect(restarted.guard(target(admitted), f.client)).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+    expect(restarted.snapshot()?.authGeneration).toBe(admitted.authGeneration + 1);
   });
 });

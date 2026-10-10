@@ -1,4 +1,5 @@
 import { resolve } from 'node:path';
+import { realpathSync } from 'node:fs';
 import { createCodexClient } from '../codex/client.js';
 import { resolveCodexHome } from '../codex/app-server.js';
 import type { CodexClient } from '../codex/app-server.js';
@@ -36,6 +37,22 @@ export async function observeCodexRuntime(client: CodexClient, signal?: AbortSig
     nativeDefaultsEvidence: descriptor ? adapter.nativeDefaultsEvidence : null });
 }
 
+function trustedProjectContext(projectRoot: string, client: CodexClient, configuredHome = resolveCodexHome(projectRoot)): () => void {
+  // Expected context comes exclusively from trusted project/deployment resolution.
+  // A peer may execute in an isolated cwd; neither cwd nor ref establishes authority.
+  let expectedHome: string;
+  try { expectedHome = realpathSync(configuredHome); }
+  catch { throw new RuntimeAuthenticationError('Cannot resolve the project Codex context'); }
+  const assertTrustedContext = () => {
+    let configured: string, actual: string;
+    try { configured = realpathSync(resolveCodexHome(projectRoot)); actual = realpathSync(client.codexHome); }
+    catch { throw new RuntimeAuthenticationError('Cannot verify the project Codex context'); }
+    if (configured !== expectedHome || actual !== expectedHome) throw new RuntimeAuthenticationError('The client does not belong to the current project Codex context');
+  };
+  assertTrustedContext();
+  return assertTrustedContext;
+}
+
 /** Only the trusted peer supplies the connection ref. A browser supplies expectedRevision. */
 export async function bindCodexModelConnection(projectRoot: string, client: CodexClient, options: {
   expectedRevision: number; signal?: AbortSignal;
@@ -43,9 +60,11 @@ export async function bindCodexModelConnection(projectRoot: string, client: Code
   const settings = await readAgentSettings(projectRoot);
   if (settings.revision !== options.expectedRevision) throw new AgentSettingsConflictError(options.expectedRevision, settings.revision);
   if (settings.selectedHarnessId !== 'codex') throw new RuntimeAuthenticationError('Binding requires the selected Codex harness');
-  const owner = new CodexAuthenticationOwner(client), admitted = await owner.admit(client, options.signal);
+  const assertTrustedContext = trustedProjectContext(projectRoot, client);
+  const owner = new CodexAuthenticationOwner(client), admitted = await owner.admit(client, options.signal, assertTrustedContext);
   await owner.guard({ harnessId: 'codex', authContextRef: admitted.authContextRef,
-    connectionRef: admitted.connection.connectionRef, authGeneration: admitted.authGeneration }, client, options.signal);
+    connectionRef: admitted.connection.connectionRef, authGeneration: admitted.authGeneration }, client, options.signal, assertTrustedContext);
+  assertTrustedContext();
   return updateAgentSettings(projectRoot, { modelConnectionRef: admitted.connection.connectionRef }, { expectedRevision: options.expectedRevision });
 }
 
@@ -66,13 +85,15 @@ export async function withCodexExecution<T>(projectRoot: string, task: () => Pro
   let leased = false;
   const peers = new Set<CodexClient>();
   try {
+    const assertProjectContext = trustedProjectContext(projectRoot, client, configuredHome);
     const owner = new CodexAuthenticationOwner(client);
-    const connection = await owner.admit(client, options.signal);
+    const connection = await owner.admit(client, options.signal, assertProjectContext);
     const adapter = new CodexRuntimeAdapter(client, options.signal);
     const harness = await adapter.describe();
     // A verified existing login may bind for execution. Config GET/preload never calls this.
     for (let attempt = 0; settings.modelConnectionRef === null; attempt++) {
       if (attempt >= 8) throw new Error('Agent configuration kept changing during connection binding');
+      assertProjectContext();
       try { settings = await updateAgentSettings(projectRoot, { modelConnectionRef: connection.connection.connectionRef }, { expectedRevision: settings.revision }); }
       catch (error) {
         if ((error as { code?: string }).code !== 'AGENT_SETTINGS_REVISION_CONFLICT') throw error;
@@ -91,9 +112,8 @@ export async function withCodexExecution<T>(projectRoot: string, task: () => Pro
       authContext: { harnessId: 'codex', authContextRef: owner.context.authContextRef }, connection });
     const assertTrustedContext = () => {
       // Deployment context is independently resolved again; it is never reconstructed from a ref.
-      if (resolveCodexHome(projectRoot) !== configuredHome) {
-        owner.disconnect(); throw new RuntimeAuthenticationError('The configured Codex context changed');
-      }
+      try { assertProjectContext(); }
+      catch (error) { owner.disconnect(); throw error; }
     };
     const context: CodexRunContext = {
       projectRoot: resolve(projectRoot), saved, selection, owner,
@@ -105,11 +125,11 @@ export async function withCodexExecution<T>(projectRoot: string, task: () => Pro
       },
       async guard(peer, signal) {
         assertTrustedContext();
-        if (peer) { await owner.guard(selection, peer, signal); assertTrustedContext(); return; }
+        if (peer) { await owner.guard(selection, peer, signal, assertTrustedContext); return; }
         const active = [...peers].find(peer => !peer.closed);
-        if (active) { await owner.guard(selection, active, signal); assertTrustedContext(); return; }
+        if (active) { await owner.guard(selection, active, signal, assertTrustedContext); return; }
         const probe = await createCodexClient(projectRoot);
-        try { await owner.guard(selection, probe, signal); assertTrustedContext(); } finally { await probe.close(); }
+        try { await owner.guard(selection, probe, signal, assertTrustedContext); } finally { await probe.close(); }
       },
     };
     await context.guard(client, options.signal);
