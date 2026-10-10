@@ -1,4 +1,5 @@
 import { registerCreationTaskRoutes } from './creation-tasks.js';
+import { createAgentConfigurationDependencies, createAgentConfigurationRoutes } from './agent-configuration.js';
 import { Hono } from "hono";
 import { StudioDaemonController } from "./daemon-controller.js";
 import { cors } from "hono/cors";
@@ -2641,6 +2642,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 
   const codexAccountService = overrides.codexAccountService ?? createCodexAccountService({ projectDir: root });
   app.route("/api/v1/codex", createCodexRoutes(codexAccountService));
+  app.route("/api/v1/agent-configuration", createAgentConfigurationRoutes(root, createAgentConfigurationDependencies(root, codexAccountService)));
 
   // BookId validation middleware — blocks path traversal on all book routes
   app.use("/api/v1/books/:id/*", async (c, next) => {
@@ -4302,7 +4304,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     // No request may reopen its temporary stores while the runtime drains.
     creationTasks.close();
     try { await daemon.shutdown(); }
-    finally { await Promise.all([...closeEventStreams].map(close => close())); }
+    finally {
+      try { await Promise.all([...closeEventStreams].map(close => close())); }
+      finally { await codexAccountService.dispose().catch(() => { throw new Error("Codex account connection did not close cleanly."); }); }
+    }
   });
 
   app.get("/api/v1/daemon", (c) => c.json(daemon.status()));
@@ -6733,10 +6738,6 @@ export async function startStudioServer(
       process.exitCode = 1;
     } finally {
       await closed;
-      await codexAccountService.dispose().catch(() => {
-        console.warn("[studio] Codex account connection did not close cleanly.");
-        process.exitCode = 1;
-      });
       process.removeListener("SIGTERM", close);
       process.removeListener("SIGINT", close);
     }

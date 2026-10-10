@@ -3,19 +3,31 @@ import type { SaveIntent, SelectionIntent, TargetView, TextView, ConnectionInten
 import { sameTarget } from "../components/agent-configuration-ui/view-model";
 import { toPreferences } from "../pages/agent-configuration-adapter";
 import { samePreferences, validScope, type AgentSettings, type HarnessId, type HarnessPreferences, type HarnessState, type SettingsUpdate } from "../shared/agent-configuration";
+import type { StudioCodexLogin } from "../shared/codex";
 
 export interface AgentConfigurationTransport {
   readSettings(signal: AbortSignal): Promise<AgentSettings>;
   saveSettings(request: SettingsUpdate, signal: AbortSignal): Promise<AgentSettings>;
   readHarnessState(harness: HarnessId, signal: AbortSignal): Promise<HarnessState>;
+  startLogin?(signal: AbortSignal): Promise<StudioCodexLogin>;
+  cancelLogin?(loginId: string, signal: AbortSignal): Promise<void>;
+  logout?(signal: AbortSignal): Promise<void>;
+  bindConnection?(expectedRevision: number, signal: AbortSignal): Promise<AgentSettings>;
 }
 export function createAgentConfigurationTransport(fetchImpl?: typeof fetch): AgentConfigurationTransport {
+  const post = <T>(action: string, body: unknown, signal: AbortSignal) => fetchJson<T>(`/agent-configuration/harnesses/codex/${action}`, {
+    method: "POST", signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  }, { fetchImpl });
   return {
     readSettings: async signal => (await fetchJson<{ settings: AgentSettings }>("/agent-configuration/settings", { signal }, { fetchImpl })).settings,
     saveSettings: async (request, signal) => (await fetchJson<{ settings: AgentSettings }>("/agent-configuration/settings", {
       method: "PUT", signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(request),
     }, { fetchImpl })).settings,
     readHarnessState: async (harness, signal) => (await fetchJson<{ state: HarnessState }>(`/agent-configuration/harnesses/${harness}/state`, { signal }, { fetchImpl })).state,
+    startLogin: async signal => (await post<{ login: StudioCodexLogin }>("login", {}, signal)).login,
+    cancelLogin: async (loginId, signal) => { await post("login/cancel", { loginId }, signal); },
+    logout: async signal => { await post("logout", {}, signal); },
+    bindConnection: async (expectedRevision, signal) => (await post<{ settings: AgentSettings }>("bind", { expectedRevision }, signal)).settings,
   };
 }
 interface DraftVersion { readonly preferences: HarnessPreferences; readonly baselineRevision: number | null; readonly edits: number; readonly dirty: boolean }
@@ -43,6 +55,8 @@ export interface AgentConfigurationSnapshot {
   readonly hasChanges: boolean;
   readonly canSave: boolean;
   readonly reviewable: boolean;
+  readonly authBusy: "login" | "cancel" | "logout" | "bind" | null;
+  readonly authDetail?: TextView;
 }
 class RequestTimeout extends Error {}
 const key = (target: TargetView) => JSON.stringify([target.harness, target.contextKey]);
@@ -77,6 +91,10 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   let stateEpoch = 0;
   let saveEpoch = 0;
   let entryEdits = 0;
+  let authDetail: TextView | undefined;
+  type AuthenticationOperation = { action: "login" | "cancel" | "logout" | "bind"; token: ReturnType<typeof capture>; closeRequested: boolean;
+    loginId?: string; cancelReturnedLogin?: (id: string) => Promise<void>; cancellation?: Promise<void>; reconciliation?: Promise<void> };
+  let authentication: AuthenticationOperation | null = null;
   const drafts = new Map<string, Draft>();
   const listeners = new Set<() => void>();
   const requests = new Set<AbortController>();
@@ -97,6 +115,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     }
     const hasChanges = baseline !== null && (baseline.selectedHarnessId !== target.harness || !samePreferences(current.preferences, baseline.harnessPreferences[target.harness]));
     snapshot = Object.freeze({ target, ownerGeneration, baseline, revision: current.baselineRevision, draft: current.preferences, retainedDrafts: current.retained ?? Object.freeze([]), state, submitted, loading, savePhase, detail, hasChanges, reviewable,
+      authBusy: authentication?.action ?? null, authDetail,
       canSave: baseline !== null && current.baselineRevision !== null && !["saving", "conflict", "uncertain"].includes(savePhase) });
     for (const listener of listeners) listener();
   }
@@ -105,6 +124,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     for (const request of requests) request.abort();
     if (savePhase === "saving") { savePhase = "uncertain"; detail = uncertain; reviewable = false; }
     loading = false;
+    authentication = null;
   }
   function capture() { return { lifetime, target, ownerGeneration }; }
   function current(token: ReturnType<typeof capture>) {
@@ -159,7 +179,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
         if (savePhase !== "uncertain") detail = { zh: "观察目标或上下文不匹配，旧连接状态已失效。", en: "Observation target or context does not match. Previous connection evidence is invalidated." };
         publish(); return;
       }
-      if (value.scope && ownerGeneration !== null && value.scope.ownerGeneration < ownerGeneration) return;
+      if (value.scope && ownerGeneration !== null && value.scope.ownerGeneration !== null && value.scope.ownerGeneration < ownerGeneration) return;
       if (value.availability === "available" && value.scope) {
         if (target.contextKey === "unobserved") {
           const previous = draft(); const entryKey = key(target);
@@ -189,6 +209,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     followSavedHarness = false;
     if (disposed || sameTarget(target, next)) return;
     invalidate(); target = Object.freeze({ ...next }); ownerGeneration = null; state = null;
+    authDetail = undefined;
     submitted = null;
     const currentDraft = draft();
     if (baseline && !currentDraft.dirty && !currentDraft.contextConflict) drafts.set(key(target), { ...currentDraft, preferences: baseline.harnessPreferences[target.harness], baselineRevision: baseline.revision });
@@ -251,16 +272,102 @@ export function createAgentConfigurationController(transport: AgentConfiguration
       savePhase = "unsaved"; detail = undefined; publish();
     }
   }
+  async function accountAction(action: "login" | "cancel" | "logout", loginId?: string) {
+    if (disposed || authentication || target.harness !== "codex") return;
+    if (!transport.startLogin || !transport.cancelLogin || !transport.logout) {
+      authDetail = { zh: "认证接口不可用，请核对连接状态。", en: "Authentication endpoints are unavailable. Check connection status." }; publish(); return;
+    }
+    invalidate(); state = null; ownerGeneration = null;
+    const operation: AuthenticationOperation = { action, token: capture(), closeRequested: false };
+    authentication = operation; authDetail = undefined; publish();
+    const cancelClosedLogin = (id: string) => operation.cancellation ??= request(signal => transport.cancelLogin!(id, signal));
+    operation.cancelReturnedLogin = cancelClosedLogin;
+    try {
+      if (action === "login") {
+        const login = await request(signal => {
+          const pending = transport.startLogin!(signal);
+          // Explicit Close can outlive an aborted/timed-out HTTP response. Cancel only its returned attempt.
+          void pending.then(value => {
+            operation.loginId = value.loginId;
+            if (operation.closeRequested) void cancelClosedLogin(value.loginId).catch(() => undefined);
+          }, () => undefined);
+          return pending;
+        });
+        if (operation.closeRequested) await cancelClosedLogin(login.loginId);
+      } else if (action === "cancel") await request(signal => transport.cancelLogin!(loginId!, signal));
+      else await request(signal => transport.logout!(signal));
+      if (!current(operation.token) || authentication !== operation) return;
+      authDetail = { zh: "操作已返回，请以当前连接观察为准。执行仍尚未验证。", en: "The operation returned. Check the current connection observation; execution remains unverified." };
+      await refreshState();
+      if (operation.reconciliation) await operation.reconciliation;
+    } catch {
+      if (current(operation.token) && authentication === operation) {
+        authDetail = { zh: "认证操作结果不确定，请核对当前状态；不会自动重新登录。", en: "Authentication outcome is uncertain. Check current status; sign-in will not be replayed automatically." };
+        await refreshState();
+      }
+    } finally { if (authentication === operation) authentication = null; publish(); }
+  }
+  async function bindConnection() {
+    if (disposed || authentication || target.harness !== "codex" || !transport.bindConnection || !snapshot.canSave || !baseline
+      || baseline.selectedHarnessId !== "codex" || !state?.account || state.scope?.authContextRef !== target.contextKey) return;
+    const expectedRevision = draft().baselineRevision!;
+    invalidate(); state = null; ownerGeneration = null;
+    const operation = { action: "bind" as const, token: capture(), closeRequested: false };
+    authentication = operation; authDetail = undefined; publish();
+    try {
+      const result = await request(signal => transport.bindConnection!(expectedRevision, signal));
+      if (!current(operation.token) || authentication !== operation) return;
+      if (baseline && result.revision < baseline.revision) throw new ApiResponseError("Settings changed", 409, undefined);
+      const latest = draft(); baseline = freezeSettings(result);
+      drafts.set(key(target), { ...latest, baselineRevision: result.revision, dirty: !samePreferences(latest.preferences, result.harnessPreferences[target.harness]) });
+      authDetail = { zh: "模型连接绑定已保存；执行尚未验证。", en: "Model connection binding saved; execution remains unverified." };
+      await refreshState();
+    } catch (error) {
+      if (!current(operation.token) || authentication !== operation) return;
+      if (error instanceof ApiResponseError && error.status === 409) {
+        savePhase = "conflict"; reviewable = false; detail = changed; publish(); await refreshSettings(true);
+      } else if (error instanceof ApiResponseError && [400, 403, 422, 503].includes(error.status)) {
+        authDetail = { zh: "绑定被拒绝或不可用，草稿已保留。", en: "Binding was rejected or unavailable. Your draft is retained." };
+      } else {
+        savePhase = "uncertain"; reviewable = false; detail = uncertain; publish(); await refreshSettings(true);
+      }
+    } finally { if (authentication === operation) authentication = null; publish(); }
+  }
   function connectionIntent(intent: ConnectionIntent) {
     if (disposed || !sameTarget(target, intent.target)) return;
     if (intent.action === "refresh-connection") { void refreshState(); return; }
-    detail = { zh: "认证操作尚未接线；未发送登录、退出或取消请求。", en: "Authentication operations are not wired. No sign-in, sign-out or cancel request was sent." }; publish();
+    if (target.harness !== "codex") return;
+    if (intent.action === "connect" && ["signed-out", "failed"].includes(state?.connection?.phase ?? "")) void accountAction("login");
+    if (intent.action === "sign-out" && state?.account?.type === "chatgpt") void accountAction("logout");
+    if (intent.action === "cancel-sign-in" && state?.connection?.login?.status === "pending" && state.connection.login.loginId === intent.attemptKey) void accountAction("cancel", intent.attemptKey);
+  }
+  function closeConnection() {
+    if (authentication?.action === "login") {
+      const operation = authentication;
+      operation.closeRequested = true;
+      authDetail = { zh: "关闭请求已记录；收到本次登录标识后将取消此尝试。", en: "Close requested. This attempt will be cancelled when its sign-in ID is returned." }; publish();
+      if (operation.loginId && operation.cancelReturnedLogin && !operation.reconciliation) {
+        // The ID may already have returned while the earlier observation is still in flight.
+        // Fence that read and reconcile only this explicit Close, retaining the target token.
+        stateEpoch++; state = null;
+        operation.reconciliation = operation.cancelReturnedLogin(operation.loginId).then(async () => {
+          if (!current(operation.token) || (authentication !== operation && authentication !== null)) return;
+          authDetail = { zh: "取消请求已返回，请核对当前连接状态。", en: "Cancellation returned. Check the current connection state." };
+          await refreshState();
+        }).catch(() => {
+          if (current(operation.token) && (authentication === operation || authentication === null)) {
+            authDetail = { zh: "取消结果不确定，请核对当前连接状态。", en: "Cancellation outcome is uncertain. Check the current connection state." }; publish();
+          }
+        });
+        publish();
+      }
+    } else if (state?.connection?.login?.status === "pending") void accountAction("cancel", state.connection.login.loginId);
   }
   publish();
   return {
     getSnapshot: () => snapshot,
     subscribe: (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
-    refresh, refreshSettings, refreshState, selectTarget, edit, save, reviewLatest, connectionIntent,
+    refresh, refreshSettings, refreshState, selectTarget, edit, save, reviewLatest, connectionIntent, closeConnection, bindConnection,
     cancel: () => { if (!disposed) { invalidate(); publish(); } },
     dispose: () => { invalidate(); disposed = true; listeners.clear(); },
   };

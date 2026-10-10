@@ -39,6 +39,12 @@ describe("pure owner evidence mapping", () => {
     expect(adapt(state, 4).connection.accountLabel).toBeUndefined();
     expect(adapt({ ...state, scope: { ...scope, authContextRef: "old-context" } }).connection.accountLabel).toBeUndefined();
   });
+  it("retains a pending attempt and hides the prior account label while admission is pending", () => {
+    const view = adapt({ ...state, connection: { phase: "signing-in", login: { loginId: "current-attempt", status: "pending" }, connectionRef: null } });
+    expect(view.connection.phase).toBe("signing-in");
+    expect(view.connection.attemptKey).toBe("current-attempt");
+    expect(view.connection.accountLabel).toBeUndefined();
+  });
   it("requires an actual chatgpt account type rather than inferring login from other evidence", () => {
     const other = { ...state, account: { type: "apiKey", label: "do-not-show" } } as unknown as HarnessState;
     expect(adapt(other).connection.phase).toBe("unverified");

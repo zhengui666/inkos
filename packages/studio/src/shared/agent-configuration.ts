@@ -1,4 +1,5 @@
 import type { AgentSettings, HarnessCapabilityCatalog, HarnessId, HarnessPreferences } from "@actalk/inkos-core";
+import type { StudioCodexLogin } from "./codex.js";
 
 export type { AgentSettings, HarnessId, HarnessPreferences };
 export interface SettingsUpdate {
@@ -10,11 +11,11 @@ export interface SettingsUpdate {
 }
 
 // Studio's credential-free observation envelope. The server owner supplies every scope field.
-// It is not the core owner's pending observe/bind/auth interface.
+// Scope and catalogue tags describe one server observation, not execution admission.
 export interface EvidenceScope {
   readonly harnessId: HarnessId;
   readonly authContextRef: string;
-  readonly ownerGeneration: number;
+  readonly ownerGeneration: number | null;
   readonly adapterVersion: string;
   readonly catalogVersion: string;
 }
@@ -24,6 +25,11 @@ export interface HarnessState {
   readonly scope: EvidenceScope | null;
   readonly installation: "installed" | "missing" | "unknown";
   readonly account: { readonly type: "chatgpt"; readonly label?: string } | null;
+  readonly connection?: {
+    readonly phase: "signed-out" | "signing-in" | "signed-in" | "failed" | "uncertain";
+    readonly login: StudioCodexLogin | null;
+    readonly connectionRef: string | null;
+  };
   readonly catalog: {
     readonly scope: EvidenceScope;
     readonly value: HarnessCapabilityCatalog;
@@ -46,7 +52,7 @@ export function sameScope(a: EvidenceScope, b: EvidenceScope): boolean {
 }
 export function validScope(scope: EvidenceScope): boolean {
   return (scope.harnessId === "codex" || scope.harnessId === "pi") && typeof scope.authContextRef === "string" && scope.authContextRef.length > 0
-    && Number.isSafeInteger(scope.ownerGeneration) && scope.ownerGeneration >= 0
+    && (scope.ownerGeneration === null || (Number.isSafeInteger(scope.ownerGeneration) && scope.ownerGeneration >= 0))
     && typeof scope.adapterVersion === "string" && scope.adapterVersion.length > 0 && typeof scope.catalogVersion === "string" && scope.catalogVersion.length > 0;
 }
 export function catalogMatchesState(state: HarnessState): boolean {

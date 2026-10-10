@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { CodexSettings } from "./CodexSettings";
+import { AgentSettings } from "./AgentSettings";
 import { Bell, Bot, FolderUp, MessageSquare, Radar, Search, Settings2, Plus, Trash2 } from "lucide-react";
 import { fetchJson, postApi, putApi, useApi } from "../hooks/use-api";
 import { usePreferencesStore } from "../store/preferences";
@@ -191,7 +191,7 @@ export function ProjectSettings({ nav, theme, t }: { nav: Nav; theme: Theme; t: 
         </div>
       )}
 
-      <CodexSettings isZh={isZh} />
+      <AgentSettings isZh={isZh} />
 
       {/* Chat UI preferences — applied immediately, persisted in this browser's localStorage */}
       <SettingsCard title={t("settings.chatUi")} description={t("settings.chatUiHint")} icon={<MessageSquare size={18} />}>

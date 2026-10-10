@@ -35,7 +35,9 @@ export function adaptAgentConfiguration(input: ConfigurationAdapterInput): Confi
   const view: ConfigurationView = {
     target, selection: toSelection(draft),
     installation: { target, phase: state?.installation === "installed" ? "installed" : state?.installation === "missing" ? "missing" : "unverified" },
-    connection: { target, phase: connectionObserved ? "signed-in" : "unverified", ...(connectionObserved && state.account?.label ? { accountLabel: state.account.label } : {}),
+    connection: { target, phase: state?.connection?.phase === "signing-in" ? "signing-in" : connectionObserved ? "signed-in" : state?.connection && state.connection.phase !== "signed-in" ? state.connection.phase : "unverified",
+      ...(state?.connection?.phase === "signing-in" && state.connection.login?.status === "pending" ? { attemptKey: state.connection.login.loginId } : {}),
+      ...(connectionObserved && state.connection?.phase !== "signing-in" && state.account?.label ? { accountLabel: state.account.label } : {}),
       ...(!state ? { detail: { zh: "真实连接观察接口尚不可用。", en: "Actual connection observation is unavailable." } } : {}) },
     catalog: { target, phase: catalog && nativeValid ? "available" : "unavailable", models: nativeValid ? models.map(model => ({
       key: model.modelId, label: label(model.modelId), reasoningOptions: model.efforts.map(key => ({ key, label: label(key) })),
