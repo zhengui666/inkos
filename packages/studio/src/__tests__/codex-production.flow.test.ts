@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CodexFixture } from "../../../core/src/__tests__/codex-fixture.js";
 import { FanqieRadarSource, QidianRadarSource } from "../../../core/src/agents/radar-source.js";
 import { createStudioServer } from "../api/server.js";
-import type { CodexAccountService } from "@actalk/inkos-core";
+import { currentCodexRun, observeCodexRuntime, readAgentSettings, updateAgentSettings,
+  type CodexAccountService, type CodexClient, type CodexRunContext } from "@actalk/inkos-core";
 
 const createCodexClient = vi.hoisted(() => vi.fn());
 vi.mock("../../../core/src/codex/client.js", () => ({ createCodexClient }));
@@ -102,12 +103,18 @@ describe("Studio Codex-only production routes", () => {
     expect(await (await app.request("/api/v1/radar/status")).json()).toMatchObject({ running: false, phase: "error" });
   });
 
-  it("executes the direct style worker with the saved model, effort and speed, then sees changed settings next request", async () => {
+  it("executes the direct style worker with saved preferences and applies authoritative CAS changes to the next request", async () => {
     const root = await project(true);
     await mkdir(join(root, ".inkos"));
     const settingsPath = join(root, ".inkos", "codex-config.json");
     await writeFile(settingsPath, JSON.stringify({ model: "fixture", reasoningEffort: "high", serviceTier: "fast" }));
-    const codex = new CodexFixture(() => ({ text: "# Style guide\nUse the supplied evidence." }));
+    const runs: Array<Pick<CodexRunContext, "saved" | "selection">> = [];
+    const codex = new CodexFixture(() => {
+      const runtime = currentCodexRun();
+      if (!runtime) throw new Error("The protocol fixture must run inside its admitted context");
+      runs.push({ saved: runtime.saved, selection: runtime.selection });
+      return { text: "# Style guide\nUse the supplied evidence." };
+    });
     createCodexClient.mockImplementation(async (path: string) => {
       const peer = await codex.createClient(path);
       const request = peer.request.bind(peer);
@@ -119,10 +126,42 @@ describe("Studio Codex-only production routes", () => {
     const response = await app.request("/api/v1/style/analyze", post({ text: "A bell rang. He waited.", sourceName: "fixture" }));
     expect(response.status, await response.clone().text()).toBe(200);
     expect(await response.json()).toMatchObject({ guide: "# Style guide\nUse the supplied evidence." });
-    expect(codex.turns[0]?.turn).toMatchObject({ effort: "high", serviceTier: "fast", serviceTierForTurn: "fast" });
+    const saved = await readAgentSettings(root);
+    expect(saved).toMatchObject({ revision: 1, selectedHarnessId: "codex", modelConnectionRef: expect.any(String),
+      harnessPreferences: { codex: { model: "fixture", effort: "high", speed: "fast" } } });
+    const assertRun = (index: number, effort: "high" | "medium", speed: "fast" | "default", revision: number) => {
+      expect(runs[index]).toMatchObject({ saved: { model: "fixture", effort, speed },
+        selection: { modelId: "fixture", effort, serviceTier: speed, configRevision: revision } });
+      expect(codex.turns[index]?.thread).toMatchObject({ model: "fixture", serviceTier: speed === "default" ? null : "fast" });
+      expect(codex.turns[index]?.turn).toMatchObject({ model: "fixture", effort, serviceTierForTurn: speed === "fast" ? "priority" : "default" });
+      expect(codex.turns[index]?.turn).not.toHaveProperty("serviceTier");
+    };
+    assertRun(0, "high", "fast", saved.revision);
+
+    // The first execution wrote agent-config.json; the legacy file can no longer override it.
     await writeFile(settingsPath, JSON.stringify({ model: "fixture", reasoningEffort: "medium", serviceTier: "default" }));
-    expect((await app.request("/api/v1/style/analyze", post({ text: "Another sample" }))).status).toBe(200);
-    expect(codex.turns[1]?.turn).toMatchObject({ effort: "medium", serviceTier: null, serviceTierForTurn: "default" });
+    expect(await readAgentSettings(root)).toEqual(saved);
+    const legacyResponse = await app.request("/api/v1/style/analyze", post({ text: "Another sample" }));
+    expect(legacyResponse.status, await legacyResponse.clone().text()).toBe(200);
+    expect(await legacyResponse.json()).toMatchObject({ guide: "# Style guide\nUse the supplied evidence." });
+    assertRun(1, "high", "fast", saved.revision);
+    expect(await readAgentSettings(root)).toEqual(saved);
+
+    // The standalone probe is an owned protocol fixture, never a borrowed account-service peer.
+    const probe: CodexClient = await createCodexClient(root);
+    let observation: Awaited<ReturnType<typeof observeCodexRuntime>>;
+    try { observation = await observeCodexRuntime(probe); } finally { await probe.close(); }
+    expect(observation.ready).toBe(true); expect(observation.descriptor?.capabilities).not.toBeNull();
+    const changed = await updateAgentSettings(root, { harnessPreferences: { codex: { effort: "medium", speed: "default" } } },
+      { expectedRevision: saved.revision, catalogs: { codex: observation.descriptor!.capabilities! } });
+    expect(changed).toMatchObject({ revision: saved.revision + 1, modelConnectionRef: saved.modelConnectionRef,
+      harnessPreferences: { codex: { model: "fixture", effort: "medium", speed: "default" } } });
+    const changedResponse = await app.request("/api/v1/style/analyze", post({ text: "Sample after the CAS save" }));
+    expect(changedResponse.status, await changedResponse.clone().text()).toBe(200);
+    expect(await changedResponse.json()).toMatchObject({ guide: "# Style guide\nUse the supplied evidence." });
+    assertRun(2, "medium", "default", changed.revision);
+    assertRun(0, "high", "fast", saved.revision);
+    expect(codex.turns).toHaveLength(3); expect(await readAgentSettings(root)).toEqual(changed);
   });
 
   it("reports genuine missing ChatGPT auth instead of an unrelated API-key gate", async () => {

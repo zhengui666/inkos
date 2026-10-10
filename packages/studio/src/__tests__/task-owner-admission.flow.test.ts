@@ -7,7 +7,13 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentSessionConfig } from "@actalk/inkos-core";
+import { Agent } from "../../../core/src/codex/agent.js";
+import { resolveCodexModel } from "../../../core/src/codex/model.js";
+import { CodexFixture } from "../../../core/src/__tests__/codex-fixture.js";
 import type { StudioTaskSnapshot } from "../api/task-store.js";
+
+const createCodexClient = vi.hoisted(() => vi.fn());
+vi.mock("../../../core/src/codex/client.js", () => ({ createCodexClient }));
 
 const fixture = vi.hoisted(() => ({
   beforeAppend: undefined as (() => Promise<void>) | undefined,
@@ -70,7 +76,7 @@ const apps: ReturnType<typeof createStudioServer>[] = [];
 const children: ChildProcess[] = [];
 const requests: Promise<Response>[] = [];
 const gates: Array<() => void> = [];
-const toolResult = { content: [{ type: "text", text: "Deterministic fixture tool completed." }], details: {} };
+const toolResult = { content: [{ type: "text" as const, text: "Deterministic fixture tool completed." }], details: {} };
 const post = (body: unknown) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
 function gate() {
@@ -81,6 +87,7 @@ function gate() {
 }
 
 beforeEach(() => {
+  createCodexClient.mockReset();
   fixture.beforeAppend = undefined;
   fixture.beforeLoadSession = undefined;
   fixture.appendCalls = 0;
@@ -461,28 +468,33 @@ describe("Studio ownership before the first task snapshot", () => {
 });
 
 
-// Exercise the real awaited Agent tool-start / argument / execute path without
-// opening a model connection. Only the business tool body is a fixture.
+// A deterministic protocol peer drives public Agent admission and tool drain;
+// account/context guards still run with the actual leased fixture client.
 async function executeChatTool(config: AgentSessionConfig, options: {
   name?: string;
   beforeToolCall?: () => Promise<void>;
-  prepareArguments?: (args: Record<string, unknown>) => Promise<Record<string, unknown>>;
+  prepareArguments?: (args: unknown) => Promise<unknown>;
   execute: () => Promise<typeof toolResult>;
 }) {
-  const { Agent } = await import(fileURLToPath(new URL("../../../core/src/codex/agent.ts", import.meta.url)));
   const tool = createShortFictionRunTool(config.pipeline, config.projectRoot);
   const name = options.name ?? "short-fiction__short_fiction_run";
+  const peer = new CodexFixture(turn => turn.messages.some(message => message.role === "tool")
+    ? { text: "Deterministic fixture response." }
+    : { calls: [{ name, args: {}, id: "ordinary-chat-tool" }] });
+  createCodexClient.mockImplementation(peer.createClient);
   const agent = new Agent({
     projectRoot: config.projectRoot,
+    signal: config.signal,
     beforeToolCall: options.beforeToolCall,
     initialState: {
-      model: { id: "deterministic-fixture" }, systemPrompt: "Fixture", messages: [],
+      model: resolveCodexModel({ model: "fixture" }), systemPrompt: "Fixture", messages: [],
       tools: [{ ...tool, name, prepareArguments: options.prepareArguments, execute: options.execute }],
     },
   });
+  if (!config.onEvent) throw new Error("The Studio fixture requires its ownership event listener");
   agent.subscribe(config.onEvent);
-  await agent.executeTool({ type: "toolCall", id: "ordinary-chat-tool", name, arguments: {} }, config.signal ?? new AbortController().signal);
-  return { responseText: "Deterministic fixture response." };
+  await agent.prompt("Run the deterministic fixture tool once.");
+  return { responseText: agent.finalOutput ?? "" };
 }
 
 function chat(app: ReturnType<typeof createStudioServer>, sessionId: string, requestId: string) {
@@ -528,7 +540,7 @@ describe("Studio owner guard at real Agent tool admission", () => {
     });
     fixture.model.mockImplementationOnce(async config => {
       const result = await executeChatTool(config, {
-        ...(stage === "arguments" ? { prepareArguments: async (args: Record<string, unknown>) => { entered.resolve(); await hold.promise; return args; } } : {}),
+        ...(stage === "arguments" ? { prepareArguments: async (args: unknown) => { entered.resolve(); await hold.promise; return args; } } : {}),
         ...(stage === "prepare" ? { beforeToolCall: async () => { entered.resolve(); await hold.promise; } } : {}),
         execute: chatTool,
       });
