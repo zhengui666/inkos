@@ -28,14 +28,15 @@ function worker(projectRoot: string, patch: unknown, expectedRevision: number, l
   const child = spawn(process.execPath, ['--experimental-transform-types', '--input-type=module', '-e', `
     import {registerHooks,syncBuiltinESMExports} from 'node:module';
     import fs from 'node:fs';
+    import {basename} from 'node:path';
     const sourceRoot=${JSON.stringify(sourceRoot)};
     registerHooks({resolve(specifier,context,next){return next(context.parentURL?.startsWith(sourceRoot)&&specifier.startsWith('.')&&specifier.endsWith('.js')?specifier.slice(0,-3)+'.ts':specifier,context);}});
-    const {readAgentSettings,updateAgentSettings}=await import(sourceRoot+'runtime/settings.ts');
+    const {readAgentSettings,updateAgentSettings,AGENT_CONFIG_FILE}=await import(sourceRoot+'runtime/settings.ts');
     const {catalog}=await import(sourceRoot+'runtime/__tests__/fixtures.ts');
     if(${pauseBeforeRename}) {
       const rename=fs.renameSync;
       fs.renameSync=(from,to)=>{
-        if(String(to).endsWith('/agent-config.json')) {
+        if(basename(String(to))===AGENT_CONFIG_FILE) {
           process.send({type:'staged'});
           Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,30000);
         }
