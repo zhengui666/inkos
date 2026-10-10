@@ -607,6 +607,7 @@ export { LLM_API_FORMATS, isLLMApiFormat, toPiApi, type LLMApiFormat } from "./l
 export * from "./harness/index.js";
 
 export * from "./codex/account.js";
+export type { CodexClient } from "./codex/app-server.js";
 export * from "./codex/settings.js";
 export * from "./codex/types.js";
 export {
