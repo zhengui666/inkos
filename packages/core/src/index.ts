@@ -609,6 +609,24 @@ export * from "./harness/index.js";
 export * from "./codex/account.js";
 export * from "./codex/settings.js";
 export * from "./codex/types.js";
+export {
+  HarnessIdSchema as RuntimeHarnessIdSchema, RuntimeIdSchema, RuntimeRevisionSchema,
+  ModelConnectionSchema, HarnessPreferencesSchema, AGENT_SETTINGS_SCHEMA_VERSION,
+  AgentSettingsSchema, HarnessModelCapabilitySchema, HarnessCapabilityCatalogSchema,
+  HarnessDescriptorSchema, ModelConnectionAdmissionSchema,
+} from "./runtime/contracts.js";
+export type {
+  HarnessId, ModelConnection, HarnessPreferences, AgentSettings, HarnessModelCapability,
+  HarnessCapabilityCatalog, HarnessDescriptor, ModelConnectionAdmission, RuntimeSelection,
+} from "./runtime/contracts.js";
+export * from "./runtime/capabilities.js";
+export * from "./runtime/selection.js";
+export * from "./runtime/registry.js";
+export {
+  AGENT_CONFIG_FILE, DEFAULT_AGENT_SETTINGS, AgentSettingsPatchSchema,
+  AgentSettingsConflictError, parseAgentSettings, readAgentSettings, updateAgentSettings,
+} from "./runtime/settings.js";
+export type { AgentSettingsPatch, UpdateAgentSettingsOptions } from "./runtime/settings.js";
 
 export { inspectCodexReadiness, selectCodexModel, CodexConfigurationError } from "./codex/account.js";
 export { GoalStore } from "./goals/store.js";
