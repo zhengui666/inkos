@@ -86,6 +86,8 @@ interface LoginAttempt {
   detached: boolean;
   closeRequested: boolean;
   closeToken?: { readonly lifetime: number; readonly target: TargetView; readonly ownerGeneration: number | null };
+  // Receipt recovery stays within the generation of the explicit Close.
+  closeGeneration?: number | null;
   closePromise?: Promise<void>;
   closeResult?: DeviceLoginAttemptCloseResult;
   closeUncertain?: boolean;
@@ -102,6 +104,7 @@ function closeDescription(result: DeviceLoginAttemptCloseResult): TextView {
   return result.cleanup === "not-started" ? { zh: "本次尝试已关闭，未启动提供方登录。执行尚未验证。", en: "This attempt is closed; provider sign-in was not started. Execution remains unverified." }
     : { zh: "本次尝试已关闭；提供方清理不适用。执行尚未验证。", en: "This attempt is closed; provider cleanup is not applicable. Execution remains unverified." };
 }
+const closeUncertainDescription = { zh: "Close 结果不确定；可再次核对同一尝试。不会自动登录或退出账号。执行尚未验证。", en: "Close outcome is uncertain. Check the same attempt again; sign-in and logout will not be replayed automatically. Execution remains unverified." };
 
 export function createAgentConfigurationController(transport: AgentConfigurationTransport, initialTarget?: TargetView, timeoutMs = 15_000) {
   let target = Object.freeze({ ...(initialTarget ?? { harness: "codex", contextKey: "unobserved" }) });
@@ -123,14 +126,23 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   let authDetail: TextView | undefined;
   let authCloseResult: DeviceLoginAttemptCloseResult | undefined;
   type AuthenticationOperation = { action: "login" | "logout" | "bind"; token: ReturnType<typeof capture>; closeRequested: boolean; attempt?: LoginAttempt };
-  let closing: { attempt: LoginAttempt; token: ReturnType<typeof capture> } | null = null;
+  type CloseObservation = { attempt: LoginAttempt; token: ReturnType<typeof capture>; promise: Promise<void>; completion?: Promise<void> };
+  let closing: CloseObservation | null = null;
+  let closeReceiptOwner: { attempt: LoginAttempt; token: ReturnType<typeof capture> } | null = null;
   const attempts = knownAttempts.get(transport) ?? new Map<string, LoginAttempt>();
   knownAttempts.set(transport, attempts);
   const knownAttempt = () => authentication?.attempt ?? attempts.get(key(target));
-  function canCloseAttempt(attempt: LoginAttempt | undefined) {
+  function matchesAttempt(attempt: LoginAttempt | undefined) {
     if (!attempt || !sameTarget(attempt.target, target)) return false;
+    if (authentication && authentication.attempt !== attempt) return false;
+    if (knownAttempt() !== attempt) return false;
     const observed = state?.connection?.login;
     if (attempt.loginId && observed && observed.loginId !== attempt.loginId) return false;
+    if (attempt.closeGeneration !== undefined && attempt.closeGeneration !== ownerGeneration) return false;
+    return true;
+  }
+  function canCloseAttempt(attempt: LoginAttempt | undefined) {
+    if (!matchesAttempt(attempt) || !attempt) return false;
     return !attempt.closeResult || attempt.closeUncertain || attempt.closeResult.cleanup === "unconfirmed";
   }
   let authentication: AuthenticationOperation | null = null;
@@ -165,6 +177,8 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     if (savePhase === "saving") { savePhase = "uncertain"; detail = uncertain; reviewable = false; }
     loading = false;
     authentication = null;
+    if (closing || closeReceiptOwner) { authDetail = undefined; authCloseResult = undefined; }
+    closing = null; closeReceiptOwner = null;
   }
   function capture() { return { lifetime, target, ownerGeneration }; }
   function current(token: ReturnType<typeof capture>) {
@@ -237,7 +251,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
         if (ownerGeneration !== value.scope.ownerGeneration || !sameTarget(token.target, target)) invalidate();
         ownerGeneration = value.scope.ownerGeneration;
       }
-      state = value; publish();
+      state = value; restoreCloseObservation(); publish();
     } catch { if (current(token) && epoch === stateEpoch) { state = null; detail = unavailable; publish(); } }
   }
   async function refresh() {
@@ -312,33 +326,58 @@ export function createAgentConfigurationController(transport: AgentConfiguration
       savePhase = "unsaved"; detail = undefined; publish();
     }
   }
-  async function settleClose(attempt: LoginAttempt, reconcile = false) {
-    if (!reconcile && (attempt.closeResult || attempt.closeUncertain)) return;
-    if (attempt.closePromise || !attempt.reservation || !transport.closeLogin) return attempt.closePromise;
-    const handle = attempt.reservation.attemptHandle;
-    const token = attempt.closeToken ?? { ...capture(), target: attempt.target };
-    const operation = { attempt, token };
-    if (current(token)) closing = operation;
-    if (current(token)) {
-      stateEpoch++; state = null; authCloseResult = undefined;
-      authDetail = { zh: "正在结算本次关闭请求…", en: "Settling Close for this attempt…" }; publish();
+  function currentCloseObservation(operation: CloseObservation) {
+    return closing === operation && current(operation.token) && matchesAttempt(operation.attempt)
+      && attempts.get(key(operation.attempt.target)) === operation.attempt;
+  }
+  function displayCloseReceipt(attempt: LoginAttempt) {
+    closeReceiptOwner = { attempt, token: capture() };
+    authCloseResult = attempt.closeUncertain ? undefined : attempt.closeResult;
+    authDetail = attempt.closeUncertain ? closeUncertainDescription : attempt.closeResult ? closeDescription(attempt.closeResult) : undefined;
+  }
+  function observeClose(attempt: LoginAttempt, token = capture(), fenceRead = false) {
+    if (!current(token) || !matchesAttempt(attempt) || attempts.get(key(attempt.target)) !== attempt) return;
+    const promise = attempt.closePromise;
+    if (!promise) {
+      if (attempt.closeResult || attempt.closeUncertain) displayCloseReceipt(attempt);
+      return;
     }
-    // Close owns its deadline and signal. Navigation may abort reads/reserve/start,
-    // but cannot withdraw an explicit settlement once its handle is known.
-    attempt.closePromise = request(signal => transport.closeLogin!(handle, signal), true).then(async result => {
-      if (result.attemptHandle !== handle) throw new Error("Close returned a different attempt");
-      attempt.closeResult = Object.freeze({ ...result }); attempt.closeUncertain = false;
-      if (!current(token) || attempts.get(key(attempt.target)) !== attempt) return;
-      authCloseResult = attempt.closeResult; authDetail = closeDescription(result); publish();
-      await refreshState();
-    }).catch(() => {
-      attempt.closeUncertain = true;
-      if (current(token) && attempts.get(key(attempt.target)) === attempt) {
-        authCloseResult = undefined;
-        authDetail = { zh: "Close 结果不确定；可再次核对同一尝试。不会自动登录或退出账号。执行尚未验证。", en: "Close outcome is uncertain. Check the same attempt again; sign-in and logout will not be replayed automatically. Execution remains unverified." }; publish();
-      }
-    }).finally(() => { attempt.closePromise = undefined; if (closing === operation) closing = null; publish(); });
-    return attempt.closePromise;
+    if (closing?.attempt === attempt && closing.promise === promise && currentCloseObservation(closing)) return closing.completion;
+    const operation: CloseObservation = { attempt, token, promise };
+    closing = operation; closeReceiptOwner = null;
+    if (fenceRead) { stateEpoch++; state = null; }
+    authCloseResult = undefined;
+    authDetail = { zh: "正在结算本次关闭请求…", en: "Settling Close for this attempt…" }; publish();
+    // Each controller observes with its own lifetime; the shared promise owns
+    // only network settlement and remains independent of navigation/disposal.
+    operation.completion = promise.then(async () => {
+      if (!currentCloseObservation(operation)) return;
+      displayCloseReceipt(attempt); publish();
+      if (!attempt.closeUncertain) await refreshState();
+    }).finally(() => {
+      if (closing === operation) { closing = null; publish(); }
+    });
+    return operation.completion;
+  }
+  function restoreCloseObservation() {
+    if (closing && !currentCloseObservation(closing)) { closing = null; authDetail = undefined; authCloseResult = undefined; }
+    if (closeReceiptOwner && (!current(closeReceiptOwner.token) || !matchesAttempt(closeReceiptOwner.attempt))) {
+      closeReceiptOwner = null; authDetail = undefined; authCloseResult = undefined;
+    }
+    const attempt = knownAttempt();
+    if (attempt?.closeRequested) void observeClose(attempt);
+  }
+  async function settleClose(attempt: LoginAttempt, reconcile = false) {
+    if (!attempt.closePromise && (reconcile || (!attempt.closeResult && !attempt.closeUncertain)) && attempt.reservation && transport.closeLogin) {
+      const handle = attempt.reservation.attemptHandle;
+      // Close owns its deadline and signal. This promise caches the receipt or
+      // uncertainty; it never writes to an initiating controller's local view.
+      attempt.closePromise = request(signal => transport.closeLogin!(handle, signal), true).then(result => {
+        if (result.attemptHandle !== handle) throw new Error("Close returned a different attempt");
+        attempt.closeResult = Object.freeze({ ...result }); attempt.closeUncertain = false;
+      }).catch(() => { attempt.closeUncertain = true; }).finally(() => { attempt.closePromise = undefined; });
+    }
+    return observeClose(attempt, attempt.closeToken ?? { ...capture(), target: attempt.target }, true) ?? attempt.closePromise;
   }
   async function accountAction(action: "login" | "logout") {
     if (disposed || authentication || (closing && current(closing.token)) || target.harness !== "codex") return;
@@ -347,6 +386,9 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     }
     invalidate(); state = null; ownerGeneration = null;
     const attempt: LoginAttempt | undefined = action === "login" ? { target, started: false, detached: false, closeRequested: false } : undefined;
+    // A newer login intent supersedes local receipt correlation even while its
+    // reservation is pending; an older reply cannot become this attempt's view.
+    if (attempt) attempts.set(key(attempt.target), attempt);
     const operation: AuthenticationOperation = { action, token: capture(), closeRequested: false, attempt };
     authentication = operation; authDetail = undefined; authCloseResult = undefined; publish();
     try {
@@ -420,10 +462,15 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   function closeConnection() {
     if (disposed || target.harness !== "codex") return;
     const attempt = knownAttempt();
+    if (attempt && matchesAttempt(attempt) && attempt.closeResult && !attempt.closeUncertain && attempt.closeResult.cleanup !== "unconfirmed") {
+      // A terminal attempt still has a receipt. Viewing it does not retry Close.
+      void observeClose(attempt); publish(); return;
+    }
     if (!canCloseAttempt(attempt) || !attempt) {
       authDetail = { zh: "当前页面没有本次尝试的已知标识；无法确认关闭，请刷新连接状态。", en: "This page has no known handle for this attempt. Close cannot be confirmed; refresh connection status." }; publish(); return;
     }
     attempt.closeRequested = true; attempt.closeToken = capture();
+    if (attempt.closeGeneration === undefined) attempt.closeGeneration = ownerGeneration;
     if (!attempt.reservation) {
       authDetail = { zh: "关闭请求已记录；收到本次标识后仅关闭，不启动登录。", en: "Close requested. If this attempt's handle returns, it will only be closed; sign-in will not start." }; publish(); return;
     }
