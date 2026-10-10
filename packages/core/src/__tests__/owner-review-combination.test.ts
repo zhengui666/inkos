@@ -50,16 +50,19 @@ it('keeps v2 authority, policy and frozen publication identity across a real SQL
     const {SchedulerStore} = require(process.argv[1]);
     const store = new SchedulerStore(process.argv[2]);
     store.acquire();
-    process.stdout.write('ready\\n');
+    process.send('ready');
     setInterval(() => {}, 1000);
-  `, join(compiled, 'pipeline/scheduler-store.js'), path], { stdio: ['ignore', 'pipe', 'pipe'] });
+  `, join(compiled, 'pipeline/scheduler-store.js'), path], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
   cleanups.push(() => kill(child));
   await new Promise<void>((resolve, reject) => {
     let stderr = '';
     child.stderr!.on('data', data => { stderr += String(data); });
     child.once('error', reject);
     child.once('exit', code => reject(new Error(`Owner exited before readiness: ${code}; ${stderr}`)));
-    child.stdout!.once('data', () => resolve());
+    child.once('message', message => {
+      if (message === 'ready') resolve();
+      else reject(new Error(`Unexpected owner readiness: ${String(message)}`));
+    });
   });
   const owner = ledger.runningOwner()!;
   expect(owner.pid).toBe(child.pid);
