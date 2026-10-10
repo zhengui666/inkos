@@ -18,7 +18,8 @@ export function createAgentConfigurationTransport(fetchImpl?: typeof fetch): Age
     readHarnessState: async (harness, signal) => (await fetchJson<{ state: HarnessState }>(`/agent-configuration/harnesses/${harness}/state`, { signal }, { fetchImpl })).state,
   };
 }
-interface Draft { readonly preferences: HarnessPreferences; readonly baselineRevision: number | null; readonly edits: number; readonly dirty: boolean }
+interface DraftVersion { readonly preferences: HarnessPreferences; readonly baselineRevision: number | null; readonly edits: number; readonly dirty: boolean }
+interface Draft extends DraftVersion { readonly retained?: readonly DraftVersion[]; readonly contextConflict?: boolean }
 export interface SubmittedConfiguration {
   readonly target: TargetView;
   readonly preferences: HarnessPreferences;
@@ -33,6 +34,7 @@ export interface AgentConfigurationSnapshot {
   readonly baseline: AgentSettings | null;
   readonly revision: number | null;
   readonly draft: HarnessPreferences;
+  readonly retainedDrafts: readonly DraftVersion[];
   readonly state: HarnessState | null;
   readonly submitted: SubmittedConfiguration | null;
   readonly loading: boolean;
@@ -52,6 +54,11 @@ function freezeSettings(value: AgentSettings): AgentSettings {
 const unavailable = { zh: "请求未完成，草稿已保留。", en: "The request did not complete. Your draft is retained." };
 const uncertain = { zh: "保存结果不确定；请核对当前存储值后再决定是否重试。", en: "Save result uncertain. Review current stored values before deciding whether to retry." };
 const changed = { zh: "存储配置已更新；草稿保留，请核对后再保存。", en: "Stored settings changed. Your draft is retained; review before saving." };
+function describePreferences(value: HarnessPreferences, isZh: boolean) {
+  const native = isZh ? "原生默认" : "Native default";
+  return isZh ? `模型 ${value.model ?? native}，推理强度 ${value.effort ?? native}，速度 ${value.speed ?? native}`
+    : `Model ${value.model ?? native}, reasoning ${value.effort ?? native}, speed ${value.speed ?? native}`;
+}
 
 export function createAgentConfigurationController(transport: AgentConfigurationTransport, initialTarget?: TargetView, timeoutMs = 15_000) {
   let target = Object.freeze({ ...(initialTarget ?? { harness: "codex", contextKey: "unobserved" }) });
@@ -69,10 +76,11 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   let readEpoch = 0;
   let stateEpoch = 0;
   let saveEpoch = 0;
+  let entryEdits = 0;
   const drafts = new Map<string, Draft>();
   const listeners = new Set<() => void>();
   const requests = new Set<AbortController>();
-  const draft = () => drafts.get(key(target)) ?? { preferences: baseline?.harnessPreferences[target.harness] ?? empty(), baselineRevision: baseline?.revision ?? null, edits: 0, dirty: false };
+  const draft = (): Draft => drafts.get(key(target)) ?? { preferences: baseline?.harnessPreferences[target.harness] ?? empty(), baselineRevision: baseline?.revision ?? null, edits: 0, dirty: false };
   let snapshot: AgentConfigurationSnapshot;
   function publish() {
     const current = draft();
@@ -80,8 +88,15 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     if (current.dirty && baseline && current.baselineRevision !== baseline.revision && !["saving", "uncertain"].includes(savePhase)) {
       savePhase = "conflict"; reviewable = true; detail = changed;
     }
+    if (current.contextConflict && savePhase !== "saving") {
+      if (savePhase !== "uncertain") { savePhase = "conflict"; reviewable = baseline !== null; }
+      detail = {
+        zh: `当前入口草稿：${describePreferences(current.preferences, true)}。保留的上下文草稿：${current.retained?.map(value => describePreferences(value.preferences, true)).join("；")}。草稿未合并；请核对当前入口草稿后再保存。${savePhase === "uncertain" ? uncertain.zh : ""}`,
+        en: `Current entry draft: ${describePreferences(current.preferences, false)}. Retained context drafts: ${current.retained?.map(value => describePreferences(value.preferences, false)).join("; ")}. Drafts remain separate; review the current entry draft before saving. ${savePhase === "uncertain" ? uncertain.en : ""}`,
+      };
+    }
     const hasChanges = baseline !== null && (baseline.selectedHarnessId !== target.harness || !samePreferences(current.preferences, baseline.harnessPreferences[target.harness]));
-    snapshot = Object.freeze({ target, ownerGeneration, baseline, revision: current.baselineRevision, draft: current.preferences, state, submitted, loading, savePhase, detail, hasChanges, reviewable,
+    snapshot = Object.freeze({ target, ownerGeneration, baseline, revision: current.baselineRevision, draft: current.preferences, retainedDrafts: current.retained ?? Object.freeze([]), state, submitted, loading, savePhase, detail, hasChanges, reviewable,
       canSave: baseline !== null && current.baselineRevision !== null && !["saving", "conflict", "uncertain"].includes(savePhase) });
     for (const listener of listeners) listener();
   }
@@ -112,8 +127,8 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     }
     const currentDraft = draft();
     baseline = freezeSettings(value);
-    if (!currentDraft.dirty && !reconcile && savePhase !== "saving") {
-      drafts.set(key(target), { preferences: preferences(value.harnessPreferences[target.harness]), baselineRevision: value.revision, edits: currentDraft.edits, dirty: false });
+    if (!currentDraft.dirty && !currentDraft.contextConflict && !reconcile && savePhase !== "saving") {
+      drafts.set(key(target), { ...currentDraft, preferences: preferences(value.harnessPreferences[target.harness]), baselineRevision: value.revision, dirty: false });
     }
   }
   async function refreshSettings(reconcile = false): Promise<ReturnType<typeof capture> | undefined> {
@@ -147,9 +162,17 @@ export function createAgentConfigurationController(transport: AgentConfiguration
       if (value.scope && ownerGeneration !== null && value.scope.ownerGeneration < ownerGeneration) return;
       if (value.availability === "available" && value.scope) {
         if (target.contextKey === "unobserved") {
-          const previous = draft();
+          const previous = draft(); const entryKey = key(target);
           target = Object.freeze({ harness: target.harness, contextKey: value.scope.authContextRef });
-          if (!drafts.has(key(target))) drafts.set(key(target), previous);
+          const existing = drafts.get(key(target));
+          if (!existing || previous.dirty || previous.edits > entryEdits) {
+            const collision = existing && (existing.dirty || existing.contextConflict) && (!samePreferences(existing.preferences, previous.preferences) || existing.baselineRevision !== previous.baselineRevision);
+            const retained = [...(previous.retained ?? []), ...(existing?.retained ?? [])];
+            if (collision) retained.push(Object.freeze({ preferences: existing.preferences, baselineRevision: existing.baselineRevision, edits: existing.edits, dirty: existing.dirty }));
+            drafts.set(key(target), { ...previous, retained: Object.freeze(retained), contextConflict: previous.contextConflict || existing?.contextConflict || !!collision });
+          }
+          // Move the entry draft so a later unobserved entry cannot revive stale edits.
+          drafts.delete(entryKey); entryEdits = draft().edits;
         }
         if (ownerGeneration !== value.scope.ownerGeneration || !sameTarget(token.target, target)) invalidate();
         ownerGeneration = value.scope.ownerGeneration;
@@ -168,7 +191,8 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     invalidate(); target = Object.freeze({ ...next }); ownerGeneration = null; state = null;
     submitted = null;
     const currentDraft = draft();
-    if (baseline && !currentDraft.dirty) drafts.set(key(target), { ...currentDraft, preferences: baseline.harnessPreferences[target.harness], baselineRevision: baseline.revision });
+    if (baseline && !currentDraft.dirty && !currentDraft.contextConflict) drafts.set(key(target), { ...currentDraft, preferences: baseline.harnessPreferences[target.harness], baselineRevision: baseline.revision });
+    entryEdits = draft().edits;
     if (!["uncertain", "conflict"].includes(savePhase)) { savePhase = "unsaved"; detail = undefined; }
     publish();
   }
@@ -197,7 +221,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
       }
       const latest = draft();
       baseline = freezeSettings(result);
-      if (latest.edits === sent.edits) drafts.set(key(target), { preferences: preferences(result.harnessPreferences[target.harness]), baselineRevision: result.revision, edits: latest.edits, dirty: false });
+      if (latest.edits === sent.edits) drafts.set(key(target), { ...latest, preferences: preferences(result.harnessPreferences[target.harness]), baselineRevision: result.revision, dirty: false });
       else drafts.set(key(target), { ...latest, baselineRevision: result.revision, dirty: !samePreferences(latest.preferences, result.harnessPreferences[target.harness]) });
       savePhase = "saved"; publish();
     } catch (error) {
@@ -222,7 +246,8 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   }
   function reviewLatest() {
     if (!disposed && baseline && reviewable && ["conflict", "uncertain"].includes(savePhase)) {
-      drafts.set(key(target), { ...draft(), baselineRevision: baseline.revision });
+      const currentDraft = draft();
+      drafts.set(key(target), { ...currentDraft, baselineRevision: baseline.revision, contextConflict: false, dirty: !samePreferences(currentDraft.preferences, baseline.harnessPreferences[target.harness]) });
       savePhase = "unsaved"; detail = undefined; publish();
     }
   }
