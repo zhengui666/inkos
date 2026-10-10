@@ -57,3 +57,95 @@ it('allows only one concurrent cold-server admission before any model work', () 
   expect(fixture.requests.filter(x => x.method === 'turn/start').length).toBeLessThanOrEqual(1);
   expect((await new ChatRequestStore(root).load(session.sessionId))?.requestId).toBe(saved?.requestId);
 }));
+
+it('retains the retry baseline and attachment submission after a rejected admission and server recreation', () => project(async root => {
+  const fixture = new CodexFixture(() => ({ error: 'deterministic failure' }));
+  createCodexClient.mockImplementation(fixture.createClient);
+  const app = createStudioServer({} as never, root), store = new ChatRequestStore(root);
+  const { session } = await (await app.request('/api/v1/sessions', post({ sessionKind: 'chat' }))).json();
+  const instruction = 'Summarize the attached note.';
+  const attachments = [{ id: 'note', filename: 'note.txt', mediaType: 'text/plain', size: 5, dataUrl: 'data:text/plain;base64,aGVsbG8=' }];
+  const input = { sessionId: session.sessionId, instruction, sessionKind: 'chat', attachments,
+    requestedSkills: [], disabledSkills: ['inkos-story-review'] };
+  expect((await app.request('/api/v1/agent', post({ ...input, clientRequestId: 'first' }))).status).toBeGreaterThanOrEqual(400);
+  const failed = await store.load(session.sessionId);
+  expect(failed).toMatchObject({ requestId: 'first', status: 'failed', baselineWork: null,
+    retry: { text: instruction, options: { retryOfRequestId: 'first', attachments, disabledSkills: input.disabledSkills } } });
+
+  const restarted = createStudioServer({} as never, root);
+  const mismatch = await restarted.request('/api/v1/agent', post({ ...input, instruction: 'A different instruction',
+    clientRequestId: 'rejected', retryOfRequestId: 'first' }));
+  expect(mismatch.status).toBe(409);
+  expect((await mismatch.json()).error.code).toBe('CHAT_RETRY_CONFLICT');
+  expect(await store.load(session.sessionId)).toEqual(failed);
+  expect(fixture.requests.filter(x => x.method === 'turn/start')).toHaveLength(1);
+
+  const retry = await restarted.request('/api/v1/agent', post({ ...input, clientRequestId: 'retry', retryOfRequestId: 'first' }));
+  expect(retry.status).toBeGreaterThanOrEqual(400);
+  expect(await store.load(session.sessionId)).toMatchObject({ requestId: 'retry', status: 'failed', baselineWork: null,
+    retry: { text: instruction, options: { retryOfRequestId: 'retry', attachments, disabledSkills: input.disabledSkills } } });
+  expect(fixture.requests.filter(x => x.method === 'turn/start')).toHaveLength(2);
+
+  const duplicate = await restarted.request('/api/v1/agent', post({ ...input, clientRequestId: 'retry' }));
+  expect(duplicate.status).toBe(409);
+  expect((await duplicate.json()).error.code).toBe('CHAT_REQUEST_ID_REUSED');
+  expect((await store.load(session.sessionId))?.requestId).toBe('retry');
+  expect(fixture.requests.filter(x => x.method === 'turn/start')).toHaveLength(2);
+}));
+
+it('rejects a legacy retry without a baseline and releases admission for a fresh instruction', () => project(async root => {
+  const fixture = new CodexFixture(() => ({ error: 'deterministic failure' }));
+  createCodexClient.mockImplementation(fixture.createClient);
+  const app = createStudioServer({} as never, root), store = new ChatRequestStore(root);
+  const { session } = await (await app.request('/api/v1/sessions', post({ sessionKind: 'chat' }))).json();
+  const instruction = 'Inspect the saved note.';
+  await store.save({ sessionId: session.sessionId, requestId: 'legacy-failed', startedAt: 1, completedAt: 2, status: 'failed',
+    error: { code: 'AGENT_LLM_ERROR', message: 'Legacy failure' }, retry: { text: instruction, options: {} } });
+  const failed = await store.load(session.sessionId);
+  const retry = await app.request('/api/v1/agent', post({ sessionId: session.sessionId, instruction,
+    clientRequestId: 'missing-baseline', retryOfRequestId: 'legacy-failed' }));
+  expect(retry.status).toBe(409);
+  expect((await retry.json()).error.code).toBe('CHAT_RETRY_BASELINE_UNAVAILABLE');
+  expect(await store.load(session.sessionId)).toEqual(failed);
+  expect(fixture.requests.filter(x => x.method === 'turn/start')).toHaveLength(0);
+
+  const fresh = await app.request('/api/v1/agent', post({ sessionId: session.sessionId, instruction, clientRequestId: 'fresh' }));
+  expect(fresh.status).toBeGreaterThanOrEqual(400);
+  expect(await store.load(session.sessionId)).toMatchObject({ requestId: 'fresh', status: 'failed', baselineWork: null });
+  expect(fixture.requests.filter(x => x.method === 'turn/start')).toHaveLength(1);
+}));
+
+it('prevents model work when abort arrives before the first durable admission', () => project(async root => {
+  const fixture = new CodexFixture(() => ({ error: 'Model work must not start' }));
+  createCodexClient.mockImplementation(fixture.createClient);
+  const app = createStudioServer({} as never, root), store = new ChatRequestStore(root);
+  const { session } = await (await app.request('/api/v1/sessions', post({ sessionKind: 'chat' }))).json();
+  let entered!: () => void, release!: () => void;
+  const admissionStarted = new Promise<void>(resolve => { entered = resolve; });
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  const admit = ChatRequestStore.prototype.admit;
+  // Delay entry only; admission still runs the real store and ownership locks.
+  const delayed = vi.spyOn(ChatRequestStore.prototype, 'admit').mockImplementation(async function (this: ChatRequestStore, snapshot, validate) {
+    entered();
+    await barrier;
+    return admit.call(this, snapshot, validate);
+  });
+  const request = app.request('/api/v1/agent', post({ sessionId: session.sessionId, instruction: 'Inspect', clientRequestId: 'stopped' }));
+  try {
+    await admissionStarted;
+    expect(await store.load(session.sessionId)).toBeNull();
+    const stopped = await app.request(`/api/v1/sessions/${session.sessionId}/abort?scope=chat`, { method: 'POST' });
+    expect(await stopped.json()).toMatchObject({ ok: true, aborted: true });
+    release();
+    await request;
+    expect(await store.load(session.sessionId)).toMatchObject({ requestId: 'stopped', status: 'cancelled' });
+    expect((await store.load(session.sessionId))?.retry).toBeUndefined();
+    expect(fixture.requests.filter(x => x.method === 'turn/start')).toHaveLength(0);
+
+    delayed.mockRestore();
+    const fresh = await app.request('/api/v1/agent', post({ sessionId: session.sessionId, instruction: 'Inspect', clientRequestId: 'after-stop' }));
+    expect(fresh.status).toBeGreaterThanOrEqual(400);
+    expect((await store.load(session.sessionId))?.requestId).toBe('after-stop');
+    expect(fixture.requests.filter(x => x.method === 'turn/start')).toHaveLength(1);
+  } finally { release(); await request; }
+}));

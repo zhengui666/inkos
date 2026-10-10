@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { openHarnessDatabase } from "../harness/sqlite.js";
+import { createOwnershipLockSpace, SQLITE_OWNER_TOKEN_PREFIX, type OwnershipLockHandle, type OwnershipLockSpace } from "../harness/ownership-lock.js";
 import {
   GoalInputSchema, GoalReceiptSchema, GoalSchema, GoalStepSchema, goalError, goalInputValue,
   type Goal, type GoalError, type GoalEvent, type GoalInput, type GoalLease, type GoalReceipt, type GoalStatus,
@@ -17,12 +18,14 @@ function processAlive(pid: number): boolean {
 /** Synchronous transactions fence all ownership and progress writes across processes. */
 export class GoalStore {
   private readonly db: DatabaseSync;
-  private readonly owned = new Set<string>();
+  private readonly owned = new Map<string, { goalId: string; workId: string; handle: OwnershipLockHandle }>();
+  private readonly lockSpace: OwnershipLockSpace;
   readonly now: () => number;
 
   constructor(path: string, options: { readonly now?: () => number } = {}) {
     this.now = options.now ?? Date.now;
     this.db = openHarnessDatabase(path);
+    this.lockSpace = createOwnershipLockSpace(path);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS goals (
         id TEXT PRIMARY KEY, work_id TEXT NOT NULL, owner_token TEXT, data_json TEXT NOT NULL
@@ -127,19 +130,33 @@ export class GoalStore {
   }
 
   claim(id: string, leaseMs = 30_000): GoalLease | undefined {
-    const token = randomUUID();
-    const claimed = this.transaction(() => {
-      const goal = this.get(id);
-      if (goal.owner || goal.status !== "ready" || goal.desiredState !== "run") return false;
-      const other = this.db.prepare("SELECT id FROM goals WHERE work_id = ? AND owner_token IS NOT NULL").get(goal.workId);
-      if (other) return false;
-      this.persist(this.next(goal, { status: "running", owner: { token, pid: process.pid, leaseUntil: this.now() + leaseMs } }),
-        "goal-claimed", { token });
-      return true;
-    });
-    if (!claimed) return undefined;
-    this.owned.add(token); activeOwners.add(this.ownerKey(token));
-    return { goalId: id, token };
+    const initial = this.get(id);
+    const handle = this.lockSpace.tryAcquire("goal-owner", initial.workId);
+    if (!handle) return undefined;
+    const token = `${SQLITE_OWNER_TOKEN_PREFIX}${randomUUID()}`;
+    let retained = false;
+    let failed = false;
+    try {
+      const claimed = this.transaction(() => {
+        const goal = this.get(id);
+        if (goal.workId !== initial.workId || goal.owner || goal.status !== "ready" || goal.desiredState !== "run") return false;
+        const other = this.db.prepare("SELECT id FROM goals WHERE work_id = ? AND owner_token IS NOT NULL").get(goal.workId);
+        if (other) return false;
+        this.persist(this.next(goal, { status: "running", owner: { token, pid: process.pid, leaseUntil: this.now() + leaseMs } }),
+          "goal-claimed", { token });
+        return true;
+      });
+      if (!claimed) return undefined;
+      this.owned.set(token, { goalId: id, workId: initial.workId, handle });
+      activeOwners.add(this.ownerKey(token));
+      retained = true;
+      return { goalId: id, token };
+    } catch (error) { failed = true; throw error; }
+    finally {
+      if (!retained) {
+        try { handle.release(); } catch (error) { if (!failed) throw error; }
+      }
+    }
   }
 
   /** Lease renewal must not invalidate an otherwise current user/API control version. */
@@ -221,6 +238,7 @@ export class GoalStore {
 
   /** Call only after all adapter work has settled. Cancellation wins late receipts. */
   release(lease: GoalLease, status: Exclude<GoalStatus, "running">, error: GoalError | null = null): Goal {
+    let failed = false;
     try {
       return this.transaction(() => {
         const goal = this.get(lease.goalId);
@@ -241,18 +259,39 @@ export class GoalStore {
         this.persist(next, "goal-released", { status: selected, error: failure });
         return next;
       });
-    } finally { this.owned.delete(lease.token); activeOwners.delete(this.ownerKey(lease.token)); }
+    } catch (failure) { failed = true; throw failure; }
+    finally {
+      const owned = this.owned.get(lease.token);
+      if (owned?.goalId === lease.goalId) {
+        this.owned.delete(lease.token);
+        activeOwners.delete(this.ownerKey(lease.token));
+        try { owned.handle.release(); } catch (failure) { if (!failed) throw failure; }
+      }
+    }
   }
 
-  /** Lease expiry alone never proves that an uncooperative writer stopped. */
+  /** Lease expiry and persisted PIDs do not prove that a new-protocol writer stopped. */
   recover(id: string, expectedVersion?: number): Goal {
-    return this.change(id, "goal-owner-recovered", {}, goal => {
-      if (expectedVersion !== undefined) this.checkVersion(goal, expectedVersion);
-      if (!goal.owner || this.ownerAlive(goal.owner)) return goal;
-      return { ...goal, owner: null, steps: interruptedSteps(goal),
-        status: goal.desiredState === "cancelled" ? "cancelled" : goal.desiredState === "paused" ? "paused" : "interrupted",
-        error: { code: "GOAL_INTERRUPTED", message: "Executor exited. Reconcile persisted effects before an explicit resume." } };
-    });
+    const initial = this.get(id);
+    const lockedOwner = initial.owner?.token.startsWith(SQLITE_OWNER_TOKEN_PREFIX);
+    const probe = lockedOwner ? this.lockSpace.tryAcquire("goal-owner", initial.workId) : undefined;
+    let failed = false;
+    try {
+      return this.change(id, "goal-owner-recovered", {}, goal => {
+        if (expectedVersion !== undefined) this.checkVersion(goal, expectedVersion);
+        // The owner may have changed before BEGIN IMMEDIATE. Never use an old
+        // death proof to clear the replacement (or an unrelated work's owner).
+        if (!goal.owner || goal.workId !== initial.workId || goal.owner.token !== initial.owner?.token) return goal;
+        if (lockedOwner ? !probe : this.ownerAlive(goal.owner)) return goal;
+        return { ...goal, owner: null, steps: interruptedSteps(goal),
+          status: goal.desiredState === "cancelled" ? "cancelled" : goal.desiredState === "paused" ? "paused" : "interrupted",
+          error: { code: "GOAL_INTERRUPTED", message: "Executor exited. Reconcile persisted effects before an explicit resume." } };
+      });
+    } catch (error) { failed = true; throw error; }
+    finally {
+      // Retain the death proof through the durable recovery decision.
+      try { probe?.release(); } catch (error) { if (!failed) throw error; }
+    }
   }
 
   close(): void {
@@ -265,7 +304,10 @@ export class GoalStore {
     return owner.pid === process.pid ? activeOwners.has(this.ownerKey(owner.token)) : processAlive(owner.pid);
   }
   private checkOwner(goal: Goal, lease: GoalLease): void {
-    if (goal.owner?.token !== lease.token || !this.owned.has(lease.token)) throw goalError("GOAL_OWNER_LOST", "Goal ownership changed.");
+    const owned = this.owned.get(lease.token);
+    if (goal.owner?.token !== lease.token || owned?.goalId !== goal.id || owned.workId !== goal.workId) {
+      throw goalError("GOAL_OWNER_LOST", "Goal ownership changed.");
+    }
   }
   private checkVersion(goal: Goal, expected: number): void {
     if (goal.version !== expected) throw goalError("GOAL_VERSION_CONFLICT", "Goal changed. Read its latest state first.");
@@ -301,7 +343,10 @@ export class GoalStore {
   private transaction<T>(task: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
     try { const result = task(); this.db.exec("COMMIT"); return result; }
-    catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* preserve the original transaction failure */ }
+      throw error;
+    }
   }
 }
 
