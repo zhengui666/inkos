@@ -50,6 +50,62 @@ describe("controlled drafts and real request ownership", () => {
     controller.selectTarget({ harness: "pi", contextKey: "pi-context" });
     expect(controller.getSnapshot().draft.model).toBe("pi-draft"); controller.dispose();
   });
+  it.each([{ harness: "pi" as const, contextKey: "pi-context" }, { ...target, contextKey: "other-codex-context" }])("keeps a dirty draft's revision when a clean target %o asynchronously refreshes newer settings", async cleanTarget => {
+    const { controller, transport, edit, save } = setup(); await controller.refresh(); edit("codex-draft-at-zero");
+    controller.selectTarget(cleanTarget);
+    const readback = deferred<AgentSettings>(); transport.readSettings.mockReturnValue(readback.promise);
+    const refresh = controller.refreshSettings(); await flush(); readback.resolve(settings("another-writer", 1)); await refresh;
+    expect(controller.getSnapshot().revision).toBe(1);
+    controller.selectTarget(target);
+    expect(controller.getSnapshot().draft.model).toBe("codex-draft-at-zero");
+    expect(controller.getSnapshot().baseline?.harnessPreferences.codex.model).toBe("another-writer");
+    expect(controller.getSnapshot().revision).toBe(0);
+    expect(controller.getSnapshot().savePhase).toBe("conflict");
+    expect(controller.getSnapshot().canSave).toBe(false);
+    await save(); expect(transport.saveSettings).not.toHaveBeenCalled();
+    controller.reviewLatest();
+    expect(controller.getSnapshot().revision).toBe(1);
+    expect(controller.getSnapshot().draft.model).toBe("codex-draft-at-zero");
+    const reply = deferred<AgentSettings>(); transport.saveSettings.mockReturnValue(reply.promise);
+    const resubmission = save(); await flush();
+    expect(transport.saveSettings.mock.calls[0]![0].expectedRevision).toBe(1);
+    reply.resolve(settings("codex-draft-at-zero", 2)); await resubmission; controller.dispose();
+  });
+  it("reviewing Pi's newer baseline does not rebase an inactive dirty Codex draft", async () => {
+    const { controller, transport, edit, save } = setup(); await controller.refresh(); edit("codex-at-zero");
+    controller.selectTarget({ harness: "pi", contextKey: "pi-context" }); edit("pi-at-zero");
+    transport.readSettings.mockResolvedValue(settings("other-codex", 1)); await controller.refreshSettings();
+    controller.reviewLatest(); expect(controller.getSnapshot().revision).toBe(1);
+    controller.selectTarget(target);
+    expect(controller.getSnapshot().revision).toBe(0); expect(controller.getSnapshot().draft.model).toBe("codex-at-zero");
+    expect(controller.getSnapshot().savePhase).toBe("conflict"); await save();
+    expect(transport.saveSettings).not.toHaveBeenCalled(); controller.dispose();
+  });
+  it("a confirmed Codex save advances only that draft's baseline while keeping newer edits and the older Pi draft", async () => {
+    const { controller, transport, edit, save } = setup(); await controller.refresh();
+    controller.selectTarget({ harness: "pi", contextKey: "pi-context" }); edit("pi-at-zero");
+    controller.selectTarget(target); edit("codex-submitted");
+    const reply = deferred<AgentSettings>(); transport.saveSettings.mockReturnValue(reply.promise);
+    const pending = save(); await flush(); edit("codex-newer-edit"); reply.resolve(settings("codex-submitted", 1)); await pending;
+    expect(controller.getSnapshot().draft.model).toBe("codex-newer-edit"); expect(controller.getSnapshot().revision).toBe(1);
+    controller.selectTarget({ harness: "pi", contextKey: "pi-context" });
+    expect(controller.getSnapshot().draft.model).toBe("pi-at-zero"); expect(controller.getSnapshot().revision).toBe(0);
+    expect(controller.getSnapshot().savePhase).toBe("conflict"); await save(); expect(transport.saveSettings).toHaveBeenCalledTimes(1);
+    controller.selectTarget(target);
+    expect(controller.getSnapshot().draft.model).toBe("codex-newer-edit"); expect(controller.getSnapshot().revision).toBe(1); controller.dispose();
+  });
+  it("a switched-away save cannot rebase newer Codex edits through a clean Pi readback", async () => {
+    const { controller, transport, edit, save } = setup(); await controller.refresh(); edit("submitted");
+    const reply = deferred<AgentSettings>(); transport.saveSettings.mockReturnValue(reply.promise);
+    const pending = save(); await flush(); edit("newer-edit");
+    controller.selectTarget({ harness: "pi", contextKey: "pi-context" });
+    transport.readSettings.mockResolvedValue(settings("submitted", 1)); await controller.refreshSettings(); controller.reviewLatest();
+    reply.resolve(settings("submitted", 1)); await pending;
+    controller.selectTarget(target);
+    expect(controller.getSnapshot().draft.model).toBe("newer-edit"); expect(controller.getSnapshot().revision).toBe(0);
+    expect(controller.getSnapshot().savePhase).toBe("conflict");
+    await save(); expect(transport.saveSettings).toHaveBeenCalledTimes(1); controller.dispose();
+  });
   it("refreshes clean drafts without borrowing the first model or altering null", async () => {
     const { controller, transport } = setup(); await controller.refresh();
     expect(controller.getSnapshot().draft).toEqual(native);
