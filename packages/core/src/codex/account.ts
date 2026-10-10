@@ -7,6 +7,8 @@ import { CodexAuthenticationOwner, type CodexAuthOperation } from '../runtime/au
 
 export type { CodexAccountStatus, CodexDeviceLogin, CodexLoginState, CodexModel } from './types.js';
 export interface CodexAccountService {
+  /** Server-only borrowed peer; the service retains lifecycle/close ownership. Never put it in a DTO. */
+  getRuntimeClient(): Promise<CodexClient>;
   readAccount(): Promise<CodexAccountStatus>;
   startDeviceLogin(): Promise<CodexDeviceLogin>;
   cancelLogin(loginId: string): Promise<void>;
@@ -161,6 +163,8 @@ class AccountService implements CodexAccountService {
       this.earlyCompletions.set(id, result.success === true);
     }
   }
+
+  getRuntimeClient(): Promise<CodexClient> { return this.getClient(); }
 
   private finishLogin(success: boolean, error?: string): void {
     if (!this.login) return;

@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCodexAccountService } from '../account.js';
+import { createCodexAccountService as createPublicAccountService, observeCodexRuntime, bindCodexModelConnection, type CodexClient as PublicCodexClient, type CodexAccountService } from '../../index.js';
 import { CodexAuthenticationOwner } from '../../runtime/auth/codex-owner.js';
 import type { CodexClient, CodexNotificationListener } from '../app-server.js';
 
@@ -259,5 +261,73 @@ it('closes after failed old-ticket settlement without changing a newer owner ope
     notify('account/login/completed', { loginId: 'l1', success: true });
     expect(owner.snapshot()).toEqual(before);
   } finally { settle.mockRestore(); }
+  expect(owner.complete(newer, 'unknown')).toBe(true);
+});
+
+
+it('exposes a borrowing getter through the public entry with concurrent creation reuse and disposed rejection', async () => {
+  const { client, request } = await fixture();
+  let release!: (peer: PublicCodexClient) => void;
+  const factory = vi.fn(() => new Promise<PublicCodexClient>(resolve => { release = resolve; }));
+  const service: CodexAccountService = createPublicAccountService({ projectDir: client.cwd, clientFactory: factory });
+  const first: Promise<PublicCodexClient> = service.getRuntimeClient(), second = service.getRuntimeClient();
+  expect(factory).toHaveBeenCalledTimes(1);
+  release(client);
+  expect(await first).toBe(client); expect(await second).toBe(client);
+  expect(request).not.toHaveBeenCalled();
+  expect(existsSync(join(client.cwd, '.inkos', 'agent-config.json'))).toBe(false);
+  expect(new CodexAuthenticationOwner(client).snapshot()).toBeUndefined();
+  expect(client.close).not.toHaveBeenCalled();
+  await service.dispose();
+  expect(client.close).toHaveBeenCalledTimes(1);
+  await expect(service.getRuntimeClient()).rejects.toThrow('closed');
+  expect(factory).toHaveBeenCalledTimes(1);
+});
+
+it('rebuilds the service-owned peer after close and fences notifications from the old borrowed peer', async () => {
+  const first = await fixture(), second = await fixture();
+  Object.defineProperties(second.client, { cwd: { value: first.client.cwd }, codexHome: { value: first.client.codexHome } });
+  const factory = vi.fn().mockResolvedValueOnce(first.client).mockResolvedValueOnce(second.client);
+  const service = createPublicAccountService({ projectDir: first.client.cwd, clientFactory: factory });
+  expect(await service.getRuntimeClient()).toBe(first.client);
+  first.close();
+  expect(await service.getRuntimeClient()).toBe(second.client);
+  expect(second.client.codexHome).toBe(first.client.codexHome);
+  first.notify('account/login/completed', { loginId: 'old-peer', success: true });
+  expect((await service.readAccount()).login).toBeNull();
+  expect(factory).toHaveBeenCalledTimes(2);
+  expect(second.client.close).not.toHaveBeenCalled();
+  await service.dispose();
+  expect(second.client.close).toHaveBeenCalledTimes(1);
+});
+
+it('shares the actual account peer and auth context with public observe/bind without transferring ownership', async () => {
+  const { service, client, request, notify } = await fixture();
+  const home = join(client.cwd, '.inkos', 'codex', 'home'); await mkdir(home, { recursive: true, mode: 0o700 });
+  Object.defineProperty(client, 'codexHome', { value: home });
+  const original = request.getMockImplementation()!;
+  request.mockImplementation(async method => method === 'account/read'
+    ? { account: { type: 'chatgpt', email: 'bridge@example.test' }, accessToken: 'DO NOT EXPOSE' } : original(method));
+  await service.startDeviceLogin();
+  notify('account/login/completed', { loginId: 'l1', success: true });
+  expect((await service.readAccount()).login?.status).toBe('completed');
+  const owner = new CodexAuthenticationOwner(client), before = owner.snapshot()!;
+  const borrowed: PublicCodexClient = await service.getRuntimeClient();
+  expect(borrowed).toBe(client);
+  const observed = await observeCodexRuntime(borrowed);
+  expect(observed).toMatchObject({ ready: true, authContextRef: before.authContextRef, owner: { authGeneration: before.authGeneration } });
+  expect(JSON.stringify(observed)).not.toMatch(/DO NOT EXPOSE|bridge@example/);
+  expect(JSON.stringify(observed)).not.toContain(home);
+  const bound = await bindCodexModelConnection(client.cwd, borrowed, { expectedRevision: 0 });
+  expect(bound.modelConnectionRef).toBe(before.connectionRef);
+  expect(owner.snapshot()).toEqual(before);
+  expect(client.close).not.toHaveBeenCalled();
+  const newer = owner.begin(true), pending = owner.snapshot()!;
+  expect((await observeCodexRuntime(await service.getRuntimeClient())).ready).toBe(false);
+  await expect(bindCodexModelConnection(client.cwd, borrowed, { expectedRevision: bound.revision })).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+  expect(owner.snapshot()).toEqual(pending);
+  await service.dispose();
+  expect(client.close).toHaveBeenCalledTimes(1);
+  expect(owner.snapshot()).toEqual(pending);
   expect(owner.complete(newer, 'unknown')).toBe(true);
 });
