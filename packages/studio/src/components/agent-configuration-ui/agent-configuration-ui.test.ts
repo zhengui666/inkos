@@ -191,7 +191,8 @@ describe("ModelOptions controlled catalog choices", () => {
       const view = { ...offlineCodexSignedIn, target };
       expect(catalogModels(target, view.catalog)).toHaveLength(0);
       expect(renderToStaticMarkup(modelOptions(view))).not.toContain("Example model A");
-      expect(elements(modelOptions(view), "select")[0]!.props.disabled).toBe(true);
+      // No catalog choices leak, but explicit removal of this target's override remains available.
+      expect(elements(modelOptions(view), "select")[0]!.props.disabled).not.toBe(true);
     }
   });
   it("rejects invalid selection events and preserves target binding across renders", () => {
@@ -271,6 +272,142 @@ describe("five independent configuration statuses", () => {
     const html = renderToStaticMarkup(ConfigurationStatus({ view: { ...offlinePiSaved, save: { ...offlinePiSaved.save, phase } }, isZh: false }));
     expect(html).toContain('role="alert"');
     expect(html).not.toContain("Saved, awaiting connection");
+  });
+});
+
+describe("native defaults and explicit override removal", () => {
+  const defaults: SelectionView = { modelKey: null, reasoningKey: null, speedKey: null };
+  const speedCatalog = { ...offlineCodexSignedIn.catalog, models: [{ ...offlineCodexSignedIn.catalog.models[0]!, speed: {
+    evidence: "backend" as const, options: [{ key: "example-standard", label: { zh: "示例标准速度", en: "Example standard speed" } }],
+  } }] };
+
+  it("roundtrips the native default model through a controlled null intent", () => {
+    const onIntent = vi.fn();
+    const view = { ...offlineCodexSignedIn, selection: defaults };
+    const tree = modelOptions(view, onIntent);
+    const select = elements(tree, "select")[0]!;
+    expect(select.props.value).toBe("");
+    expect(select.props["aria-invalid"]).toBeUndefined();
+    expect(elements(select, "option")[0]!.props.disabled).not.toBe(true);
+    expect(renderToStaticMarkup(tree)).toContain("Use native default");
+    expect(selectionIssues(view.target, view.catalog, defaults)).toEqual([]);
+    expect(isExecutionReady({ ...simulatedReady(), selection: defaults, execution: { ...simulatedReady().execution, selection: defaults } })).toBe(true);
+    choose(select, "example-a");
+    const selected = { ...view, selection: { ...defaults, modelKey: onIntent.mock.calls[0]![0].choiceKey } };
+    choose(elements(modelOptions(selected, onIntent), "select")[0]!, "");
+    expect(onIntent.mock.calls.map(([intent]) => intent)).toEqual([
+      { action: "choose-option", target: codexFixtureTarget, field: "model", choiceKey: "example-a" },
+      { action: "choose-option", target: codexFixtureTarget, field: "model", choiceKey: null },
+    ]);
+    expect(view.selection).toEqual(defaults);
+  });
+
+  it("allows null reasoning and speed defaults with a known catalog, without selecting a tier", () => {
+    const onIntent = vi.fn();
+    const selection: SelectionView = { modelKey: "example-a", reasoningKey: null, speedKey: null };
+    const view = { ...offlineCodexSignedIn, catalog: speedCatalog, selection };
+    const tree = modelOptions(view, onIntent);
+    const selects = elements(tree, "select");
+    expect(selects.map((item) => item.props.value)).toEqual(["example-a", "", ""]);
+    expect(selectionIssues(view.target, view.catalog, selection)).toEqual([]);
+    expect(isExecutionReady({ ...view, execution: { ...simulatedReady().execution, selection } })).toBe(true);
+    choose(selects[1]!, "example-medium");
+    choose(selects[1]!, "");
+    choose(selects[2]!, "example-standard");
+    choose(selects[2]!, "");
+    expect(onIntent.mock.calls.map(([intent]) => [intent.field, intent.choiceKey])).toEqual([
+      ["reasoning", "example-medium"], ["reasoning", null], ["speed", "example-standard"], ["speed", null],
+    ]);
+    expect(selection).toEqual({ modelKey: "example-a", reasoningKey: null, speedKey: null });
+  });
+
+  it("explicitly clears unsupported reasoning and speed instead of trapping the old overrides", () => {
+    const onIntent = vi.fn();
+    const selection = Object.freeze({ modelKey: "example-a", reasoningKey: "old-effort", speedKey: "old-speed" });
+    const view = { ...offlineCodexSignedIn, catalog: speedCatalog, selection };
+    const tree = modelOptions(view, onIntent);
+    expect(renderToStaticMarkup(tree)).toContain("old-effort (unavailable)");
+    expect(renderToStaticMarkup(tree)).toContain("old-speed (unavailable)");
+    choose(elements(tree, "select")[1]!, "");
+    choose(elements(tree, "select")[2]!, "");
+    expect(onIntent.mock.calls.map(([intent]) => [intent.field, intent.choiceKey])).toEqual([["reasoning", null], ["speed", null]]);
+    expect(selection.reasoningKey).toBe("old-effort");
+    expect(selection.speedKey).toBe("old-speed");
+  });
+
+  it.each(["unverified", "failed", "available"] as const)("retains native defaults with an empty %s catalog without fake readiness", (phase) => {
+    const onIntent = vi.fn();
+    const view: ConfigurationView = { ...simulatedReady(), selection: defaults,
+      catalog: { target: codexFixtureTarget, phase, models: [] },
+      execution: { ...simulatedReady().execution, selection: defaults },
+    };
+    const tree = modelOptions(view, onIntent);
+    expect(selectionIssues(view.target, view.catalog, defaults)).toEqual([]);
+    expect(elements(tree, "select")[0]!.props.value).toBe("");
+    choose(elements(tree, "select")[0]!, "");
+    expect(onIntent).toHaveBeenCalledExactlyOnceWith({ action: "choose-option", target: codexFixtureTarget, field: "model", choiceKey: null });
+    expect(isExecutionReady(view)).toBe(false);
+    expect(renderToStaticMarkup(ConfigurationStatus({ view, isZh: false }))).toContain("not yet verified");
+  });
+
+  it("distinguishes inherited model defaults from unresolved override capabilities", () => {
+    const onIntent = vi.fn();
+    const selection = { modelKey: null, reasoningKey: "old-effort", speedKey: "old-speed" };
+    const view = { ...offlineCodexSignedIn, selection };
+    expect(selectionIssues(view.target, view.catalog, selection)).toHaveLength(2);
+    const tree = modelOptions(view, onIntent);
+    expect(renderToStaticMarkup(tree)).toContain("old-effort (not yet verified)");
+    expect(renderToStaticMarkup(tree)).toContain("old-speed");
+    choose(elements(tree, "select")[1]!, "");
+    click(button(tree, "Remove speed override; use native default"));
+    expect(onIntent.mock.calls.map(([intent]) => [intent.field, intent.choiceKey])).toEqual([["reasoning", null], ["speed", null]]);
+  });
+
+  it("retains all supported explicit values without default substitution", () => {
+    const onIntent = vi.fn();
+    const selection = Object.freeze({ ...offlineCodexSignedIn.selection, speedKey: "example-standard" });
+    const tree = modelOptions({ ...offlineCodexSignedIn, catalog: speedCatalog, selection }, onIntent);
+    expect(elements(tree, "select").map((item) => item.props.value)).toEqual(["example-a", "example-medium", "example-standard"]);
+    expect(onIntent).not.toHaveBeenCalled();
+  });
+});
+
+describe("retained speed overrides without verified capabilities", () => {
+  it.each(["unverified", "unsupported"] as const)("keeps old speed visible after a model change to %s until explicit removal", (evidence) => {
+    const onIntent = vi.fn();
+    const selection = Object.freeze({ ...offlineCodexSignedIn.selection, speedKey: "old-speed" });
+    const previousModel = { ...offlineCodexSignedIn.catalog.models[0]!, speed: {
+      evidence: "backend" as const, options: [{ key: "old-speed", label: { zh: "先前速度覆盖", en: "Previous speed override" } }],
+    } };
+    const nextModel = { ...offlineCodexSignedIn.catalog.models[0]!, key: "without-speed", speed: { evidence, options: [] } };
+    const view = { ...offlineCodexSignedIn, selection, catalog: { ...offlineCodexSignedIn.catalog, models: [previousModel, nextModel] } };
+    const previousTree = modelOptions(view, onIntent);
+    expect(elements(previousTree, "select").find((item) => item.props["aria-label"] === "Service speed")!.props.value).toBe("old-speed");
+    choose(elements(previousTree, "select")[0]!, "without-speed");
+    expect(onIntent).toHaveBeenCalledExactlyOnceWith({ action: "choose-option", target: codexFixtureTarget, field: "model", choiceKey: "without-speed" });
+    const next = { ...view, selection: { ...selection, modelKey: "without-speed" } };
+    const tree = modelOptions(next, onIntent);
+    expect(elements(tree, "select").some((item) => item.props["aria-label"] === "Service speed")).toBe(false);
+    expect(elements(tree, "output")[0]!.props.children).toBe("old-speed");
+    expect(renderToStaticMarkup(tree)).toContain(evidence === "unsupported" ? "does not support speed overrides" : "capabilities are not yet verified");
+    expect(onIntent).toHaveBeenCalledTimes(1);
+    click(button(tree, "Remove speed override; use native default"));
+    expect(onIntent).toHaveBeenLastCalledWith({ action: "choose-option", target: codexFixtureTarget, field: "speed", choiceKey: null });
+    expect(next.selection.speedKey).toBe("old-speed");
+    expect(selection.speedKey).toBe("old-speed");
+    const cleared = modelOptions({ ...next, selection: { ...next.selection, speedKey: null } });
+    expect(elements(cleared, "output")[0]!.props.children).toBe("Use native default");
+    expect(renderToStaticMarkup(cleared)).not.toContain("old-speed");
+  });
+
+  it("suppresses clear intents while disabled", () => {
+    const onIntent = vi.fn();
+    const tree = ModelOptions({ id: "disabled-speed", target: offlineCodexSignedIn.target, catalog: offlineCodexSignedIn.catalog,
+      selection: { ...offlineCodexSignedIn.selection, speedKey: "old-speed" }, isZh: false, disabled: true, onIntent });
+    const clear = button(tree, "Remove speed override; use native default");
+    expect(clear.props.disabled).toBe(true);
+    click(clear);
+    expect(onIntent).not.toHaveBeenCalled();
   });
 });
 

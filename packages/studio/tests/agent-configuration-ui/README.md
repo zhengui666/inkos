@@ -20,9 +20,11 @@ Import the six components and their prop types from
   connection requires a status check before a new sign-in intent.
 - `ModelOptions`: native selects populated exclusively from the scoped catalog.
   Invalid existing values remain visible. Model changes emit a single-field
-  intent; the component never resets reasoning or speed. Speed controls require
-  capability evidence marked `backend`; unverified or unsupported speed never
-  creates a default/fast option, including for Pi.
+  intent; the component never resets reasoning or speed. `null` means inherit the
+  native default; users can select that option explicitly to remove an override.
+  Selectable speed tiers require capability evidence marked `backend`. With no
+  verified tiers, the current speed preference remains visible with an unknown or
+  unsupported reason and an explicit remove-override button, including for Pi.
 - `ConfigurationStatus`: separate installation, authentication, catalog,
   execution and save rows, with visible text, live announcements and inline
   errors. A saved configuration without readiness reads **已保存，待连接** /
@@ -44,6 +46,9 @@ Controls use the product's native elements, Tailwind classes and `isZh` pattern.
    `contextKey`, option keys and attempt keys are opaque internal view identities;
    do not send them as invented API fields. Map them through the configuration
    owner's reviewed adapter.
+   `SelectionIntent.choiceKey: null` explicitly requests native inheritance for
+   that one field. It does not reset the other fields. Missing catalog data is
+   represented by catalog phase/evidence, never by changing a preference to null.
 2. Supply account labels only from the selected target's account state. The UI
    also suppresses labels on target mismatch and on every phase except signed-in.
 3. Resolve actual operations outside this package. Cancel intents carry the
@@ -62,6 +67,10 @@ Controls use the product's native elements, Tailwind classes and `isZh` pattern.
    prerequisites display **尚未验证** / **Not yet verified**, regardless of a
    `ready` phase. Tests fabricate evidence to exercise that rendering branch;
    fabricated inputs are never actual verification.
+   An all-null native preference is valid even before the catalog arrives, but
+   cannot be ready with an empty/unverified catalog. Inheriting a model does not
+   identify its capabilities: explicit reasoning/speed overrides then remain
+   unverified until reviewed or removed, rather than using the first listed model.
 6. Capture `FrozenRunView` when the run starts, using its actual configuration.
    Keep that snapshot independent of edits and new defaults. The component renders
    the snapshot verbatim and has no fallback path between Codex and Pi.
@@ -100,7 +109,7 @@ component/intent rule is checked locally, not that the real service works.
 | 6 | Login success does not mean runnable | Exact-target/selection/evidence readiness tests | Pending: verification result mapping | Pending: real execution verification |
 | 7 | Saved unready Pi says 已保存，待连接; no fallback | Bilingual status and target tests | Pending: actual persisted-default read-back | Pending: save while disconnected |
 | 8 | Codex email cannot leak into Pi/context | Cross-harness/context and signed-out label tests | Pending: correctly scoped account source | Pending: different real accounts |
-| 9 | Pi speed without evidence is absent | Unverified/unsupported capabilities hide controls, even with supplied options | Pending: verified capability adapter | Pending: actual Pi speed support |
+| 9 | Pi has no fabricated speed tiers without evidence | Unverified/unsupported capabilities hide tier selects; retain the current value and explicit removal | Pending: verified capability adapter | Pending: actual Pi speed support |
 | 10 | Model/reasoning/speed are independent; no silent resets | Choice-only intents; unavailable values retained | Pending: explicit owner reconciliation | Pending: real catalogs and model changes |
 | 11 | Old run keeps Codex when new defaults become Pi | Frozen stamp unchanged by default render | Pending: capture true startup snapshot | Pending: concurrent run/default edits |
 | 12 | Keyboard radio/select and focus affordances | Native group/select/button semantics and focus classes asserted | Pending: mount in existing UI | Pending: browser Tab/arrows/focus recovery |
@@ -152,7 +161,40 @@ The first local commit attempt exited 128 because the isolated repository had no
 author identity. The retry uses per-command `Codex <codex@openai.com>` identity,
 matching the baseline commit, without changing global or source-repository config.
 
+## Review remediation: P1 and P2
+
+- P1: `null` now means inherit the native default for model, reasoning and speed.
+  Native-default options remain selectable and emit `choiceKey: null`. Unknown
+  capabilities and unavailable explicit overrides stay separate from that valid
+  preference. Model changes still emit only a model intent. Empty catalogs never
+  create readiness, including with a fabricated ready execution input.
+- P2: after switching from a verified speed tier to a model with unknown or
+  unsupported speed, the old override remains visible with its reason. Only an
+  explicit remove-override click emits the null speed intent; controlled props
+  stay unchanged until the owner supplies a new view. No fake speed tier is added.
+
+All original 35 test cases are retained. One original assertion changed: a model
+select with a mismatched catalog is no longer disabled. The catalog-isolation
+assertions remain; the select now permits only explicit native inheritance when
+no scoped models are available. Keeping it disabled would trap the old override
+and contradict P1. No original test case was deleted.
+
+11 additional cases cover null/default roundtrips, explicit clearing, unresolved
+native-model capabilities, empty catalogs, supported-value retention, transition
+from verified speed to unknown/unsupported speed, and disabled removal.
+
+Remediation reproduction used the documented pinned Vitest command with
+`-t 'native defaults|retained speed overrides'`: exit 1, 10 failed, 1 passed and
+35 original cases skipped by the filter. This reproduced the reported defects
+before the component changes. The exact documented commands above were then run
+twice: targeted Vitest exit 0, 46/46 passed each time; scoped TypeScript exit 0,
+no diagnostics each time. The final Vitest run collected one file, with 0 failed
+and 0 skipped (666 ms wall time). This remediation iteration had 1 nonzero exit
+among 5 test/compiler invocations, the intentional failing reproduction. Final
+test/compiler nonzero count is 0 of 2. Boundary/scope/resource and diff-whitespace
+checks also passed. Actual backend operations remain unverified.
+
 No existing isolated browser preview was found. No router or preview-tool change
 was made; browser keyboard/focus and visual checks remain pending. Full app/CI,
 real sign-in, inference, persistence, deployment and screen-reader tests were not
-run. Parent-owned board synchronization is pending handoff of this evidence.
+run. Board synchronization is cancelled; this package performs no board actions.

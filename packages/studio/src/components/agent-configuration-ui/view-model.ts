@@ -25,6 +25,7 @@ export interface CatalogView extends ScopedView {
   readonly models: readonly ModelView[];
 }
 export interface SelectionView {
+  // null means inherit the harness's native default, never a missing catalog value.
   readonly modelKey: string | null;
   readonly reasoningKey: string | null;
   readonly speedKey: string | null;
@@ -54,7 +55,7 @@ export interface SelectionIntent {
   readonly action: "choose-option";
   readonly target: TargetView;
   readonly field: "model" | "reasoning" | "speed";
-  readonly choiceKey: string;
+  readonly choiceKey: string | null;
 }
 export interface SaveIntent {
   readonly action: "save-defaults";

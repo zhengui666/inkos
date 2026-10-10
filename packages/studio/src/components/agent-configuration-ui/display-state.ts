@@ -5,15 +5,19 @@ export function catalogModels(target: TargetView, catalog: CatalogView) {
 }
 
 export function selectionIssues(target: TargetView, catalog: CatalogView, selection: SelectionView): readonly TextView[] {
+  if (selection.modelKey === null) {
+    const unresolved: TextView[] = [];
+    if (selection.reasoningKey !== null) unresolved.push({ zh: "原生默认模型的推理强度覆盖尚未验证，请核对或移除覆盖。", en: "The reasoning override for the native default model is unverified. Review or remove the override." });
+    if (selection.speedKey !== null) unresolved.push({ zh: "原生默认模型的速度覆盖尚未验证，请核对或移除覆盖。", en: "The speed override for the native default model is unverified. Review or remove the override." });
+    return unresolved;
+  }
   const model = catalogModels(target, catalog).find((item) => item.key === selection.modelKey);
   if (!model) return [{ zh: "所选模型尚未验证或不可用，请核对模型目录。", en: "The selected model is unverified or unavailable. Check the catalog." }];
   const issues: TextView[] = [];
-  if (model.reasoningOptions.length ? !model.reasoningOptions.some((item) => item.key === selection.reasoningKey) : selection.reasoningKey !== null) {
+  if (selection.reasoningKey !== null && !model.reasoningOptions.some((item) => item.key === selection.reasoningKey)) {
     issues.push({ zh: "当前推理强度不可用，请明确选择受支持的选项。", en: "The current reasoning effort is unavailable. Choose a supported option explicitly." });
   }
-  if (model.speed.evidence === "backend" && model.speed.options.length
-    ? !model.speed.options.some((item) => item.key === selection.speedKey)
-    : selection.speedKey !== null) {
+  if (selection.speedKey !== null && (model.speed.evidence !== "backend" || !model.speed.options.some((item) => item.key === selection.speedKey))) {
     issues.push({ zh: "当前速度选项尚未核实或不可用，请核对配置。", en: "The current speed option is unverified or unavailable. Review the configuration." });
   }
   return issues;
@@ -23,6 +27,7 @@ export function isExecutionReady(view: ConfigurationView) {
   const { target, selection, installation, connection, catalog, execution } = view;
   return [installation, connection, catalog, execution].every((item) => sameTarget(target, item.target))
     && installation.phase === "installed" && connection.phase === "signed-in"
+    && catalogModels(target, catalog).length > 0
     && execution.phase === "ready" && execution.evidence === "backend"
     && sameSelection(selection, execution.selection) && selectionIssues(target, catalog, selection).length === 0;
 }
