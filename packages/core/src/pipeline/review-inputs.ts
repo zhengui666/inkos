@@ -6,12 +6,30 @@ import { z } from 'zod';
  * Missing files stay distinct from empty files. Generated intent/context
  * projections are not authority and must not invalidate a review receipt. */
 export const ChapterReviewInputsSchema = z.object({
-  version: z.literal(1),
+  version: z.literal(2),
   plan: z.string().nullable(),
   authorBrief: z.string().nullable(),
   bookRules: z.string().nullable(),
+  bookRulesJson: z.string().nullable(),
+  authorIntent: z.string().nullable(),
+  currentFocus: z.string().nullable(),
+  styleGuide: z.string().nullable(),
+  parentCanon: z.string().nullable(),
+  fanficCanon: z.string().nullable(),
 }).strict();
 export type ChapterReviewInputs = z.infer<typeof ChapterReviewInputsSchema>;
+
+export const ChapterReviewPolicySchema = z.object({
+  requireStoryClosure: z.boolean(),
+  language: z.enum(['zh', 'en']),
+}).strict();
+export type ChapterReviewPolicy = z.infer<typeof ChapterReviewPolicySchema>;
+
+export function sameChapterReviewPolicy(expected: unknown, current: ChapterReviewPolicy): boolean {
+  const parsed = ChapterReviewPolicySchema.safeParse(expected);
+  return parsed.success && parsed.data.requireStoryClosure === current.requireStoryClosure
+    && parsed.data.language === current.language;
+}
 
 export async function readChapterReviewInputs(bookDir: string, chapter: number): Promise<ChapterReviewInputs> {
   if (!Number.isSafeInteger(chapter) || chapter < 1) throw new Error('Invalid review chapter number.');
@@ -27,12 +45,18 @@ export async function readChapterReviewInputs(bookDir: string, chapter: number):
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
   };
   const slug = `story/runtime/chapter-${String(chapter).padStart(4, '0')}`;
-  return { version: 1, plan: await read(`${slug}.plan.json`),
-    authorBrief: await read(`${slug}.user-brief.md`), bookRules: await read('story/book_rules.md') };
+  return { version: 2, plan: await read(`${slug}.plan.json`),
+    authorBrief: await read(`${slug}.user-brief.md`), bookRules: await read('story/book_rules.md'),
+    bookRulesJson: await read('story/book_rules.json'), authorIntent: await read('story/author_intent.md'),
+    currentFocus: await read('story/current_focus.md'), styleGuide: await read('story/style_guide.md'),
+    parentCanon: await read('story/parent_canon.md'), fanficCanon: await read('story/fanfic_canon.md') };
 }
 
 export function sameChapterReviewInputs(expected: unknown, current: ChapterReviewInputs): boolean {
   const parsed = ChapterReviewInputsSchema.safeParse(expected);
   return parsed.success && parsed.data.plan === current.plan && parsed.data.authorBrief === current.authorBrief
-    && parsed.data.bookRules === current.bookRules;
+    && parsed.data.bookRules === current.bookRules && parsed.data.bookRulesJson === current.bookRulesJson
+    && parsed.data.authorIntent === current.authorIntent && parsed.data.currentFocus === current.currentFocus
+    && parsed.data.styleGuide === current.styleGuide && parsed.data.parentCanon === current.parentCanon
+    && parsed.data.fanficCanon === current.fanficCanon;
 }

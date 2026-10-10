@@ -1,4 +1,4 @@
-import { readChapterReviewInputs, sameChapterReviewInputs, type ChapterReviewInputs } from "./review-inputs.js";
+import { readChapterReviewInputs, sameChapterReviewInputs, sameChapterReviewPolicy, type ChapterReviewInputs, type ChapterReviewPolicy } from "./review-inputs.js";
 import { isCreationTransientFailure } from '../creation/transient.js';
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -222,11 +222,12 @@ export class AutonomousChapterRunner {
         return this.block(job, 'STORY_CLOSURE_REVIEW_REQUIRED', 'The final chapter has no source-supported story closure acceptance. The task cannot publish or finish on chapter count alone.');
       }
       if (!issues.length) {
-        if (!sameChapterReviewInputs(result.reviewInputs, await readChapterReviewInputs(this.state.bookDir(job.workId), job.chapter))) {
+        if (!sameChapterReviewInputs(result.reviewInputs, await readChapterReviewInputs(this.state.bookDir(job.workId), job.chapter))
+          || !sameChapterReviewPolicy(result.reviewPolicy, await this.currentReviewPolicy(job))) {
           return this.invalidateReview(job);
         }
         job = { ...job, revisionId: reviewed.revisionId, reviewReceipt: {
-          inputs: result.reviewInputs, revisionId: reviewed.revisionId, reviewedAt: now(), summary: result.summary, observations: result.observations,
+          inputs: result.reviewInputs, reviewPolicy: result.reviewPolicy, revisionId: reviewed.revisionId, reviewedAt: now(), summary: result.summary, observations: result.observations,
         } };
         return this.advance(job, this.options.publisher ? "publishing" : "completed", "review-accepted");
       }
@@ -266,7 +267,8 @@ export class AutonomousChapterRunner {
       const current = await this.chapterRevision(job.workId, job.chapter);
       if (current.revisionId !== job.revisionId || job.reviewReceipt?.revisionId !== current.revisionId
         || unresolvedReview(current.observations).length
-        || !sameChapterReviewInputs(job.reviewReceipt?.inputs, await readChapterReviewInputs(this.state.bookDir(job.workId), job.chapter))) {
+        || !sameChapterReviewInputs(job.reviewReceipt?.inputs, await readChapterReviewInputs(this.state.bookDir(job.workId), job.chapter))
+        || !sameChapterReviewPolicy(job.reviewReceipt?.reviewPolicy, await this.currentReviewPolicy(job))) {
         throw Object.assign(new Error("The chapter or its authoritative review inputs changed; review again before submission."), { code: "CHAPTER_REVIEW_INPUTS_CHANGED" });
       }
     };
@@ -296,10 +298,15 @@ export class AutonomousChapterRunner {
   }
 
   private invalidateReview(job: ScheduledChapter): ScheduledChapter {
-    const next: ScheduledChapter = { ...job, phase: "reviewing", revisionId: undefined, reviewReceipt: undefined,
+    const next: ScheduledChapter = { ...job, phase: "reviewing", reviewReceipt: undefined,
       reviewAttempt: undefined, error: undefined };
     this.store.save(next, "review-invalidated-by-edit", (this.options.now ?? Date.now)());
     return next;
+  }
+
+  private async currentReviewPolicy(job: ScheduledChapter): Promise<ChapterReviewPolicy> {
+    const book = await this.state.loadBookConfig(job.workId);
+    return { requireStoryClosure: this.options.requireStoryClosure?.(job.workId, job.chapter) === true, language: book.language };
   }
 
   private async chapterRevision(workId: string, chapter: number) {

@@ -57,6 +57,21 @@ async function setup(language: "zh" | "en") {
 }
 
 describe("reader contract schema and compatibility", () => {
+  it("parses captured raw rules without consulting a newer file, retaining existing schema validation", async () => {
+    const module = await import("../agents/reader-contract-context.js");
+    const fromRaw = Reflect.get(module, "readerContractContextFromRaw") as (raw: string | null) => Awaited<ReturnType<typeof readerContractContext>>;
+    expect(fromRaw).toBeTypeOf("function");
+    const f = await setup("en"); await mkdir(join(f.bookDir, "story"), { recursive: true });
+    const raw = JSON.stringify({ ...rulesBase, readerContract: routes.en }, null, 2) + "\r\n";
+    await writeFile(join(f.bookDir, "story/book_rules.json"), JSON.stringify({ ...rulesBase, readerContract: routes.zh }));
+    expect(contractFromContext({ chapter: 1, selectedContext: fromRaw(raw) })).toEqual(routes.en);
+    expect(fromRaw(null)).toEqual([]);
+    expect(fromRaw(JSON.stringify(rulesBase))).toEqual([]);
+    for (const invalid of ["", "{", JSON.stringify({ ...rulesBase, version: "future", readerContract: routes.en }), JSON.stringify({ ...rulesBase, readerContract: { mode: "commercial-underdog" } })]) {
+      expect(() => fromRaw(invalid)).toThrow();
+    }
+    expect(await readerContractContext(join(f.bookDir, "story"))).toEqual(fromRaw(JSON.stringify({ ...rulesBase, readerContract: routes.zh })));
+  });
   it.each(["zh", "en"] as const)("keeps %s causal meaning without platform or language quotas", language => {
     expect(ReaderContractSchema.parse(routes[language])).toEqual(routes[language]);
     expect(Value.Check(ReaderContractToolSchema, routes[language])).toBe(true);
@@ -77,6 +92,134 @@ describe("reader contract schema and compatibility", () => {
     expect(await readFile(path, "utf8")).toBe(original);
     await writeFile(path, JSON.stringify({ ...rulesBase, readerContract: { mode: "commercial-underdog" } }));
     await expect(readerContractContext(join(f.bookDir, "story"))).rejects.toThrow();
+  });
+});
+
+describe("captured authority through the real review pipeline", () => {
+  const addedKeys = ["bookRulesJson", "authorIntent", "currentFocus", "styleGuide", "parentCanon", "fanficCanon"] as const;
+  function authority(label: "A" | "B") {
+    const contract: ReaderContract = { mode: "author-directed", familiarPromise: `${label} family promise`, distinctiveHook: `${label} CONTRACT HOOK`, readingPleasure: `${label} family choice`, openingQuestion: `${label} unanswered letter`, proseApproach: `${label} quiet English`, authorDirection: `${label} AUTHOR DIRECTION` };
+    return {
+      version: 2 as const,
+      plan: JSON.stringify({ version: 2, intent: { chapter: 1, goal: `${label} MEMO GOAL` }, memo: { chapter: 1, goal: `${label} MEMO GOAL`, body: `${label} MEMO BODY`, threadRefs: [] }, plannerInputs: [] }) + "\r\n",
+      authorBrief: ` \n${label} AUTHOR BRIEF 🙂\r\n `,
+      bookRules: ` \n${label} BOOK RULES 🙂\r\n `,
+      bookRulesJson: JSON.stringify({ ...rulesBase, readerContract: contract }, null, 2) + "\r\n",
+      authorIntent: ` \n${label} AUTHOR INTENT 🙂\r\n `,
+      currentFocus: ` \n${label} CURRENT FOCUS 🙂\r\n `,
+      styleGuide: ` \n${label} STYLE GUIDE 🙂\r\n `,
+      parentCanon: ` \n${label} PARENT CANON 🙂\r\n `,
+      fanficCanon: ` \n${label} FANFIC CANON 🙂\r\n `,
+    };
+  }
+  type RawAuthority = { [K in Exclude<keyof ReturnType<typeof authority>, "version">]: string | null } & { version: 2 };
+  async function reviewFixture(language: "zh" | "en" = "en") {
+    const f = await setup(language);
+    const { StateManager } = await import("../state/manager.js");
+    const { createInitialRuntimeState } = await import("../state/runtime-state-store.js");
+    const { syncWorkSourceArtifacts } = await import("../harness/source-sync.js");
+    const { PipelineRunner } = await import("../pipeline/runner.js");
+    const state = new StateManager(f.root);
+    await state.saveBookConfig(f.book.id, f.book);
+    await mkdir(join(f.bookDir, "story/runtime"), { recursive: true });
+    await mkdir(join(f.bookDir, "story/outline"), { recursive: true });
+    await mkdir(join(f.bookDir, "chapters"), { recursive: true });
+    await writeFile(join(f.bookDir, "chapters/0001_Gate.md"), "# Chapter 1: Gate\n\nNeri read the letter and chose to return home.");
+    await createInitialRuntimeState({ bookDir: f.bookDir, language });
+    const now = "2026-01-01T00:00:00.000Z";
+    await state.saveChapterIndex(f.book.id, [{ number: 1, title: "Gate", wordCount: 10, provenance: "generated", observations: [], createdAt: now, updatedAt: now }]);
+    const paths = {
+      plan: "story/runtime/chapter-0001.plan.json", authorBrief: "story/runtime/chapter-0001.user-brief.md", bookRules: "story/book_rules.md",
+      bookRulesJson: "story/book_rules.json", authorIntent: "story/author_intent.md", currentFocus: "story/current_focus.md",
+      styleGuide: "story/style_guide.md", parentCanon: "story/parent_canon.md", fanficCanon: "story/fanfic_canon.md",
+    };
+    const writeAuthority = async (raw: RawAuthority) => {
+      await Promise.all(Object.entries(paths).map(([key, path]) => {
+        const value = raw[key as keyof typeof paths], fullPath = join(f.bookDir, path);
+        return value === null ? rm(fullPath, { force: true }) : writeFile(fullPath, value);
+      }));
+    };
+    await writeAuthority(authority("A"));
+    await syncWorkSourceArtifacts({ projectRoot: f.root, workId: f.book.id, accept: true });
+    return { ...f, state, writeAuthority, pipeline: new PipelineRunner({ projectRoot: f.root, client: f.ctx.client, model: "fixture" }) };
+  }
+  function installReviewTransport(options: { inspect?: (prompt: string) => void; beforeInspect?: () => Promise<void>; requireStoryClosure?: boolean } = {}) {
+    const fixture = new CodexFixture(async view => {
+      const name = view.tools[0]!.function.name;
+      if (name === "submit_selected_sources") return { calls: [{ name, args: { selectedIndices: [] } }] };
+      await options.beforeInspect?.();
+      options.inspect?.(view.messages.map(message => message.content).join("\n"));
+      if (name === "submit_chapter_contract") return { calls: [{ name, args: { summary: "Synthetic background inventory", observations: [{ code: "background", assessment: "observation", summary: "Both original memo lines are background for this transport fixture", sourceRefs: [{ sourceId: "chapter-contract-source", startLine: 1, endLine: 2 }] }] } }] };
+      if (name === "submit_chapter_review") return { calls: [{ name, args: { summary: "Captured-input transport fixture", observations: [
+        { code: "chapter-contract-inventory", category: "quality", assessment: "observation", summary: "The original memo remains available", sourceRefs: [{ sourceId: "chapter-contract-source", startLine: 1, endLine: 2 }] },
+        ...(options.requireStoryClosure ? [{ code: "story-closure", category: "quality", assessment: "observation", summary: "The fixture resolves the letter's decision", sourceRefs: [{ sourceId: "chapter-1", startLine: 1, endLine: 1 }] }] : []),
+      ] } }] };
+      throw new Error(`Unexpected model operation ${name}`);
+    });
+    codex.create.mockImplementation(fixture.createClient);
+    return fixture;
+  }
+
+  it.each(["complete", "budgeted"] as const)("uses the nine captured raw values in %s Composer and actual audit prompts despite A-B-A file changes", async mode => {
+    const f = await reviewFixture(), expected = authority("A");
+    const capture = vi.spyOn(await import("../pipeline/review-inputs.js"), "readChapterReviewInputs");
+    await writeFile(join(f.bookDir, "story/outline/story_frame.md"), "# Current scene\nOne letter.\n\n# Distant archive\n" + "Archive details. ".repeat(3000));
+    const original = ComposerAgent.prototype.selectTaskContext;
+    let context: Awaited<ReturnType<typeof original>> | undefined;
+    const selection = vi.spyOn(ComposerAgent.prototype, "selectTaskContext").mockImplementationOnce(async function (this: ComposerAgent, input) {
+      await f.writeAuthority(authority("B"));
+      context = await original.call(this, { ...input, ...(mode === "budgeted" ? { contextBudget: { contextWindowTokens: 4000, reservedOutputTokens: 1024 } } : {}) });
+      return context;
+    });
+    let prompts = 0;
+    const fixture = installReviewTransport({ beforeInspect: () => f.writeAuthority(expected), inspect: prompt => {
+      prompts++;
+      for (const marker of ["MEMO GOAL", "MEMO BODY", "AUTHOR BRIEF", "BOOK RULES", "CONTRACT HOOK", "AUTHOR INTENT", "CURRENT FOCUS", "STYLE GUIDE", "PARENT CANON", "FANFIC CANON"]) {
+        expect(prompt).toContain(`A ${marker}`);
+        expect(prompt).not.toContain(`B ${marker}`);
+      }
+    } });
+    const result = await f.pipeline.reviewChapter(f.book.id, 1);
+    expect(result.reviewInputs).toEqual(expected);
+    expect(Object.keys(result.reviewInputs)).toHaveLength(10);
+    expect(result.reviewPolicy).toEqual({ requireStoryClosure: false, language: "en" });
+    expect(capture).toHaveBeenCalledOnce(); expect(selection).toHaveBeenCalledOnce(); expect(prompts).toBe(2);
+    expect(contractFromContext(context!)).toEqual(JSON.parse(expected.bookRulesJson).readerContract);
+    for (const [key, source] of [["authorIntent", "story/author_intent.md"], ["currentFocus", "story/current_focus.md"], ["styleGuide", "story/style_guide.md"], ["parentCanon", "story/parent_canon.md"], ["fanficCanon", "story/fanfic_canon.md"]] as const) {
+      expect(context!.selectedContext.find(entry => entry.source === source)?.excerpt).toBe(expected[key].trim());
+    }
+    const selectorCalls = fixture.turns.filter(view => view.tools[0]!.function.name === "submit_selected_sources");
+    if (mode === "complete") expect(selectorCalls).toHaveLength(0);
+    else expect(selectorCalls.length).toBeGreaterThan(0);
+  });
+
+  it("keeps captured null authority absent when files are created before real Composer reads them", async () => {
+    const f = await reviewFixture();
+    const expected: RawAuthority = { ...authority("A"), ...Object.fromEntries(addedKeys.map(key => [key, null])) };
+    await f.writeAuthority(expected);
+    const original = ComposerAgent.prototype.selectTaskContext;
+    let context: Awaited<ReturnType<typeof original>> | undefined;
+    vi.spyOn(ComposerAgent.prototype, "selectTaskContext").mockImplementationOnce(async function (this: ComposerAgent, input) {
+      await f.writeAuthority({ ...expected, ...Object.fromEntries(addedKeys.map(key => [key, authority("B")[key]])) });
+      context = await original.call(this, input);
+      return context;
+    });
+    installReviewTransport({ inspect: prompt => {
+      for (const marker of ["CONTRACT HOOK", "AUTHOR INTENT", "CURRENT FOCUS", "STYLE GUIDE", "PARENT CANON", "FANFIC CANON"]) expect(prompt).not.toContain(`B ${marker}`);
+    } });
+    const result = await f.pipeline.reviewChapter(f.book.id, 1);
+    expect(result.reviewInputs).toEqual(expected);
+    expect(contractFromContext(context!)).toBeUndefined();
+    for (const source of [READER_CONTRACT_SOURCE, "story/author_intent.md", "story/current_focus.md", "story/style_guide.md", "story/parent_canon.md", "story/fanfic_canon.md"]) expect(context!.selectedContext.some(entry => entry.source === source)).toBe(false);
+  });
+
+  it.each([{ language: "en", requireStoryClosure: false }, { language: "en", requireStoryClosure: true }, { language: "zh", requireStoryClosure: false }, { language: "zh", requireStoryClosure: true }] as const)("returns independent review policy for $language with closure=$requireStoryClosure", async policy => {
+    const f = await reviewFixture(policy.language);
+    installReviewTransport({ requireStoryClosure: policy.requireStoryClosure });
+    const result = await f.pipeline.reviewChapter(f.book.id, 1, { requireStoryClosure: policy.requireStoryClosure });
+    expect(result.reviewPolicy).toEqual(policy);
+    expect(result.reviewInputs).toEqual(authority("A"));
+    expect(result.observations.some(observation => observation.code === "story-closure")).toBe(policy.requireStoryClosure);
   });
 });
 

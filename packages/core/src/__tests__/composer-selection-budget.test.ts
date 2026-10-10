@@ -1,5 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ComposerAgent, type OutlineSectionSelectionRequest } from "../agents/composer.js";
+import { ZodError } from "zod";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ComposerAgent, composeGovernedChapter, type CompressibleContextCompileRequest, type OutlineSectionSelectionRequest } from "../agents/composer.js";
+import { contractFromContext, READER_CONTRACT_SOURCE } from "../agents/reader-contract-context.js";
+import { readChapterReviewInputs } from "../pipeline/review-inputs.js";
+import { createInitialRuntimeState } from "../state/runtime-state-store.js";
+import type { PlanChapterOutput } from "../agents/planner.js";
+import type { BookConfig } from "../models/book.js";
+import type { ContextPackage } from "../models/input-governance.js";
 import { ProtectedContextOverflowError } from "../harness/context-compiler.js";
 import { withExecutionEvidence } from "../harness/execution-evidence.js";
 import { estimateTextTokens, type LLMClient, type LLMMessage } from "../llm/provider.js";
@@ -12,6 +22,7 @@ vi.mock("../agent/worker-agent.js", () => ({ runWorkerAgentTool: worker.run, run
 type SelectionIndex = { number: number; sourceId: string };
 const WINDOW = 5_496;
 const authorRequest = "Preserve the author's complete constraints.\n" + "授权约束".repeat(100);
+const roots: string[] = [];
 
 function context(extra: Partial<AgentContext> = {}, window: number | undefined = WINDOW): AgentContext {
   return {
@@ -52,7 +63,10 @@ beforeEach(() => {
     selectedIndices: indexOf(messages).map((entry) => entry.number),
   }));
 });
-afterEach(() => { vi.restoreAllMocks(); worker.run.mockReset(); });
+afterEach(async () => {
+  vi.restoreAllMocks(); worker.run.mockReset();
+  await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
+});
 
 describe("bounded composer source selection", () => {
   it.each(["current-state", "role-card"] as const)("covers every %s candidate without truncating the protected author request", async (kind) => {
@@ -227,4 +241,163 @@ describe("bounded composer source selection", () => {
     ] })).toEqual(["memory"]);
     expect(worker.run).toHaveBeenCalledTimes(1);
   });
+});
+
+const authorityPaths = {
+  plan: "runtime/chapter-0001.plan.json",
+  authorBrief: "runtime/chapter-0001.user-brief.md",
+  bookRules: "book_rules.md",
+  bookRulesJson: "book_rules.json",
+  authorIntent: "author_intent.md",
+  currentFocus: "current_focus.md",
+  styleGuide: "style_guide.md",
+  parentCanon: "parent_canon.md",
+  fanficCanon: "fanfic_canon.md",
+} as const;
+type AuthorityField = keyof typeof authorityPaths;
+const literalContextFields = ["authorIntent", "currentFocus", "styleGuide", "parentCanon", "fanficCanon"] as const;
+
+function authorityContract(marker: string) {
+  return {
+    mode: "author-directed" as const,
+    familiarPromise: `${marker} family story`, distinctiveHook: `${marker} letters arrive in reverse order`,
+    readingPleasure: `${marker} relationships change`, openingQuestion: `${marker} why was the last letter unopened?`,
+    proseApproach: `${marker} quiet concrete prose`, authorDirection: `${marker} explicit author direction`,
+  };
+}
+
+function authorityValues(marker: string): Record<AuthorityField, string> {
+  return {
+    plan: JSON.stringify({ marker }), authorBrief: `${marker} author brief`, bookRules: `${marker} book rules`,
+    bookRulesJson: JSON.stringify({ version: "2", prohibitions: [], enableFullCastTracking: false,
+      allowedDeviations: [], readerContract: authorityContract(marker) }),
+    authorIntent: `\n${marker} author intent é🙂\n`, currentFocus: `${marker} current focus`,
+    styleGuide: `${marker} approved style`, parentCanon: `${marker} parent canon`, fanficCanon: `${marker} fanfic canon`,
+  };
+}
+
+async function writeAuthority(bookDir: string, values: Record<AuthorityField, string | null>): Promise<void> {
+  for (const field of Object.keys(authorityPaths) as AuthorityField[]) {
+    const path = join(bookDir, "story", authorityPaths[field]);
+    if (values[field] === null) await rm(path, { force: true });
+    else await writeFile(path, values[field]!);
+  }
+}
+
+async function authorityFixture(withFiles = true, budgeted = false) {
+  const bookDir = await mkdtemp(join(tmpdir(), "inkos-composer-review-inputs-")); roots.push(bookDir);
+  await createInitialRuntimeState({ bookDir, language: "en" });
+  await mkdir(join(bookDir, "story", "runtime"), { recursive: true });
+  const values = authorityValues("CAPTURED-É-🙂");
+  if (withFiles) await writeAuthority(bookDir, values);
+  if (budgeted) await writeFile(join(bookDir, "story", "volume_summaries.md"),
+    "# Earlier voyage\n" + "Lower-priority history about the voyage. ".repeat(4_000));
+  const book: BookConfig = {
+    id: "composer-review-inputs", title: "Captured letters", genre: "family story", platform: "other", language: "en",
+    status: "active", targetChapters: 12, chapterWordCount: 1300,
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+  const plan: PlanChapterOutput = {
+    intent: { chapter: 1, goal: "Read the letter" },
+    memo: { chapter: 1, goal: "Read the letter", body: "The last letter changes a family relationship.", threadRefs: [] },
+    intentMarkdown: "The last letter changes a family relationship.", plannerInputs: [],
+    runtimePath: join(bookDir, "story", "runtime", "chapter-0001.plan.json"),
+  };
+  return { bookDir, book, plan, values };
+}
+
+function expectCapturedContext(contextPackage: ContextPackage, values: Record<AuthorityField, string>): void {
+  for (const field of literalContextFields) {
+    expect(contextPackage.selectedContext.find(entry => entry.source === `story/${authorityPaths[field]}`))
+      .toMatchObject({ protection: "protected", excerpt: values[field].trim() });
+  }
+  expect(contractFromContext(contextPackage)).toEqual(JSON.parse(values.bookRulesJson).readerContract);
+  expect(contextPackage.selectedContext.find(entry => entry.source === READER_CONTRACT_SOURCE)?.protection).toBe("protected");
+}
+
+describe("captured review authority in the real composer", () => {
+  it("keeps the captured corpus on the complete fast path across A-B-A disk changes", async () => {
+    const f = await authorityFixture();
+    const authoritativeInputs = await readChapterReviewInputs(f.bookDir, 1);
+    await writeAuthority(f.bookDir, authorityValues("LATER-B"));
+    const composer = new ComposerAgent(context({ projectRoot: f.bookDir }, 100_000));
+    const input = { book: f.book, bookDir: f.bookDir, chapterNumber: 1, plan: f.plan, authoritativeInputs };
+    const whileChanged = await composer.composeChapter(input);
+    expectCapturedContext(whileChanged.contextPackage, f.values);
+    expect(whileChanged.trace.retrieval?.selectionMode).toBe("complete");
+    await writeAuthority(f.bookDir, f.values);
+    const afterRestored = await composer.composeChapter(input);
+    expect(afterRestored.contextPackage).toEqual(whileChanged.contextPackage);
+    expect(worker.run).not.toHaveBeenCalled();
+  });
+
+  it("keeps captured authority through complete probing, semantic selection and budget compilation when disk goes A-B-A", async () => {
+    const f = await authorityFixture(true, true);
+    const authoritativeInputs = await readChapterReviewInputs(f.bookDir, 1);
+    await writeAuthority(f.bookDir, authorityValues("LATER-B"));
+    worker.run.mockImplementation(async (_client, _model, messages: ReadonlyArray<LLMMessage>) => {
+      expect(await readFile(join(f.bookDir, "story", "style_guide.md"), "utf8")).toContain("LATER-B");
+      await writeAuthority(f.bookDir, f.values);
+      return { selectedIndices: indexOf(messages).map(entry => entry.number) };
+    });
+    const compiler = vi.fn(async (request: CompressibleContextCompileRequest) => {
+      expectCapturedContext({ chapter: 1, selectedContext: request.protectedEntries }, f.values);
+      return "The earlier voyage established the missing letter.";
+    });
+    const input = { book: f.book, bookDir: f.bookDir, chapterNumber: 1, plan: f.plan, authoritativeInputs,
+      contextBudget: { contextWindowTokens: 8_000, reservedOutputTokens: 1_024 },
+      compressibleContextCompiler: compiler };
+    const composed = await new ComposerAgent(context({ projectRoot: f.bookDir }, 100_000)).composeChapter(input);
+    expectCapturedContext(composed.contextPackage, f.values);
+    expect(composed.trace.retrieval?.selectionMode).toBe("semantic");
+    expect(worker.run).toHaveBeenCalledTimes(1);
+    expect(compiler).toHaveBeenCalledTimes(1);
+    expect(composed.trace.compression?.compiledSource).toBe("runtime/compiled-compressible-context");
+    expect(await readFile(join(f.bookDir, "story", "style_guide.md"), "utf8")).toBe(f.values.styleGuide);
+  });
+
+  it.each([["complete", "null"], ["complete", "empty"], ["budgeted", "null"], ["budgeted", "empty"]] as const)
+    ("does not read newly created files on the %s path when captured text is %s", async (path, capturedText) => {
+    const budgeted = path === "budgeted", f = await authorityFixture(false, budgeted);
+    if (capturedText === "empty") await writeAuthority(f.bookDir, { ...f.values, bookRulesJson: null,
+      authorIntent: "", currentFocus: "", styleGuide: "", parentCanon: "", fanficCanon: "" });
+    const authoritativeInputs = await readChapterReviewInputs(f.bookDir, 1);
+    await writeAuthority(f.bookDir, authorityValues("CREATED-AFTER-CAPTURE"));
+    const compiler = vi.fn(async () => "The voyage established the missing letter.");
+    const input = { book: f.book, bookDir: f.bookDir, chapterNumber: 1, plan: f.plan, authoritativeInputs,
+      ...(budgeted ? { contextBudget: { contextWindowTokens: 8_000, reservedOutputTokens: 1_024 },
+        compressibleContextCompiler: compiler } : {}) };
+    const composed = await new ComposerAgent(context({ projectRoot: f.bookDir }, 100_000)).composeChapter(input);
+    expect(composed.contextPackage.selectedContext.some(entry =>
+      literalContextFields.some(field => entry.source === `story/${authorityPaths[field]}`)
+      || entry.source === READER_CONTRACT_SOURCE)).toBe(false);
+    expect(contractFromContext(composed.contextPackage)).toBeUndefined();
+    expect(composed.trace.retrieval?.selectionMode).toBe(budgeted ? "semantic" : "complete");
+    expect(compiler).toHaveBeenCalledTimes(budgeted ? 1 : 0);
+    expect(worker.run).toHaveBeenCalledTimes(budgeted ? 1 : 0);
+    });
+
+  it("passes the same captured inputs through direct governed composition before disk is restored from B to A", async () => {
+    const f = await authorityFixture();
+    const authoritativeInputs = await readChapterReviewInputs(f.bookDir, 1);
+    await writeAuthority(f.bookDir, authorityValues("LATER-B"));
+    const input = { book: f.book, bookDir: f.bookDir, chapterNumber: 1, plan: f.plan, authoritativeInputs,
+      outlineSectionSelector: async () => [], memorySemanticSelector: async () => [],
+      referenceContextProvider: async () => { await writeAuthority(f.bookDir, f.values); return { entries: [], notes: [] }; } };
+    const composed = await composeGovernedChapter(input);
+    expectCapturedContext(composed.contextPackage, f.values);
+    expect(await readFile(join(f.bookDir, "story", "book_rules.json"), "utf8")).toBe(f.values.bookRulesJson);
+    expect(worker.run).not.toHaveBeenCalled();
+  });
+
+  it.each([["", SyntaxError], ["{invalid-json", SyntaxError],
+    [JSON.stringify({ version: "2", readerContract: { mode: "author-directed" } }), ZodError]] as const)
+    ("validates captured raw structured rules instead of replacing malformed authority with valid disk rules (%s)", async (bookRulesJson, errorClass) => {
+      const f = await authorityFixture();
+      const authoritativeInputs = { ...await readChapterReviewInputs(f.bookDir, 1), bookRulesJson };
+      const input = { book: f.book, bookDir: f.bookDir, chapterNumber: 1, plan: f.plan, authoritativeInputs,
+        outlineSectionSelector: async () => [], memorySemanticSelector: async () => [] };
+      await expect(composeGovernedChapter(input)).rejects.toBeInstanceOf(errorClass);
+      expect(worker.run).not.toHaveBeenCalled();
+    });
 });

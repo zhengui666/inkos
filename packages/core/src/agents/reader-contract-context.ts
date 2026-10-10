@@ -11,6 +11,12 @@ export async function readerContractContext(storyDir: string): Promise<ContextPa
   let raw: string;
   try { raw = await readFile(join(storyDir, "book_rules.json"), "utf8"); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+  return readerContractContextFromRaw(raw);
+}
+
+/** Parse captured authority without consulting the current filesystem. */
+export function readerContractContextFromRaw(raw: string | null): ContextPackage["selectedContext"] {
+  if (raw === null) return [];
   const contract = BookRulesSchema.parse(JSON.parse(raw)).readerContract;
   return contract ? [{ source: READER_CONTRACT_SOURCE, protection: "protected",
     reason: "Durable reader promise and causal rise route. Current author changes override generated plans; these plans are not proof of prose delivery.",
