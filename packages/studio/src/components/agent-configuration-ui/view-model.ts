@@ -20,9 +20,16 @@ export interface ModelView extends OptionView {
     readonly options: readonly OptionView[];
   };
 }
+export interface NativeDefaultsView {
+  readonly target: TargetView;
+  readonly evidence: "backend" | "unverified";
+  readonly modelKey: string;
+}
 export interface CatalogView extends ScopedView {
   readonly phase: "unverified" | "loading" | "available" | "unavailable" | "failed" | "partial" | "uncertain";
   readonly models: readonly ModelView[];
+  // Evidence for capability checks only; never replaces a requested or saved null.
+  readonly nativeDefaults?: NativeDefaultsView;
 }
 export interface SelectionView {
   // null means inherit the harness's native default, never a missing catalog value.

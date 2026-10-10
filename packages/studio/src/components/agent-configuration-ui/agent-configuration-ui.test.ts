@@ -411,6 +411,105 @@ describe("retained speed overrides without verified capabilities", () => {
   });
 });
 
+describe("verified native default display evidence", () => {
+  const selection = Object.freeze({ modelKey: null, reasoningKey: "native-high", speedKey: "native-fast" });
+  const nativeModel = {
+    ...offlineCodexSignedIn.catalog.models[0]!, key: "native-model", label: { zh: "已核验原生默认模型", en: "Verified native default model" },
+    reasoningOptions: [{ key: "native-high", label: { zh: "原生高强度", en: "Native high effort" } }],
+    speed: { evidence: "backend" as const, options: [{ key: "native-fast", label: { zh: "原生快速", en: "Native fast tier" } }] },
+  };
+  const nativeDefaults = { target: codexFixtureTarget, evidence: "backend" as const, modelKey: nativeModel.key };
+  function viewWithDefaults(): ConfigurationView {
+    return { ...simulatedReady(), selection,
+      catalog: { ...offlineCodexSignedIn.catalog, models: [...offlineCodexSignedIn.catalog.models, nativeModel], nativeDefaults },
+      execution: { ...simulatedReady().execution, selection }, save: { ...offlineCodexSignedIn.save, selection },
+    };
+  }
+
+  it("validates legal overrides against the verified native model, preserving null in controls and save intents", () => {
+    const view = viewWithDefaults();
+    const onIntent = vi.fn();
+    expect(selectionIssues(view.target, view.catalog, view.selection)).toEqual([]);
+    expect(isExecutionReady(view)).toBe(true);
+    const tree = modelOptions(view, onIntent);
+    expect(elements(tree, "select").map((item) => item.props.value)).toEqual(["", "native-high", "native-fast"]);
+    expect(renderToStaticMarkup(tree)).toContain("Native high effort");
+    expect(renderToStaticMarkup(tree)).toContain("Native fast tier");
+    const onSaveIntent = vi.fn();
+    click(button(panel(view, onSaveIntent), "Save defaults · Codex"));
+    expect(onSaveIntent).toHaveBeenCalledExactlyOnceWith({ action: "save-defaults", target: codexFixtureTarget, selection });
+    expect(onSaveIntent.mock.calls[0]![0].selection.modelKey).toBeNull();
+    expect(view.selection.modelKey).toBeNull();
+    expect(view.save.selection.modelKey).toBeNull();
+    expect(onIntent).not.toHaveBeenCalled();
+  });
+
+  it("rejects overrides unsupported by the known native model while retaining requested values", () => {
+    const view = viewWithDefaults();
+    const unsupported: ConfigurationView = { ...view, catalog: { ...view.catalog, models: [
+      { ...nativeModel, reasoningOptions: [], speed: { evidence: "unsupported", options: [] } },
+    ] } };
+    const issues = selectionIssues(unsupported.target, unsupported.catalog, selection);
+    expect(issues).toHaveLength(2);
+    expect(issues[0]!.en).toContain("reasoning effort is unavailable");
+    expect(issues[1]!.en).toContain("speed option is unverified or unavailable");
+    expect(isExecutionReady(unsupported)).toBe(false);
+    const html = renderToStaticMarkup(modelOptions(unsupported));
+    expect(html).toContain("native-high (unavailable)");
+    expect(html).toContain("native-fast");
+    expect(html).toContain("does not support speed overrides");
+    expect(unsupported.selection).toBe(selection);
+  });
+
+  it.each(["absent", "unverified", "missing-model", "loading-catalog"] as const)("keeps native overrides unverified for %s evidence without first-model fallback", (state) => {
+    const view = viewWithDefaults();
+    const catalog: ConfigurationView["catalog"] = { ...view.catalog,
+      ...(state === "loading-catalog" ? { phase: "loading" as const } : {}),
+      nativeDefaults: state === "absent" ? undefined : {
+        ...nativeDefaults,
+        evidence: state === "unverified" ? "unverified" : "backend",
+        modelKey: state === "missing-model" ? "not-in-catalog" : nativeModel.key,
+      },
+    };
+    const unknown = { ...view, catalog };
+    const issues = selectionIssues(unknown.target, catalog, selection);
+    expect(issues).toHaveLength(2);
+    expect(issues.every((item) => item.en.includes("native default model is unverified"))).toBe(true);
+    expect(isExecutionReady(unknown)).toBe(false);
+    const html = renderToStaticMarkup(modelOptions(unknown));
+    expect(html).not.toContain("Native high effort");
+    expect(html).not.toContain("Native fast tier");
+    expect(html).toContain("native-high (not yet verified)");
+    expect(html).toContain("native-fast");
+    expect(unknown.selection.modelKey).toBeNull();
+  });
+
+  it.each([{ ...codexFixtureTarget, contextKey: "different-context" }, piFixtureTarget])("ignores a native default bound to another target %o", (target) => {
+    const view = viewWithDefaults();
+    const mismatch = { ...view, catalog: { ...view.catalog, nativeDefaults: { ...nativeDefaults, target } } };
+    expect(selectionIssues(mismatch.target, mismatch.catalog, selection)).toHaveLength(2);
+    expect(isExecutionReady(mismatch)).toBe(false);
+    expect(renderToStaticMarkup(modelOptions(mismatch))).not.toContain("Native high effort");
+    expect(mismatch.selection.modelKey).toBeNull();
+  });
+
+  it("requires the catalog context to match even when the nested native evidence matches", () => {
+    const view = viewWithDefaults();
+    const mismatch = { ...view, catalog: { ...view.catalog, target: { ...codexFixtureTarget, contextKey: "different-catalog-context" } } };
+    expect(selectionIssues(mismatch.target, mismatch.catalog, selection)).toHaveLength(2);
+    expect(isExecutionReady(mismatch)).toBe(false);
+    expect(renderToStaticMarkup(modelOptions(mismatch))).not.toContain("Native fast tier");
+  });
+
+  it("uses an explicit model preference independently of native default evidence", () => {
+    const view = viewWithDefaults();
+    const explicit = { ...view, selection: offlineCodexSignedIn.selection };
+    expect(selectionIssues(explicit.target, explicit.catalog, explicit.selection)).toEqual([]);
+    expect(elements(modelOptions(explicit), "select").map((item) => item.props.value)).toEqual(["example-a", "example-medium"]);
+    expect(explicit.selection.modelKey).toBe("example-a");
+  });
+});
+
 describe("explicit controlled save and frozen current-run display", () => {
   it("emits an explicit Pi save while disconnected, taking a copy of the selection", () => {
     const onSaveIntent = vi.fn();

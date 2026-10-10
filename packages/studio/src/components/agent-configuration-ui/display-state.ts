@@ -4,14 +4,22 @@ export function catalogModels(target: TargetView, catalog: CatalogView) {
   return sameTarget(target, catalog.target) && ["available", "partial"].includes(catalog.phase) ? catalog.models : [];
 }
 
+export function selectionModel(target: TargetView, catalog: CatalogView, selection: SelectionView) {
+  const models = catalogModels(target, catalog);
+  if (selection.modelKey !== null) return models.find((item) => item.key === selection.modelKey);
+  const defaults = catalog.nativeDefaults;
+  if (!defaults || defaults.evidence !== "backend" || !sameTarget(target, defaults.target)) return undefined;
+  return models.find((item) => item.key === defaults.modelKey);
+}
+
 export function selectionIssues(target: TargetView, catalog: CatalogView, selection: SelectionView): readonly TextView[] {
-  if (selection.modelKey === null) {
+  const model = selectionModel(target, catalog, selection);
+  if (selection.modelKey === null && !model) {
     const unresolved: TextView[] = [];
     if (selection.reasoningKey !== null) unresolved.push({ zh: "原生默认模型的推理强度覆盖尚未验证，请核对或移除覆盖。", en: "The reasoning override for the native default model is unverified. Review or remove the override." });
     if (selection.speedKey !== null) unresolved.push({ zh: "原生默认模型的速度覆盖尚未验证，请核对或移除覆盖。", en: "The speed override for the native default model is unverified. Review or remove the override." });
     return unresolved;
   }
-  const model = catalogModels(target, catalog).find((item) => item.key === selection.modelKey);
   if (!model) return [{ zh: "所选模型尚未验证或不可用，请核对模型目录。", en: "The selected model is unverified or unavailable. Check the catalog." }];
   const issues: TextView[] = [];
   if (selection.reasoningKey !== null && !model.reasoningOptions.some((item) => item.key === selection.reasoningKey)) {

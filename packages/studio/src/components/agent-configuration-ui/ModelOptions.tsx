@@ -1,4 +1,4 @@
-import { catalogLabels, catalogModels, selectionIssues } from "./display-state";
+import { catalogLabels, catalogModels, selectionIssues, selectionModel } from "./display-state";
 import { buttonClass, fieldClass, harnessLabel, localize, sameTarget, text, type CatalogView, type OptionView, type SelectionIntent, type SelectionView, type TargetView } from "./view-model";
 
 export interface ModelOptionsProps {
@@ -14,7 +14,7 @@ export interface ModelOptionsProps {
 export function ModelOptions({ id, target, catalog, selection, isZh, disabled, onIntent }: ModelOptionsProps) {
   const matches = sameTarget(target, catalog.target);
   const models = catalogModels(target, catalog);
-  const model = models.find((item) => item.key === selection.modelKey);
+  const model = selectionModel(target, catalog, selection);
   const issues = selectionIssues(target, catalog, selection);
   const speedVerified = model?.speed.evidence === "backend";
   const nativeDefault = text(isZh, "使用原生默认", "Use native default");
