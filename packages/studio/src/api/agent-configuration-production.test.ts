@@ -522,19 +522,30 @@ describe("mounted Studio routes with real Core account/attempt/SQLite owner and 
     expect((await readAgentSettings(root)).modelConnectionRef).toBeNull();
   });
 
-  it("ignores a navigation-away login reply, keeps Pi unavailable and recovers the same pending owner on return", async () => {
+  it("ignores a navigation-away login reply, observes installed Pi with missing auth and recovers the same pending Codex owner on return", async () => {
     peer.authenticated = false; const { controller, httpCalls, view } = ui(); await controller.refresh();
     const entered = deferred<void>(); const release = deferred<void>();
     peer.beforeRequest = async method => { if (method === "account/login/start") { entered.resolve(); await release.promise; } };
     controller.connectionIntent({ action: "connect", target: controller.getSnapshot().target }); await entered.promise;
-    controller.selectTarget({ harness: "pi", contextKey: "unobserved" }); await controller.refresh(); release.resolve();
+    const pendingOwner = owner().snapshot(), rpcCountBeforePi = peer.calls.length;
+    expect(pendingOwner).toMatchObject({ localState: "transitioning" }); expect(pendingOwner!.operationId).not.toBeNull();
+    controller.selectTarget({ harness: "pi", contextKey: "unobserved" }); await controller.refresh();
+    const piObservation = controller.getSnapshot().state;
+    release.resolve();
     await vi.waitFor(() => expect(httpCalls).toContainEqual({ method: "POST", path: `${prefix}/harnesses/codex/login`, status: 200 }));
-    expect(controller.getSnapshot().target.harness).toBe("pi"); expect(controller.getSnapshot().state?.availability).toBe("unavailable");
-    expect(view().connection.phase).toBe("unverified"); expect(view().execution.phase).toBe("unverified");
+    expect(controller.getSnapshot().target.harness).toBe("pi"); expect(controller.getSnapshot().state).toBe(piObservation);
+    expect(piObservation).toMatchObject({ harnessId: "pi", availability: "available", installation: "installed", localAuthentication: "missing",
+      scope: { harnessId: "pi", ownerGeneration: null }, account: null, catalog: null, execution: null });
+    expect(piObservation?.connection).toBeUndefined(); expect(controller.getSnapshot().ownerGeneration).toBeNull();
+    expect(view().installation.phase).toBe("installed"); expect(view().connection.phase).toBe("signed-out");
+    expect(view().catalog.phase).toBe("unavailable"); expect(view().execution.phase).toBe("unverified");
+    expect(existsSync(join(root, "unconfigured-pi"))).toBe(false); expect(peer.calls).toHaveLength(rpcCountBeforePi);
+    expect(owner().snapshot()).toEqual(pendingOwner); expect(peer.count("account/login/cancel")).toBe(0);
     expect(controller.getSnapshot().authBusy).toBeNull(); expect(peer.count("account/login/start")).toBe(1);
     controller.selectTarget({ harness: "codex", contextKey: "unobserved" }); await controller.refresh();
     expect(controller.getSnapshot().state?.connection?.login).toMatchObject({ loginId: "login-1", status: "pending" });
     expect(view().connection.phase).toBe("signing-in"); expect(peer.count("account/login/start")).toBe(1);
+    expect(owner().snapshot()).toEqual(pendingOwner);
     controller.closeConnection(); await vi.waitFor(() => expect(controller.getSnapshot().state?.connection?.login?.status).toBe("cancelled"));
     expect(peer.count("account/login/cancel")).toBe(1); expect(factory).toHaveBeenCalledTimes(1);
   });

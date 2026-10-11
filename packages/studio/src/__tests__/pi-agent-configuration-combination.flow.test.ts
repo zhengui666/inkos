@@ -1,7 +1,7 @@
 import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { CodexFixture } from "../../../core/src/__tests__/codex-fixture.js";
 
 const createCodexClient = vi.hoisted(() => vi.fn());
@@ -21,7 +21,15 @@ import { createStudioServer, shutdownStudioServer } from "../api/server.js";
 // Actual HTTP callers, dispatchers, native SDK/parser, owner/SQLite guards,
 // transcripts and history projections run unchanged. Only external fetch bytes
 // and the lowest Codex protocol peer are synthetic. No OAuth or inference occurs.
-const fixtures: Array<Awaited<ReturnType<typeof studio>>> = [];
+interface StudioFixture {
+  readonly root: string;
+  readonly agentDir: string;
+  readonly app: ReturnType<typeof createStudioServer>;
+  readonly sessions: Set<string>;
+  readonly accountPeerFactory: Mock<CodexFixture["createClient"]>;
+  session(): Promise<string>;
+}
+const fixtures: StudioFixture[] = [];
 const releases: Array<() => void> = [];
 const pending: Array<Promise<Response>> = [];
 const credential = (suffix = "first", expires = Date.now() + 3_600_000) => ({
@@ -64,7 +72,7 @@ function rawResponse(message: string, id: string): Response {
   return new Response(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""),
     { status: 200, headers: { "content-type": "text/event-stream" } });
 }
-async function studio(auth: "valid" | "missing" | "invalid" | "expired" = "valid", codex?: CodexFixture) {
+async function studio(auth: "valid" | "missing" | "invalid" | "expired" = "valid", codex?: CodexFixture): Promise<StudioFixture> {
   const root = await mkdtemp(join(tmpdir(), "inkos-studio-pi-combination-"));
   const agentDir = join(root, "isolated-pi-home");
   vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
@@ -78,12 +86,13 @@ async function studio(auth: "valid" | "missing" | "invalid" | "expired" = "valid
     await writeFile(join(agentDir, "settings.json"), JSON.stringify({ defaultProvider: "openai", defaultModel: "gpt-5.4", defaultThinkingLevel: "low" }));
   }
   await writeFile(join(root, "inkos.json"), JSON.stringify({ name: "Offline Pi caller", version: "0.1.0", language: "en" }));
-  const factory = codex?.createClient ?? (async () => { throw new Error("Codex fallback forbidden"); });
+  const factory: CodexFixture["createClient"] = codex?.createClient ?? (async () => { throw new Error("Codex fallback forbidden"); });
   createCodexClient.mockImplementation(factory);
-  const accountService = createCodexAccountService({ projectDir: root, clientFactory: factory });
+  const accountPeerFactory = vi.fn(factory);
+  const accountService = createCodexAccountService({ projectDir: root, clientFactory: accountPeerFactory });
   const app = createStudioServer({} as never, root, { codexAccountService: accountService });
   const sessions = new Set<string>();
-  const fixture = { root, agentDir, app, sessions, async session() {
+  const fixture: StudioFixture = { root, agentDir, app, sessions, accountPeerFactory, async session() {
     const response = await app.request("/api/v1/sessions", post({ sessionKind: "chat" }));
     expect(response.status, await response.clone().text()).toBe(200);
     const { session } = await response.json(); sessions.add(session.sessionId); return session.sessionId as string;
@@ -100,7 +109,7 @@ async function saveHarness(fixture: { root: string; app: ReturnType<typeof creat
   expect(response.status, await response.clone().text()).toBe(200);
   return (await response.json()).settings;
 }
-function run(fixture: Awaited<ReturnType<typeof studio>>, sessionId: string, instruction: string): Promise<Response> {
+function run(fixture: StudioFixture, sessionId: string, instruction: string): Promise<Response> {
   // app.request invokes the actual existing Hono route; global fetch below is
   // reserved exclusively for the official SDK's external native transport.
   const response = Promise.resolve(fixture.app.request("/api/v1/agent", post({ sessionId, instruction })));
@@ -158,12 +167,22 @@ describe("actual Studio Pi dispatcher and durable request history (offline nativ
     const admitted = await readAgentSettings(fixture.root);
     expect(admitted).toMatchObject({ selectedHarnessId: "pi", revision: piRevision });
     expect(admitted.modelConnectionRef).not.toBeNull(); expect(createCodexClient).not.toHaveBeenCalled();
+    expect(fixture.accountPeerFactory).not.toHaveBeenCalled(); expect(codex.requests).toEqual([]); expect(codex.turns).toEqual([]);
     const saved = await saveHarness(fixture, "codex");
     expect(saved).toMatchObject({ selectedHarnessId: "codex", revision: piRevision + 1, modelConnectionRef: null });
+    // Saving the concrete Codex defaults validates their real catalog using
+    // the account service's observation peer. It does not dispatch a Codex run.
+    expect(fixture.accountPeerFactory).toHaveBeenCalledOnce(); expect(createCodexClient).not.toHaveBeenCalled();
+    expect(codex.requests.map(request => request.method)).toEqual([
+      "account/read", "account/read", "model/list", "config/read", "account/read", "account/read",
+    ]);
+    expect(codex.turns).toEqual([]);
+    const savedObservation = structuredClone(codex.requests);
     gate.release(); const firstResponse = await first;
     expect(firstResponse.status, await firstResponse.clone().text()).toBe(200);
     expect((await firstResponse.json()).response).toBe("Frozen actual Pi answer");
-    expect(network).toHaveBeenCalledOnce(); expect(createCodexClient).not.toHaveBeenCalled(); expect(codex.requests).toEqual([]);
+    expect(network).toHaveBeenCalledOnce(); expect(createCodexClient).not.toHaveBeenCalled();
+    expect(fixture.accountPeerFactory).toHaveBeenCalledOnce(); expect(codex.requests).toEqual(savedObservation); expect(codex.turns).toEqual([]);
     const recordedPi = await history(fixture.root, sessionId);
     expect(recordedPi.projected.issues).toEqual([]); expect(recordedPi.projected.requests).toHaveLength(1);
     const pi = recordedPi.projected.requests[0]!;

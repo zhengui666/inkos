@@ -1,8 +1,9 @@
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { findPackageJSON } from "node:module";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ModelRuntime, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { createCodexAccountService, readAgentSettings, updateAgentSettings, withRuntimeExecution } from "@actalk/inkos-core";
 import { createStudioServer, shutdownStudioServer } from "./server.js";
 import { catalogMatchesState, type HarnessState } from "../shared/agent-configuration.js";
@@ -13,6 +14,12 @@ vi.mock("../../../core/src/runtime/auth/pi-native-store-compat.js", async () => 
   const { createRequire } = await import("node:module");
   return createRequire(import.meta.url)("../../../core/src/runtime/auth/pi-native-store-compat.ts");
 });
+
+// The SDK is Core's declared dependency. Observe that same installed module
+// without adding an undeclared direct dependency to Studio.
+const sdkManifest = findPackageJSON("@earendil-works/pi-coding-agent", new URL("../../../core/src/index.ts", import.meta.url));
+if (!sdkManifest) throw new Error("Core's installed Pi SDK must be available for this integration test");
+const { ModelRuntime, SettingsManager } = await import(pathToFileURL(join(dirname(sdkManifest), "dist/index.js")).href);
 
 const native = { model: null, effort: null, speed: null };
 const prefix = "/api/v1/agent-configuration";

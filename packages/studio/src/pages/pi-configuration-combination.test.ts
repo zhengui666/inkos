@@ -139,6 +139,7 @@ function mount<P extends object>(Component: (props: P) => ReactNode, props: P) {
       if (!isValidElement<Record<string, unknown>>(node)) return node;
       const component = renderable(node.type);
       if (component) {
+        const renderComponent = component.render, componentProps = node.props;
         const key = `${path}:${component.name}:${node.key ?? ""}`; used.add(key);
         const frame = frames.get(key) ?? { cursor: 0, slots: [], effects: [], mounted: true, schedule };
         frames.set(key, frame); frame.cursor = 0; components.set(component.name, node);
@@ -150,7 +151,7 @@ function mount<P extends object>(Component: (props: P) => ReactNode, props: P) {
         // after boundary.leave. Capture returns no DOM and adds no product wrapper.
         function Capture() {
           boundary.enter(frame);
-          try { result = component!.render(node.props); } finally { boundary.leave(); }
+          try { result = renderComponent(componentProps); } finally { boundary.leave(); }
           return null;
         }
         renderToStaticMarkup(createElement(Capture));
@@ -434,7 +435,8 @@ describe("real Pi settings page and ChatPage → default fetchJson → TCP/Hono 
   it("retains a trusted stored unsupported speed override until the user explicitly clears it and real Pi CAS accepts null", async () => {
     const value = await fixture({ unsupportedSpeed: true }), page = value.mounts(AgentSettings, { isZh: false }); await loaded(page);
     expect(page.snapshot().draft.speed).toBe("fast");
-    expect(page.native("output").find(node => node.props["aria-label"] === "Current speed preference")?.props.children).toBe("fast");
+    const speedOutput = page.native("output").find(node => node.props["aria-label"] === "Current speed preference");
+    expect(speedOutput).toBeDefined(); expect(contents(speedOutput!.props.children as ReactNode)).toBe("fast");
     expect(page.native("select").some(node => node.props["aria-label"] === "Service speed")).toBe(false);
     expect(page.markup()).toContain("This model does not support speed overrides.");
     const original = { ...page.snapshot().draft }, before = await value.disk();
