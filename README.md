@@ -116,6 +116,8 @@ InkOS 2.0 把“Chat Agent 调工具”和“各类作品管线”收敛成一�
 npm i -g @actalk/inkos
 ```
 
+本地同源三包可通过 [bundle + Shell 安装入口](docs/local-bundle-install.md) 安装到一个明确的新目录（Node.js >=22.19.0）。此入口使用本地 tgz，第三方运行依赖仍需要 npm 网络或缓存；尚无公开发行资产下载入口，不支持原地更新。
+
 ### 通过 OpenClaw 使用 🦞
 
 InkOS 已发布为 [OpenClaw](https://clawhub.ai/narcooo/inkos) Skill，可被任何兼容 Agent（Claude Code、OpenClaw 等）直接调用：
