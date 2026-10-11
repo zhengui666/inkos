@@ -313,7 +313,7 @@ export const doctorCommand = new Command("doctor")
                 ], { maxTokens: 16 });
 
                 connected = true;
-                detectedDetail = `OK (model: ${model}, apiFormat=${plan.apiFormat}, stream=${plan.stream}, tokens: ${response.usage.totalTokens})`;
+                detectedDetail = `OK (model: ${model}, apiFormat=${plan.apiFormat}, stream=${plan.stream}, tokens: ${response.usage?.totalTokens ?? "unavailable"})`;
                 break;
               } catch (error) {
                 lastError = error instanceof Error ? error.message : String(error);

@@ -1,5 +1,42 @@
-import { describe, expect, it } from "vitest";
-import { buildDoctorModelCandidates, resolveDoctorModelsBaseUrl } from "../commands/doctor.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+const mocks = vi.hoisted(() => ({
+  log: vi.fn(), readFile: vi.fn(), chat: vi.fn(), createClient: vi.fn(),
+  fetch: vi.fn(), createAccount: vi.fn(), readiness: vi.fn(), dispose: vi.fn(), parseConfig: vi.fn(),
+}));
+const llm = { provider: "openai", model: "fixture-model", baseUrl: "http://127.0.0.1:1", apiKey: "", apiFormat: "chat", stream: false };
+vi.mock("node:fs/promises", () => ({ readFile: mocks.readFile }));
+vi.mock("../utils.js", () => ({
+  findProjectRoot: () => "/controlled/doctor-fixture", GLOBAL_ENV_PATH: "/controlled/empty-env",
+  log: mocks.log, logError: vi.fn(), loadConfig: async () => ({ llm }),
+  loadConfigWithDiagnostics: async () => ({ llm, diagnostics: {
+    configMode: "fixture", serviceSource: "fixture", modelSource: "fixture", apiKeySource: "none", warnings: [],
+  } }),
+}));
+vi.mock("../runtime-requirements.js", () => ({
+  evaluateNodeRuntimeSupport: () => ({ ok: true, detail: "fixture" }),
+  inspectNodeRuntimePinFiles: async () => ({ ok: true, detail: "fixture" }),
+  ensureNodeRuntimePinFiles: vi.fn(),
+}));
+vi.mock("@actalk/inkos-core", () => ({
+  fetchWithProxy: mocks.fetch, chatCompletion: mocks.chat, createLLMClient: mocks.createClient,
+  LLMConfigSchema: { parse: mocks.parseConfig },
+  isApiKeyOptionalForEndpoint: () => true, resolveServiceModelsBaseUrl: () => undefined,
+  StateManager: class { async listBooks() { return []; } },
+  createCodexAccountService: mocks.createAccount, inspectCodexReadiness: mocks.readiness,
+}));
+import { buildDoctorModelCandidates, doctorCommand, resolveDoctorModelsBaseUrl } from "../commands/doctor.js";
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mocks.readFile.mockResolvedValue("{}");
+  mocks.createClient.mockReturnValue({});
+  mocks.createAccount.mockReturnValue({ dispose: mocks.dispose });
+  mocks.readiness.mockResolvedValue({ model: "fixture", reasoningEffort: "medium", serviceTier: "default" });
+  mocks.dispose.mockResolvedValue(undefined);
+  mocks.fetch.mockRejectedValue(new Error("Network is forbidden in this fixture"));
+  vi.stubGlobal("fetch", mocks.fetch);
+});
+afterEach(() => vi.unstubAllGlobals());
 
 describe("doctor model candidate probing", () => {
   it("keeps the configured model first, then tries discovered models without duplicates", () => {
@@ -33,4 +70,24 @@ describe("doctor model candidate probing", () => {
     expect(modelsBaseUrl).toBe("https://dashscope.aliyuncs.com/compatible-mode/v1");
   });
 
+});
+
+describe("doctor successful provider usage display", () => {
+  it.each([
+    { usage: undefined, display: "unavailable" },
+    { usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, display: "0" },
+    { usage: { promptTokens: 10, completionTokens: 7, totalTokens: 17 }, display: "17" },
+  ])("keeps connectivity successful with tokens=$display and one probe", async ({ usage, display }) => {
+    mocks.chat.mockResolvedValue({ content: "OK", usage });
+    await doctorCommand.parseAsync(["--provider"], { from: "user" });
+    const output = mocks.log.mock.calls.map(call => call[0]).join("\n");
+    expect(output).toContain(`[OK] API Connectivity: OK (model: fixture-model, apiFormat=chat, stream=false, tokens: ${display})`);
+    expect(mocks.chat).toHaveBeenCalledOnce();
+    expect(mocks.createClient).toHaveBeenCalledOnce();
+    expect(mocks.fetch).not.toHaveBeenCalled();
+    expect(mocks.parseConfig).not.toHaveBeenCalled();
+    expect(mocks.createAccount).toHaveBeenCalledOnce();
+    expect(mocks.readiness).toHaveBeenCalledOnce();
+    expect(mocks.dispose).toHaveBeenCalledOnce();
+  });
 });
