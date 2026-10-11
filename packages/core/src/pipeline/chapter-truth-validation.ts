@@ -4,6 +4,7 @@ import type { BookConfig } from "../models/book.js";
 import type { ContextPackage } from "../models/input-governance.js";
 import type { Logger } from "../utils/logger.js";
 import type { LengthLanguage } from "../utils/length-metrics.js";
+import { isCreationTransientFailure } from "../creation/transient.js";
 import { reconcileChapterStateAfterReview } from "./chapter-state-recovery.js";
 import { loadRuntimeStateSnapshot } from "../state/runtime-state-store.js";
 import {
@@ -52,6 +53,12 @@ export async function validateChapterTruthPersistence(params: {
       params.authorityContext,
     );
   } catch (error) {
+    const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+    // Chapter goals classify the immediate code; retain wrappers and uncertain effects as unavailable.
+    if (isCreationTransientFailure(error) && typeof code === "string"
+      && ["MODEL_UNAVAILABLE", "WORKER_TIMEOUT", "ECONNRESET", "ETIMEDOUT", "RATE_LIMITED"].includes(code)) {
+      throw error;
+    }
     params.logger?.warn(`State validation error for chapter ${params.chapterNumber}: ${String(error)}`);
     return {
       validation: {

@@ -10,6 +10,7 @@ import type { Logger } from "../utils/logger.js";
 import type { BookConfig } from "../models/book.js";
 import type { ContextPackage } from "../models/input-governance.js";
 import type { LengthLanguage } from "../utils/length-metrics.js";
+import { isCreationTransientFailure } from "../creation/transient.js";
 
 export interface SettlementRetryParams {
   readonly writer: Pick<WriterAgent, "settleChapterState">;
@@ -85,6 +86,12 @@ export async function reconcileChapterStateAfterReview(
       params.authorityContext,
     );
   } catch (error) {
+    const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+    // Chapter goals classify the immediate code; retain wrappers and uncertain effects as unavailable.
+    if (isCreationTransientFailure(error) && typeof code === "string"
+      && ["MODEL_UNAVAILABLE", "WORKER_TIMEOUT", "ECONNRESET", "ETIMEDOUT", "RATE_LIMITED"].includes(code)) {
+      throw error;
+    }
     const validation: ValidationResult = {
       consistent: false,
       reconciliationRequired: true,
