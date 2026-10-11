@@ -1,4 +1,5 @@
 import { access, readFile, realpath } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { findPackageJSON } from "node:module";
@@ -121,6 +122,43 @@ function checkSignal(signal?: AbortSignal): void {
   if (signal?.aborted) throw new DOMException("Pi auth operation cancelled", "AbortError");
 }
 
+/** Private read-only evidence. Undefined from the SDK one-off reader alone is insufficient. */
+export async function inspectPiStoredOAuth(authPath: string, signal?: AbortSignal): Promise<Readonly<{
+  kind: 'absent'; credential: undefined;
+} | { kind: 'oauth'; credential: Credential }>> {
+  if (!isAbsolute(authPath)) throw new Error('Pi auth inspection requires an explicit absolute path');
+  signal?.throwIfAborted();
+  let content: string;
+  try { content = await readFile(authPath, 'utf8'); }
+  catch (error) {
+    signal?.throwIfAborted();
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return Object.freeze({ kind: 'absent', credential: undefined });
+    throw new Error('Pi auth storage could not be inspected');
+  }
+  signal?.throwIfAborted();
+  return decodeStoredOAuth(content);
+}
+function decodeStoredOAuth(content: string): Readonly<{ kind: 'absent'; credential: undefined } | { kind: 'oauth'; credential: Credential }> {
+  let root: unknown;
+  try { root = JSON.parse(content.replace(/^\uFEFF/, '')); } catch { throw new Error('Pi auth storage is not a valid object'); }
+  if (!root || typeof root !== 'object' || Array.isArray(root)) throw new Error('Pi auth storage is not a valid object');
+  if (!Object.hasOwn(root, 'openai')) return Object.freeze({ kind: 'absent', credential: undefined });
+  const credential = oauthOnly((root as Record<string, unknown>).openai);
+  if (!credential) throw new Error('Pi ChatGPT OAuth entry is not valid');
+  return Object.freeze({ kind: 'oauth', credential });
+}
+/** Synchronous evidence used only inside the short metadata CAS, never a writer. */
+export function inspectPiStoredOAuthSync(authPath: string): ReturnType<typeof decodeStoredOAuth> {
+  if (!isAbsolute(authPath)) throw new Error('Pi auth inspection requires an explicit absolute path');
+  let content: string;
+  try { content = readFileSync(authPath, 'utf8'); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return Object.freeze({ kind: 'absent', credential: undefined });
+    throw new Error('Pi auth storage could not be inspected');
+  }
+  return decodeStoredOAuth(content);
+}
+
 /** Explicit path only. Native locks and writes remain entirely owned by Pi. */
 export async function createPiNativeStoreCompat(authPath: string): Promise<PiCredentialStore> {
   if (!isAbsolute(authPath)) throw new Error("Pi auth storage requires an explicit absolute path");
@@ -146,8 +184,19 @@ export async function createPiNativeStoreCompat(authPath: string): Promise<PiCre
       requireOpenAI(provider); checkSignal(options?.signal);
       try {
         const storage = (await native(true))!;
-        return oauthOnly(await storage.modify(provider, async raw => oauthOnly(await fn(oauthOnly(raw))), options));
-      } catch { checkSignal(options?.signal); throw new Error("Pi native OAuth credential mutation failed"); }
+        return oauthOnly(await storage.modify(provider, async raw => {
+          const current = oauthOnly(raw);
+          // This callback still holds the official native file lock. Reinspect
+          // the captured canonical target; never repair scalar/damaged roots.
+          const inspected = await inspectPiStoredOAuth(authPath, options?.signal);
+          if (JSON.stringify(inspected.credential) !== JSON.stringify(current)) throw new Error('Pi locked OAuth evidence changed');
+          return oauthOnly(await fn(current));
+        }, options));
+      } catch (error) {
+        // Cancellation must not overwrite a distinct saving/verification error.
+        if (options?.signal?.aborted && (error === options.signal.reason || (error as { name?: unknown })?.name === 'AbortError')) checkSignal(options.signal);
+        throw new Error("Pi native OAuth credential mutation failed");
+      }
     },
     async delete(provider, options) {
       requireOpenAI(provider); checkSignal(options?.signal);

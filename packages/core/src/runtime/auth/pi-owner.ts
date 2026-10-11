@@ -1,13 +1,13 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
 import { z } from 'zod';
 import { withBookLockGuard } from '../../state/book-lock-guard.js';
 import type { ModelConnectionAdmission, RuntimeSelection } from '../contracts.js';
 import { RuntimeAuthenticationError } from './codex-owner.js';
-import { createPiNativeStoreCompat, type PiCredentialStore } from './pi-native-store-compat.js';
+import { createPiNativeStoreCompat, inspectPiStoredOAuthSync, type PiCredentialStore } from './pi-native-store-compat.js';
 
 export interface PiHostScope {
   readonly projectRoot: string; readonly cwd: string; readonly agentDir: string;
@@ -43,14 +43,42 @@ function credentialRef(value: Credential | undefined): string {
   }
   return digest('inkos/pi/oauth-continuity/v1', JSON.stringify(sorted(value)));
 }
+const NativeMarkerSchema = z.object({
+  kind: z.enum(['refresh', 'login']), operationId: z.string().min(1),
+  authContextRef: z.string().min(1), connectionRef: z.string().min(1),
+  authGeneration: z.number().int().positive().safe(),
+}).strict();
+const RefreshMarkerSchema = z.union([
+  NativeMarkerSchema.extend({ kind: z.literal('refresh') }),
+  // Existing markers remain blocking; only new operations issue full immutable tickets.
+  z.object({ operationId: z.string().min(1), authGeneration: z.number().int().positive().safe() }).strict(),
+]);
 const RecordSchema = z.object({
   schemaVersion: z.literal(1), harnessId: z.literal('pi'), authContextRef: z.string().min(1),
   connectionRef: z.string().min(1), authGeneration: z.number().int().positive().safe(),
-  localState: z.enum(['ready', 'unknown']), operationId: z.null(), credentialRef: z.string().regex(/^[a-f0-9]{64}$/),
-  pendingRefresh: z.object({ operationId: z.string().min(1), authGeneration: z.number().int().positive().safe() }).strict().optional(),
-}).strict();
+  localState: z.enum(['ready', 'unknown']), operationId: z.null(), credentialRef: z.string().regex(/^[a-f0-9]{64}$/).nullable(),
+  pendingRefresh: RefreshMarkerSchema.optional(),
+  pendingLogin: NativeMarkerSchema.extend({ kind: z.literal('login'), closed: z.boolean() }).optional(),
+}).strict().superRefine((record, context) => {
+  if ((record.pendingRefresh && record.pendingLogin) || (record.localState === 'ready' && (record.credentialRef === null || record.pendingLogin))) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid Pi native operation state' });
+  }
+});
 type OwnerRecord = z.infer<typeof RecordSchema>;
 export type PiAuthenticationTarget = Pick<RuntimeSelection, 'harnessId' | 'authContextRef' | 'connectionRef' | 'authGeneration'>;
+/** Internal capability. Browser callers receive an unrelated service-local handle. */
+export interface PiLoginTicket {
+  readonly kind: 'login'; readonly operationId: string; readonly authContextRef: string;
+  readonly connectionRef: string; readonly authGeneration: number; readonly startingCredentialRef: string | null;
+}
+export type PiLoginSettlement = Readonly<{ outcome: 'saved' | 'not-saved' | 'unknown'; closed: boolean;
+  failure?: 'login-failed' | 'storage-failed' | 'owner-changed' }>;
+/** Safe start-admission reasons; native mutation/fence algorithms retain their existing errors. */
+export class PiLoginAdmissionError extends RuntimeAuthenticationError {
+  constructor(readonly reason: 'native-mutation-unsettled' | 'owner-changed' | 'context-changed' | 'storage-failed') {
+    super(reason); this.name = 'PiLoginAdmissionError';
+  }
+}
 export interface PiExecutionLease {
   readonly credentials: PiCredentialStore;
   guard(signal?: AbortSignal): Promise<void>;
@@ -107,14 +135,14 @@ export class PiAuthenticationOwner {
       && record.authGeneration === target.authGeneration;
   }
   private fence(record: OwnerRecord): void {
-    const { pendingRefresh: _pending, ...rest } = record;
-    this.write({ ...rest, authGeneration: record.authGeneration + 1, localState: 'unknown' });
+    if (record.pendingRefresh || record.pendingLogin) throw new RuntimeAuthenticationError('Pi native mutation remains unsettled');
+    this.write({ ...record, authGeneration: record.authGeneration + 1, localState: 'unknown' });
   }
   private admission(record: OwnerRecord): ModelConnectionAdmission {
     return { harnessId: 'pi', authContextRef: record.authContextRef,
       connection: { provider: 'chatgpt', authMethod: 'oauth', connectionRef: record.connectionRef },
-      authGeneration: record.authGeneration, ready: record.localState === 'ready' && !record.pendingRefresh,
-      readyReasons: record.pendingRefresh ? ['refresh-pending'] : record.localState === 'ready' ? [] : ['unknown'] };
+      authGeneration: record.authGeneration, ready: record.localState === 'ready' && !record.pendingRefresh && !record.pendingLogin,
+      readyReasons: record.pendingLogin ? ['login-pending'] : record.pendingRefresh ? ['refresh-pending'] : record.localState === 'ready' ? [] : ['unknown'] };
   }
   private async raw(): Promise<Credential | undefined> {
     this.assertContext();
@@ -124,6 +152,122 @@ export class PiAuthenticationOwner {
       const failure = new RuntimeAuthenticationError('Cannot verify the Pi ChatGPT OAuth credential');
       Object.defineProperty(failure, 'cause', { value: error }); throw failure;
     }
+  }
+  private strictRef(): string | null {
+    this.assertContext();
+    // Native file locks are path based. An aliased auth file could otherwise
+    // share credentials while splitting persistent owner/mutex locations.
+    if (this.scope.authPath !== join(this.scope.agentDir, 'auth.json')) throw new RuntimeAuthenticationError('Pi login requires one canonical native storage scope');
+    try { if (lstatSync(this.scope.authPath).nlink !== 1) throw new RuntimeAuthenticationError('Pi login requires an unaliased native auth file'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    const inspected = inspectPiStoredOAuthSync(this.scope.authPath);
+    this.assertContext(); return inspected.credential ? credentialRef(inspected.credential) : null;
+  }
+  /** Read-only CAS evidence, including cold/unknown owners. It does not admit execution. */
+  loginExpectation(): PiAuthenticationTarget | null {
+    this.assertContext(); const record = this.readRecord();
+    return record ? Object.freeze({ harnessId: 'pi', authContextRef: record.authContextRef,
+      connectionRef: record.connectionRef, authGeneration: record.authGeneration }) : null;
+  }
+  private loginRecord(ticket: PiLoginTicket): OwnerRecord {
+    this.assertContext(); const record = this.readRecord(), pending = record?.pendingLogin;
+    if (!record || record.pendingRefresh || !pending || record.authContextRef !== ticket.authContextRef
+      || record.connectionRef !== ticket.connectionRef || record.authGeneration !== ticket.authGeneration
+      || record.credentialRef !== ticket.startingCredentialRef || pending.kind !== ticket.kind
+      || pending.operationId !== ticket.operationId || pending.authContextRef !== ticket.authContextRef
+      || pending.connectionRef !== ticket.connectionRef || pending.authGeneration !== ticket.authGeneration) {
+      throw new RuntimeAuthenticationError('The Pi login ticket is no longer current');
+    }
+    return record;
+  }
+  /** Explicit start only: revoke prior execution, then hold exclusion through real settlement. */
+  beginLogin(expected?: PiAuthenticationTarget | null): Readonly<PiLoginTicket> {
+    try {
+      this.assertContext(); const before = this.readRecord();
+      if (before?.pendingRefresh || before?.pendingLogin) throw new PiLoginAdmissionError('native-mutation-unsettled');
+      const ref = this.strictRef();
+      if (expected === null ? !!before : expected !== undefined && (!before || expected.harnessId !== 'pi'
+        || expected.authContextRef !== before.authContextRef || expected.connectionRef !== before.connectionRef
+        || expected.authGeneration !== before.authGeneration)) throw new PiLoginAdmissionError('owner-changed');
+      const ticket = Object.freeze({ kind: 'login' as const, operationId: randomUUID(), authContextRef: this.context.authContextRef,
+        connectionRef: before?.connectionRef ?? `pi-connection-${randomUUID()}`, authGeneration: (before?.authGeneration ?? 0) + 1,
+        startingCredentialRef: ref });
+      mkdirSync(this.scope.agentDir, { recursive: true, mode: 0o700 });
+      this.locked(() => {
+        this.assertContext(); const current = this.readRecord();
+        if (current?.pendingRefresh || current?.pendingLogin) throw new PiLoginAdmissionError('native-mutation-unsettled');
+        if (JSON.stringify(current) !== JSON.stringify(before) || this.strictRef() !== ref) throw new PiLoginAdmissionError('owner-changed');
+        const { startingCredentialRef: _private, ...marker } = ticket;
+        try {
+          this.write({ schemaVersion: 1, harnessId: 'pi', authContextRef: ticket.authContextRef, connectionRef: ticket.connectionRef,
+            authGeneration: ticket.authGeneration, localState: 'unknown', operationId: null, credentialRef: ref,
+            pendingLogin: { ...marker, closed: false } });
+        } catch (error) {
+          // A rename may be visible despite fsync failure. No OAuth/native work was started.
+          try { const owned = this.loginRecord(ticket), { pendingLogin: _pending, ...rest } = owned; this.write(rest); } catch { /* Preserve unproven exclusion. */ }
+          throw error;
+        }
+      });
+      return ticket;
+    } catch (error) {
+      if (error instanceof PiLoginAdmissionError) throw error;
+      try { this.assertContext(); } catch { throw new PiLoginAdmissionError('context-changed'); }
+      throw new PiLoginAdmissionError('storage-failed');
+    }
+  }
+  /** Close latches before aborting the same controller; it never releases exclusion. */
+  closeLogin(ticket: PiLoginTicket): void {
+    this.locked(() => { const current = this.loginRecord(ticket);
+      if (!current.pendingLogin!.closed) this.write({ ...current, pendingLogin: { ...current.pendingLogin!, closed: true } });
+    });
+  }
+  runLogin(ticket: PiLoginTicket, authenticate: () => Promise<Credential>, signal: AbortSignal): Promise<PiLoginSettlement> {
+    this.loginRecord(ticket);
+    let pending = mutations.get(this.context.authContextRef);
+    if (!pending) { pending = new Map(); mutations.set(this.context.authContextRef, pending); }
+    if (pending.has(ticket.operationId)) throw new RuntimeAuthenticationError('Pi login has already started');
+    let candidateRef: string | undefined, committedCandidate: OwnerRecord | undefined, saving = false, phase: 'login-failed' | 'storage-failed' = 'login-failed';
+    const settle = (outcome: PiLoginSettlement['outcome'], failure?: PiLoginSettlement['failure']): PiLoginSettlement => this.locked(() => {
+      const record = this.loginRecord(ticket), closed = record.pendingLogin!.closed;
+      if (outcome === 'saved' && this.strictRef() !== candidateRef) throw new RuntimeAuthenticationError('Pi saved login could not be verified');
+      const { pendingLogin: _pending, ...rest } = record;
+      const next = RecordSchema.parse({ ...rest, credentialRef: outcome === 'saved' ? candidateRef! : rest.credentialRef,
+        localState: outcome === 'saved' ? 'ready' : 'unknown' });
+      if (outcome === 'saved') committedCandidate = next;
+      this.write(next);
+      return Object.freeze({ outcome, closed, ...(failure ? { failure } : {}) });
+    });
+    const operation = Promise.resolve().then(async () => {
+      signal.throwIfAborted(); const credential = await authenticate(); candidateRef = credentialRef(credential);
+      signal.throwIfAborted(); this.assertContext(); this.loginRecord(ticket); phase = 'storage-failed';
+      saving = true;
+      const saved = await this.native.modify('openai', async current => {
+        signal.throwIfAborted(); this.assertContext();
+        this.locked(() => { const record = this.loginRecord(ticket);
+          if (record.pendingLogin!.closed || this.strictRef() !== ticket.startingCredentialRef
+            || (current ? credentialRef(current) : null) !== ticket.startingCredentialRef) throw new RuntimeAuthenticationError('Pi OAuth changed before the login save');
+        });
+        return credential;
+      }, { signal });
+      if (credentialRef(saved) !== candidateRef) throw new RuntimeAuthenticationError('Pi native login save returned a different credential');
+      return settle('saved');
+    }).catch(() => {
+      // Only this actual OAuth+native Promise can settle its ticket. Never recover another operation.
+      try {
+        if (committedCandidate) {
+          this.locked(() => { this.assertContext(); const current = this.readRecord();
+            if (JSON.stringify(current) === JSON.stringify(committedCandidate)) this.fence(current!);
+          });
+          return Object.freeze({ outcome: 'unknown' as const, closed: signal.aborted, failure: 'storage-failed' as const });
+        }
+        const actual = this.strictRef();
+        const outcome = !saving ? 'not-saved' : actual === ticket.startingCredentialRef ? 'not-saved' : 'unknown';
+        return settle(outcome, phase);
+      } catch { return Object.freeze({ outcome: 'unknown' as const, closed: signal.aborted, failure: 'owner-changed' as const }); }
+    });
+    pending.set(ticket.operationId, operation);
+    void operation.finally(() => { pending!.delete(ticket.operationId); if (!pending!.size) mutations.delete(this.context.authContextRef); }).catch(() => {});
+    return operation;
   }
   /** Read-only observation: no owner, auth, config, directory or mutex creation. */
   async observe(): Promise<ModelConnectionAdmission | null> {
@@ -199,11 +343,14 @@ export class PiAuthenticationOwner {
   }
   /** A fresh top-level execution can establish continuity from an existing raw OAuth credential. */
   async admit(signal?: AbortSignal): Promise<ModelConnectionAdmission> {
-    signal?.throwIfAborted(); await this.drain(); signal?.throwIfAborted();
+    signal?.throwIfAborted(); this.assertContext();
+    const observed = this.readRecord();
+    if (observed?.pendingRefresh || observed?.pendingLogin) throw new RuntimeAuthenticationError('Pi native mutation remains unsettled');
+    await this.drain(); signal?.throwIfAborted();
     const ref = credentialRef(await this.raw());
     const record = this.locked(() => {
       this.assertContext(); const current = this.readRecord();
-      if (current?.pendingRefresh) { this.fence(current); throw new RuntimeAuthenticationError('Unproven Pi refresh was fenced; start a fresh execution'); }
+      if (current?.pendingRefresh || current?.pendingLogin) throw new RuntimeAuthenticationError('Pi native mutation remains unsettled');
       if (!current) return this.write({ schemaVersion: 1, harnessId: 'pi', authContextRef: this.context.authContextRef,
         connectionRef: `pi-connection-${randomUUID()}`, authGeneration: 1, localState: 'ready', operationId: null, credentialRef: ref });
       return current.localState === 'ready' && current.credentialRef === ref ? current
@@ -216,17 +363,25 @@ export class PiAuthenticationOwner {
   }
   private check(target: PiAuthenticationTarget, ref?: string): void {
     this.assertContext();
+    // Unknown/foreign work is rejected before entering a metadata mutex. A Map
+    // without that Promise is not evidence that the native write has finished.
+    const observed = this.readRecord();
+    if (!this.matches(observed, target) || observed.pendingRefresh || observed.pendingLogin) throw new RuntimeAuthenticationError('The Pi connection is not available for execution');
     this.locked(() => {
       const current = this.readRecord();
-      if (!this.matches(current, target)) throw new RuntimeAuthenticationError('The Pi connection is no longer admitted');
-      if (current.pendingRefresh || ref === undefined || current.credentialRef !== ref) {
+      if (!this.matches(current, target) || current.pendingRefresh || current.pendingLogin) throw new RuntimeAuthenticationError('The Pi connection is no longer admitted');
+      if (ref === undefined || current.credentialRef !== ref) {
         this.fence(current); throw new RuntimeAuthenticationError('Pi OAuth credential continuity changed');
       }
     });
   }
   async guard(target: PiAuthenticationTarget, signal?: AbortSignal): Promise<void> {
     for (;;) {
-      signal?.throwIfAborted(); await this.drain(); signal?.throwIfAborted();
+      signal?.throwIfAborted();
+      // Login already revoked the execution generation. Do not wait for a
+      // human prompt before delivering that revocation to an old execution.
+      this.assertContext(); if (this.readRecord()?.pendingLogin) this.check(target);
+      await this.drain(); signal?.throwIfAborted();
       let ref: string | undefined;
       try { ref = credentialRef(await this.raw()); } catch { /* Missing/invalid credentials revoke this generation. */ }
       if (mutations.get(this.context.authContextRef)?.size) continue;
@@ -267,6 +422,8 @@ export class PiAuthenticationOwner {
         if (provider !== 'openai' || refreshContexts.getStore() !== capability) return Promise.reject(new RuntimeAuthenticationError('Only official auth resolution may rotate Pi OAuth'));
         options?.signal?.throwIfAborted();
         const operationId = randomUUID(); let entered = false, startingRef: string | undefined;
+        const marker = { kind: 'refresh' as const, operationId, authContextRef: owner.context.authContextRef,
+          connectionRef: target.connectionRef, authGeneration: target.authGeneration };
         let committedCandidate: OwnerRecord | undefined;
         const mutation = Promise.resolve().then(async () => {
           // Omit the native cancellation race. getAuth may cancel, but this promise owns actual saving/finalization.
@@ -283,11 +440,12 @@ export class PiAuthenticationOwner {
             const ref = credentialRef(current);
             owner.locked(() => {
               const record = owner.readRecord();
-              if (!owner.matches(record, target) || record.pendingRefresh || record.credentialRef !== ref) {
-                if (owner.matches(record, target)) owner.fence(record);
+              if (!owner.matches(record, target) || record.pendingRefresh || record.pendingLogin || record.credentialRef !== ref) {
+                if (owner.matches(record, target) && !record.pendingRefresh && !record.pendingLogin) owner.fence(record);
                 throw new RuntimeAuthenticationError('Pi OAuth changed before the native refresh lock');
               }
-              owner.write({ ...record, pendingRefresh: { operationId, authGeneration: target.authGeneration } }); entered = true; startingRef = ref;
+              entered = true; startingRef = ref;
+              owner.write({ ...record, pendingRefresh: marker });
             });
             return fn(current);
           });
@@ -299,7 +457,7 @@ export class PiAuthenticationOwner {
           owner.locked(() => {
             const record = owner.readRecord();
             if (!owner.matches(record, target) || record.credentialRef !== startingRef
-              || record.pendingRefresh?.operationId !== operationId || record.pendingRefresh.authGeneration !== target.authGeneration) {
+              || record.pendingLogin || JSON.stringify(record.pendingRefresh) !== JSON.stringify(marker)) {
               throw new RuntimeAuthenticationError('The Pi refresh ticket is no longer admitted');
             }
             const { pendingRefresh: _pending, ...rest } = record;
@@ -315,11 +473,16 @@ export class PiAuthenticationOwner {
               owner.locked(() => { const record = owner.readRecord();
                 if (!owner.matches(record, target)) return;
                 const ownsPending = record.credentialRef === startingRef
-                  && record.pendingRefresh?.operationId === operationId && record.pendingRefresh.authGeneration === target.authGeneration;
+                  && !record.pendingLogin && JSON.stringify(record.pendingRefresh) === JSON.stringify(marker);
                 // rename may publish the exact candidate before directory fsync reports failure.
-                const ownsCommitted = committedCandidate && !record.pendingRefresh
+                const ownsCommitted = committedCandidate && !record.pendingRefresh && !record.pendingLogin
                   && JSON.stringify(record) === JSON.stringify(committedCandidate);
-                if (ownsPending || ownsCommitted) owner.fence(record);
+                if (ownsPending) {
+                  // The awaited actual native mutation has settled. Only this
+                  // full ticket can release its own exclusion, never a successor.
+                  const { pendingRefresh: _pending, ...rest } = record;
+                  owner.write({ ...rest, authGeneration: record.authGeneration + 1, localState: 'unknown' });
+                } else if (ownsCommitted) owner.fence(record);
               });
             } catch (fencingFailure) { Object.defineProperty(failure, 'fencingFailure', { value: fencingFailure }); }
             mutationFailure ??= failure;

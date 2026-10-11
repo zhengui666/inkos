@@ -44,6 +44,28 @@ beforeEach(() => { network = vi.fn(async () => { throw new Error('Network forbid
 afterEach(async () => { directorySyncFault.inject = undefined; expect(network).not.toHaveBeenCalled(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true }))); });
 
 describe('Pi credential-continuity execution owner with official storage', () => {
+  it.each(['same-ticket', 'higher-generation', 'different-ref', 'new-pending'] as const)('login rename then directory fsync failure preserves %s authority', async mode => {
+    const f = await fixture(), { target } = await f.admit(), ticket = f.owner.beginLogin(target);
+    const candidate = oauth('login'), failure = Object.assign(new Error('login-final-fsync-sentinel'), { code: 'EIO' });
+    let injected = false, replacement: Record<string, unknown> | undefined;
+    directorySyncFault.inject = () => {
+      const visible = JSON.parse(readFileSync(f.recordPath, 'utf8'));
+      if (injected || visible.pendingLogin || visible.localState !== 'ready') return;
+      injected = true;
+      if (mode !== 'same-ticket') {
+        replacement = mode === 'higher-generation' ? { ...visible, authGeneration: visible.authGeneration + 1 }
+          : mode === 'different-ref' ? { ...visible, credentialRef: 'b'.repeat(64) }
+          : { ...visible, pendingRefresh: { kind: 'refresh', operationId: 'new-operation', authContextRef: visible.authContextRef,
+            connectionRef: visible.connectionRef, authGeneration: visible.authGeneration } };
+        writeFileSync(f.recordPath, JSON.stringify(replacement));
+      }
+      throw failure;
+    };
+    expect(await f.owner.runLogin(ticket, async () => candidate, new AbortController().signal)).toMatchObject({ outcome: 'unknown' });
+    expect(injected).toBe(true); expect(JSON.parse(await readFile(f.authPath, 'utf8')).openai.access).toBe(candidate.access);
+    if (mode === 'same-ticket') expect(await f.record()).toMatchObject({ localState: 'unknown', authGeneration: ticket.authGeneration + 1 });
+    else expect(await f.record()).toEqual(replacement);
+  });
   it.each(['same-target', 'higher-generation', 'new-pending', 'different-ref'] as const)('review metadata rename then directory fsync EIO preserves %s fencing authority', async mode => {
     const f = await fixture({ openai: oauth('expired', 1) }), { lease, target } = await f.admit(), real = await runtime(f, lease);
     const sibling = f.owner.lease(target), before = await f.record();
@@ -227,16 +249,37 @@ describe('Pi credential-continuity execution owner with official storage', () =>
     release.resolve(); await Promise.all([guard, drain]); expect((await f.record()).pendingRefresh).toBeUndefined();
     expect(JSON.parse(await readFile(f.authPath, 'utf8')).openai.access).toBe('synthetic-access-rotated');
   });
-  it('fences unproven cross-process pending metadata without auth creation, lock rendezvous or readmission', async () => {
+  it('preserves unproven cross-process pending metadata and rejects readmission without a lock rendezvous', async () => {
     const f = await fixture(), { lease, target } = await f.admit(), before = await readFile(f.authPath, 'utf8');
     await writeFile(f.recordPath, JSON.stringify({ ...await f.record(), pendingRefresh: { operationId: 'other-process', authGeneration: target.authGeneration } }));
+    const pending = await readFile(f.recordPath, 'utf8'), inventory = await readdir(f.agentDir);
     const { AuthStorage } = await loadPiNativeAuthStorage(), create = vi.spyOn(AuthStorage, 'create'), modify = vi.spyOn(AuthStorage.prototype, 'modify');
     expect((await f.owner.observe())?.ready).toBe(false);
     await expect(lease.guard()).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
-    expect((await f.record()).localState).toBe('unknown'); expect(await readFile(f.authPath, 'utf8')).toBe(before);
+    expect(await readFile(f.recordPath, 'utf8')).toBe(pending); expect(await readFile(f.authPath, 'utf8')).toBe(before);
     expect(create).not.toHaveBeenCalled(); expect(modify).not.toHaveBeenCalled();
-    expect((await f.admit()).target.authGeneration).toBe(target.authGeneration + 1);
+    await expect(f.admit()).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
     await expect(lease.guard()).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+    expect(await readFile(f.recordPath, 'utf8')).toBe(pending); expect(await readdir(f.agentDir)).toEqual(inventory);
+  });
+  it.each(['refresh', 'login'] as const)('all execution callbacks leave a foreign full %s ticket untouched', async kind => {
+    const f = await fixture(), { target } = await f.admit();
+    const current = await f.record(), marker = { kind, operationId: 'foreign-process', authContextRef: target.authContextRef,
+      connectionRef: target.connectionRef, authGeneration: target.authGeneration };
+    await writeFile(f.recordPath, JSON.stringify(kind === 'refresh' ? { ...current, pendingRefresh: marker }
+      : { ...current, localState: 'unknown', pendingLogin: { ...marker, closed: true } }));
+    const pending = await readFile(f.recordPath, 'utf8'), auth = await readFile(f.authPath, 'utf8'), inventory = await readdir(f.agentDir);
+    const owner = await PiAuthenticationOwner.create(f.project), lease = owner.lease(target);
+    const { AuthStorage } = await loadPiNativeAuthStorage(), create = vi.spyOn(AuthStorage, 'create'), modify = vi.spyOn(AuthStorage.prototype, 'modify');
+    await expect(owner.admit()).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+    await expect(lease.guard()).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+    await expect(lease.credentials.read('openai')).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+    await expect(lease.credentials.list()).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+    await expect(lease.resolveAuth(() => lease.credentials.modify('openai', async () => oauth('forbidden')))).rejects.toMatchObject({ code: 'RUNTIME_AUTH_REVOKED' });
+    expect((await owner.observe())?.ready).toBe(false);
+    expect((await owner.observeSnapshot(async () => { throw new Error('must not inspect'); })).authentication).toBe('unknown');
+    expect(await readFile(f.recordPath, 'utf8')).toBe(pending); expect(await readFile(f.authPath, 'utf8')).toBe(auth);
+    expect(await readdir(f.agentDir)).toEqual(inventory); expect(create).not.toHaveBeenCalled(); expect(modify).not.toHaveBeenCalled();
   });
   it('rejects replacement during native toAuth before returning its obsolete credential', async () => {
     const f = await fixture(), { lease } = await f.admit(), real = await runtime(f, lease);

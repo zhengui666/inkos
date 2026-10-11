@@ -9,7 +9,7 @@ const require = createRequire(import.meta.url);
 const fs = require("node:fs") as typeof import("node:fs");
 const nodeModule = require("node:module") as typeof import("node:module");
 // Vitest 3 SSR omits import.meta.resolve. Node 22 loads the actual module unchanged.
-const { createPiNativeStoreCompat, loadPiNativeAuthStorage, validatePiNativeAuthStorage, inspectPiSdkInstallation, validatePiSdkDependency } =
+const { createPiNativeStoreCompat, loadPiNativeAuthStorage, validatePiNativeAuthStorage, inspectPiSdkInstallation, validatePiSdkDependency, inspectPiStoredOAuth } =
   createRequire(import.meta.url)("../pi-native-store-compat.ts") as typeof import("../pi-native-store-compat.js");
 
 const oauth = (access = "fake-access") => ({ type: "oauth" as const, access, refresh: "fake-refresh", expires: Date.now() + 3_600_000 });
@@ -26,6 +26,32 @@ afterEach(async () => {
 });
 
 describe("Pi 1.1.0 native auth storage temporary fixture contract", () => {
+  it.each(['null', '[]', 'true', '42', '"scalar"', '{broken'])("strict inspection rejects %s and the official writer cannot repair it", async content => {
+    const { path, store } = await fixture(); await writeFile(path, content);
+    await expect(inspectPiStoredOAuth(path)).rejects.toThrow('valid object');
+    const callback = vi.fn(async () => oauth('forbidden'));
+    await expect(store.modify('openai', callback)).rejects.toThrow('mutation failed');
+    expect(callback).not.toHaveBeenCalled(); expect(await readFile(path, 'utf8')).toBe(content);
+  });
+  it('strict inspection distinguishes missing OAuth from unreadable storage without creating it', async () => {
+    const { dir, path } = await fixture();
+    expect(await inspectPiStoredOAuth(path)).toEqual({ kind: 'absent', credential: undefined });
+    expect(await readdir(dir)).toEqual([]);
+    await writeFile(path, JSON.stringify({ other: { type: 'api_key', key: 'synthetic' } }));
+    expect(await inspectPiStoredOAuth(path)).toEqual({ kind: 'absent', credential: undefined });
+    await rm(path); await mkdir(path);
+    await expect(inspectPiStoredOAuth(path)).rejects.toThrow('could not be inspected');
+  });
+  it('passes the same signal into the actual native writer and sanitizes cancellation', async () => {
+    const { path, store } = await fixture({ openai: oauth() }), { AuthStorage } = await loadPiNativeAuthStorage();
+    const modify = AuthStorage.prototype.modify, controller = new AbortController(), reason = new DOMException('synthetic close', 'AbortError');
+    const spy = vi.spyOn(AuthStorage.prototype, 'modify').mockImplementation(function(this: typeof AuthStorage.prototype, provider, callback, options) {
+      expect(options?.signal).toBe(controller.signal); return modify.call(this, provider, callback, options);
+    });
+    const before = await readFile(path, 'utf8');
+    await expect(store.modify('openai', async () => { controller.abort(reason); return oauth('forbidden'); }, { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError', message: 'Pi auth operation cancelled' });
+    expect(spy).toHaveBeenCalledOnce(); expect(await readFile(path, 'utf8')).toBe(before);
+  });
   it("loads the installed actual internal module and validates its API", async () => {
     const native = await loadPiNativeAuthStorage();
     expect(typeof native.AuthStorage.create).toBe("function");
