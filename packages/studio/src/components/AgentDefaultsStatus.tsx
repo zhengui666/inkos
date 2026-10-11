@@ -1,19 +1,52 @@
-import { useEffect } from "react";
-import { useApi } from "../hooks/use-api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { buildApiUrl, fetchJson } from "../hooks/use-api";
 import { adaptAgentConfiguration } from "../pages/agent-configuration-adapter";
 import type { AgentSettings, HarnessState } from "../shared/agent-configuration";
 import { harnessLabel, text } from "./agent-configuration-ui/view-model";
 
 interface Props { readonly isZh: boolean; readonly onSettings: () => void }
 
+function useDefaultsRead<T>(path: string) {
+  const [result, setResult] = useState<{ data: T | null; loading: boolean; error: string | null }>({ data: null, loading: true, error: null });
+  const sequence = useRef(0);
+  const request = useRef<AbortController | null>(null);
+  const refetch = useCallback(async () => {
+    const id = ++sequence.current;
+    request.current?.abort();
+    const controller = new AbortController(); request.current = controller;
+    setResult({ data: null, loading: true, error: null });
+    try {
+      const data = await fetchJson<T>(path, { signal: controller.signal });
+      if (sequence.current === id && !controller.signal.aborted) setResult({ data, loading: false, error: null });
+    } catch (error) {
+      if (sequence.current === id && !controller.signal.aborted) setResult({ data: null, loading: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  }, [path]);
+  useEffect(() => {
+    void refetch();
+    const refresh = () => { void refetch(); };
+    const invalidate = (event: Event) => {
+      const detail = (event as CustomEvent<{ paths: readonly string[] }>).detail;
+      if (detail?.paths.includes(buildApiUrl(path)!)) refresh();
+    };
+    if (typeof window !== "undefined") {
+      window.addEventListener("focus", refresh);
+      window.addEventListener("inkos:api-invalidate", invalidate);
+    }
+    return () => {
+      ++sequence.current; request.current?.abort(); request.current = null;
+      if (typeof window !== "undefined") {
+        window.removeEventListener("focus", refresh);
+        window.removeEventListener("inkos:api-invalidate", invalidate);
+      }
+    };
+  }, [path, refetch]);
+  return result;
+}
+
 function SavedHarnessDefaults({ saved, isZh, onSettings }: Props & { readonly saved: AgentSettings }) {
   const harness = saved.selectedHarnessId;
-  const observation = useApi<{ state: HarnessState }>(`/agent-configuration/harnesses/${harness}/state`);
-  useEffect(() => {
-    const refresh = () => { void observation.refetch(); };
-    window.addEventListener("focus", refresh);
-    return () => window.removeEventListener("focus", refresh);
-  }, [observation.refetch]);
+  const observation = useDefaultsRead<{ state: HarnessState }>(`/agent-configuration/harnesses/${harness}/state`);
   const state = observation.data?.state ?? null;
   const preferences = saved.harnessPreferences[harness];
   const view = adaptAgentConfiguration({ target: { harness, contextKey: state?.scope?.authContextRef ?? "unobserved" },
@@ -36,12 +69,7 @@ function DefaultsButton({ isZh, onSettings, label }: Props & { readonly label: s
 }
 
 export function AgentDefaultsStatus({ isZh, onSettings }: Props) {
-  const settings = useApi<{ settings: AgentSettings }>("/agent-configuration/settings");
-  useEffect(() => {
-    const refresh = () => { void settings.refetch(); };
-    window.addEventListener("focus", refresh);
-    return () => window.removeEventListener("focus", refresh);
-  }, [settings.refetch]);
+  const settings = useDefaultsRead<{ settings: AgentSettings }>("/agent-configuration/settings");
   if (settings.loading || settings.error || !settings.data) return <DefaultsButton isZh={isZh} onSettings={onSettings}
     label={settings.loading ? text(isZh, "正在读取已保存配置…", "Loading saved settings…") : text(isZh, "配置读取失败，请核对设置", "Settings read failed; check settings")} />;
   const saved = settings.data.settings;
