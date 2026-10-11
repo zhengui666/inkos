@@ -20,6 +20,7 @@ export interface ConfigurationAdapterInput {
 export function adaptAgentConfiguration(input: ConfigurationAdapterInput): ConfigurationView {
   const { target, ownerGeneration, draft, saved, savePhase, saveDetail, submitted } = input;
   const candidate = input.state;
+  const installation = candidate?.harnessId === target.harness ? candidate.installation : "unknown";
   const state = candidate?.availability === "available" && candidate.harnessId === target.harness
     && candidate.scope?.harnessId === target.harness && validScope(candidate.scope) && candidate.scope.authContextRef === target.contextKey
     && candidate.scope.ownerGeneration === ownerGeneration ? candidate : null;
@@ -34,7 +35,7 @@ export function adaptAgentConfiguration(input: ConfigurationAdapterInput): Confi
     && catalog.value.supportsChatGptOauth && catalog.value.supportsTools && catalog.value.supportsStreaming;
   const view: ConfigurationView = {
     target, selection: toSelection(draft),
-    installation: { target, phase: state?.installation === "installed" ? "installed" : state?.installation === "missing" ? "missing" : "unverified" },
+    installation: { target, phase: installation === "installed" ? "installed" : installation === "missing" ? "missing" : "unverified" },
     connection: { target, phase: state?.connection?.phase === "signing-in" ? "signing-in" : connectionObserved ? "signed-in" : state?.connection && state.connection.phase !== "signed-in" ? state.connection.phase : "unverified",
       ...(state?.connection?.phase === "signing-in" && state.connection.login?.status === "pending" ? { attemptKey: state.connection.login.loginId } : {}),
       ...(connectionObserved && state.connection?.phase !== "signing-in" && state.account?.label ? { accountLabel: state.account.label } : {}),

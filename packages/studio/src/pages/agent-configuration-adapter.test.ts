@@ -14,6 +14,16 @@ function adapt(candidate: HarnessState | null = state, generation: number | null
   return adaptAgentConfiguration({ target, ownerGeneration: generation, state: candidate, draft, saved: draft, savePhase: "saved" });
 }
 describe("pure owner evidence mapping", () => {
+  it.each(["installed", "missing"] as const)("keeps target-matched installation %s independent of unavailable auth scope", installation => {
+    const candidate = { ...unavailableHarnessState("pi"), installation };
+    const view = adaptAgentConfiguration({ target: { harness: "pi", contextKey: "unobserved" }, ownerGeneration: null,
+      state: candidate, draft, saved: draft, savePhase: "saved" });
+    expect(view.installation.phase).toBe(installation);
+    expect(view.connection.phase).toBe("unverified"); expect(view.connection.accountLabel).toBeUndefined();
+    expect(view.catalog.models).toEqual([]); expect(view.execution.phase).toBe("unverified");
+    expect(adaptAgentConfiguration({ target: { harness: "codex", contextKey: "unobserved" }, ownerGeneration: null,
+      state: candidate, draft, saved: draft, savePhase: "saved" }).installation.phase).toBe("unverified");
+  });
   it("uses only matching native evidence, retaining null preferences and actual account observation", () => {
     const view = adapt();
     expect(view.selection.modelKey).toBeNull();

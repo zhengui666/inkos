@@ -37,6 +37,43 @@ function choose(element: Element, value: string) { (element.props.onChange as (e
 function modelOptions(view: ConfigurationView, onIntent = vi.fn()) {
   return ModelOptions({ id: "test-options", target: view.target, catalog: view.catalog, selection: view.selection, isZh: false, onIntent });
 }
+
+describe("host-managed authentication actions", () => {
+  it("keeps the management gate closed even with an explicit Connect override", () => {
+    const onIntent = vi.fn();
+    const tree = ChatGptConnectionCard({ target: piFixtureTarget, connection: { target: piFixtureTarget, phase: "signed-out" },
+      isZh: false, disabled: true, connectDisabled: false, authManagementAvailable: false, onIntent });
+    expect(button(tree, "Sign in with ChatGPT").props.disabled).toBe(true);
+    click(button(tree, "Sign in with ChatGPT")); expect(onIntent).not.toHaveBeenCalled();
+  });
+  it.each(["signed-out", "signed-in", "signing-in"] as const)("blocks %s mutations while retaining refresh", phase => {
+    const onIntent = vi.fn();
+    const tree = ChatGptConnectionCard({ target: piFixtureTarget,
+      connection: { target: piFixtureTarget, phase, attemptKey: "pi-attempt" },
+      isZh: false, authManagementAvailable: false, onIntent });
+    const controls = elements(tree, "button");
+    expect(controls[0]!.props.disabled).toBe(true);
+    click(controls[0]!);
+    expect(onIntent).not.toHaveBeenCalled();
+    expect(controls[1]!.props.disabled).toBeFalsy();
+    click(controls[1]!);
+    expect(onIntent).toHaveBeenCalledExactlyOnceWith({ action: "refresh-connection", target: piFixtureTarget });
+  });
+
+  it("does not disable preference editing, harness selection or explicit save", () => {
+    const onSaveIntent = vi.fn();
+    const tree = AgentConfigurationPanel({ id: "host-managed-pi", view: offlinePiSaved, isZh: false,
+      canSave: true, hasChanges: true, authManagementAvailable: false, onHarnessChange: vi.fn(),
+      onConnectionIntent: vi.fn(), onSelectionIntent: vi.fn(), onSaveIntent });
+    const children = Children.toArray(tree.props.children).filter(isValidElement) as Element[];
+    expect(children.find(child => child.type === ChatGptConnectionCard)!.props.authManagementAvailable).toBe(false);
+    expect(children.find(child => child.type === HarnessSelector)!.props.disabled).toBeFalsy();
+    expect(children.find(child => child.type === ModelOptions)!.props.disabled).toBeFalsy();
+    const save = button(tree, "Save defaults · Pi");
+    expect(save.props.disabled).toBeFalsy(); click(save);
+    expect(onSaveIntent).toHaveBeenCalledExactlyOnceWith({ action: "save-defaults", target: offlinePiSaved.target, selection: offlinePiSaved.selection });
+  });
+});
 function panel(view: ConfigurationView, onSaveIntent = vi.fn(), options: { canSave?: boolean; hasChanges?: boolean; disabled?: boolean } = {}) {
   return AgentConfigurationPanel({ id: "test-panel", view, isZh: false, canSave: true, hasChanges: true, onSaveIntent,
     onHarnessChange: vi.fn(), onConnectionIntent: vi.fn(), onSelectionIntent: vi.fn(), ...options });

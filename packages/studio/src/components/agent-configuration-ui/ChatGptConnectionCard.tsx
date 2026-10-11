@@ -7,18 +7,22 @@ export interface ChatGptConnectionCardProps {
   readonly isZh: boolean;
   readonly disabled?: boolean;
   readonly connectDisabled?: boolean;
+  readonly authManagementAvailable?: boolean;
   readonly onIntent: (intent: ConnectionIntent) => void;
 }
 
-export function ChatGptConnectionCard({ target, connection, isZh, disabled, connectDisabled, onIntent }: ChatGptConnectionCardProps) {
+export function ChatGptConnectionCard({ target, connection, isZh, disabled, connectDisabled, authManagementAvailable = true, onIntent }: ChatGptConnectionCardProps) {
   const matches = sameTarget(target, connection.target);
   const phase = matches ? connection.phase : "unverified";
   const signedIn = phase === "signed-in";
   const pending = phase === "signing-in";
   const canConnect = matches && !["unverified", "uncertain"].includes(phase);
   const error = ["expired", "failed", "uncertain"].includes(phase) || !matches || (pending && !connection.attemptKey);
-  const connectBlocked = connectDisabled ?? disabled;
-  const emit = (intent: ConnectionIntent) => { if (!(intent.action === "connect" ? connectBlocked : disabled)) onIntent(intent); };
+  const authDisabled = disabled || !authManagementAvailable;
+  const connectBlocked = !authManagementAvailable || (connectDisabled ?? disabled);
+  const emit = (intent: ConnectionIntent) => {
+    if (!(intent.action === "connect" ? connectBlocked : intent.action === "refresh-connection" ? disabled : authDisabled)) onIntent(intent);
+  };
   return <section className={sectionClass} aria-label={`${harnessLabel(target.harness)} · ${text(isZh, "ChatGPT 连接", "ChatGPT connection")}`}>
     <h3 className="text-sm font-medium">{harnessLabel(target.harness)} · ChatGPT</h3>
     <p role="status" aria-live="polite" aria-atomic="true" className="text-sm">
@@ -31,9 +35,9 @@ export function ChatGptConnectionCard({ target, connection, isZh, disabled, conn
     {!error && matches && connection.detail && <p className="text-xs text-muted-foreground">{localize(isZh, connection.detail)}</p>}
     <div className="flex flex-wrap gap-2">
       {signedIn
-        ? <button type="button" className={buttonClass} disabled={disabled} onClick={() => emit({ action: "sign-out", target: { ...target } })}>{text(isZh, "退出 ChatGPT", "Sign out of ChatGPT")}</button>
+        ? <button type="button" className={buttonClass} disabled={authDisabled} onClick={() => emit({ action: "sign-out", target: { ...target } })}>{text(isZh, "退出 ChatGPT", "Sign out of ChatGPT")}</button>
         : pending
-          ? <button type="button" className={buttonClass} disabled={disabled || !connection.attemptKey} onClick={() => {
+          ? <button type="button" className={buttonClass} disabled={authDisabled || !connection.attemptKey} onClick={() => {
             if (matches && connection.attemptKey) emit({ action: "cancel-sign-in", target: { ...connection.target }, attemptKey: connection.attemptKey });
           }}>{text(isZh, "取消登录", "Cancel sign-in")}</button>
           : <button type="button" className={buttonClass} disabled={connectBlocked || !canConnect} onClick={() => { if (canConnect) emit({ action: "connect", target: { ...target } }); }}>{text(isZh, "使用 ChatGPT 登录", "Sign in with ChatGPT")}</button>}

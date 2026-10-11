@@ -6,7 +6,7 @@ import { fetchJson, postApi, useApi } from "../hooks/use-api";
 import type { ChatAttachmentPayload } from "../store/chat/types";
 import { chatSelectors, useChatStore } from "../store/chat";
 import type { ChatSessionKind } from "../store/chat";
-import { CodexRuntimeStatus } from "../components/CodexRuntimeStatus";
+import { AgentDefaultsStatus } from "../components/AgentDefaultsStatus";
 import {
   Reasoning,
   ReasoningTrigger,
@@ -1081,7 +1081,7 @@ export function ChatPage({ activeBookId, activeWorkId, workProfileId, mode = act
                 </button>
               </div>
               <div className="flex items-center gap-2 px-3 pb-2 border-t border-border/20 pt-1.5">
-                <CodexRuntimeStatus isZh={isZh} onSettings={nav.toProjectSettings} />
+                <AgentDefaultsStatus isZh={isZh} onSettings={nav.toProjectSettings} />
                 {isPlaySurface && (
                   <button
                     type="button"

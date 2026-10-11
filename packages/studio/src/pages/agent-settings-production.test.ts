@@ -156,12 +156,18 @@ describe("native UI → production API → real Core attempts/SQLite owner/CAS w
     await vi.waitFor(() => expect(controller.getSnapshot().state?.harnessId).toBe("pi"));
     expect(native(tree(), "select").map(item => item.props["aria-label"])).toEqual(["Model"]);
     expect(button("Sign in with ChatGPT").props.disabled).toBe(true);
+    (button("Sign in with ChatGPT").props.onClick as () => void)();
+    expect(peer.calls.length).toBe(callsBeforePi);
+    expect(button("Check status").props.disabled).toBeFalsy();
+    expect(native(tree(), "button").some(item => contents(item.props.children as ReactNode) === "Bind current ChatGPT model connection")).toBe(false);
     click("Save defaults · Pi"); await vi.waitFor(() => expect(controller.getSnapshot().savePhase).toBe("saved"));
     const saved = await readAgentSettings(root); expect(saved.selectedHarnessId).toBe("pi"); expect(saved.modelConnectionRef).toBeNull();
     expect(saved.harnessPreferences.pi).toEqual({ model: null, effort: null, speed: null });
     expect(peer.calls.length).toBe(callsBeforePi); expect(controller.getSnapshot().state?.account).toBeNull();
     expect(renderToStaticMarkup(tree(true))).toContain("已保存，待连接");
     expect(renderToStaticMarkup(tree())).toContain("Current run configuration remains frozen");
+    expect(renderToStaticMarkup(tree())).toContain("This page does not yet provide Pi sign-in or sign-out");
+    expect(renderToStaticMarkup(tree())).not.toContain("Pi production execution is unavailable");
   });
 
   it("dispatches explicit Close and logout through native buttons, preserving unverified execution", async () => {
