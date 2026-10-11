@@ -40,9 +40,7 @@ export function adaptAgentConfiguration(input: ConfigurationAdapterInput): Confi
   const localPhase = target.harness === "pi" && state?.localAuthentication
     ? state.localAuthentication === "oauth-present" ? "oauth-present" : state.localAuthentication === "missing" ? "signed-out" : "unverified" : undefined;
   const piAttempt = target.harness === "pi" && input.piLoginAttempt?.harnessId === "pi" ? input.piLoginAttempt : null;
-  const piSaved = piAttempt?.status === "saved";
-  const piPending = piAttempt && ["reserved", "starting", "awaiting-user", "exchanging", "closing"].includes(piAttempt.status);
-  const connectionPhase = piSaved ? "oauth-present" : piPending ? "signing-in" : localPhase ?? (state?.connection?.phase === "signing-in" ? "signing-in" : connectionObserved ? "signed-in"
+  const connectionPhase = target.harness === "pi" ? localPhase ?? "unverified" : (state?.connection?.phase === "signing-in" ? "signing-in" : connectionObserved ? "signed-in"
     : state?.connection && state.connection.phase !== "signed-in" ? state.connection.phase : "unverified");
   const ready = execution?.phase === "ready" && connectionObserved && state?.installation === "installed" && catalog !== null && nativeValid
     && catalog.value.supportsChatGptOauth && catalog.value.supportsTools && catalog.value.supportsStreaming;

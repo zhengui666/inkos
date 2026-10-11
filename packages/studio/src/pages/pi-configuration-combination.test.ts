@@ -329,10 +329,17 @@ describe("real Pi settings page and ChatPage → default fetchJson → TCP/Hono 
     expect(page.row("catalog")).toContain(isZh ? "模型目录可用" : "Model catalog available");
     expect(page.view().execution).toMatchObject({ phase: "unverified", evidence: "unverified" });
     expect(page.row("execution")).toContain(isZh ? "尚未验证" : "Not yet verified");
-    expect(page.button(copy.connect).props.disabled).toBe(true);
-    // Invoke the disabled Card handler too: its controlled intent guard must not emit auth.
-    (page.button(copy.connect).props.onClick as () => void)();
-    expect(page.native("button").some(button => /Bind current|绑定当前|Sign out|退出 ChatGPT|Close and cancel/.test(contents(button.props.children as ReactNode)))).toBe(false);
+    // Pi2 exposes a request capability; it does not establish deployment or execution.
+    // This remains a read-only observation scenario, so do not dispatch a login intent.
+    expect(page.component("ChatGptConnectionCard").props.piAuthentication).toMatchObject({
+      phase: "idle", capabilities: { canStartLogin: true, canCloseAttempt: false, canReply: false, canLogout: false },
+    });
+    expect(page.button(copy.connect).props.disabled).toBe(false);
+    const logout = page.button(isZh ? "退出 ChatGPT" : "Sign out of ChatGPT");
+    expect(logout.props.disabled).toBe(true); expect(logout.props.onClick).toBeUndefined();
+    expect(logout.props["aria-describedby"]).toBe("agent-settings-connection-logout-reason");
+    expect(page.markup()).toContain(isZh ? "Pi 暂不支持在此页面退出 ChatGPT。" : "Pi sign-out is unavailable on this page.");
+    expect(page.native("button").some(button => /Bind current|绑定当前|Close and cancel|Close this Pi|关闭本次 Pi/.test(contents(button.props.children as ReactNode)))).toBe(false);
     await refreshObserved(page, copy.check); await refreshObserved(page, copy.refresh); await loaded(page, null);
     expect(await value.disk()).toEqual(before); expect(mutations(value)).toHaveLength(0); noCodexOrAuthMutation(value);
     expect(page.markup()).toContain(isZh ? "当前运行配置保持冻结" : "Current run configuration remains frozen");
@@ -348,7 +355,8 @@ describe("real Pi settings page and ChatPage → default fetchJson → TCP/Hono 
     const before = await value.disk(); await refreshObserved(page, labels().check);
     await vi.waitFor(() => expect(page.snapshot().state?.localAuthentication).toBe("missing"));
     expect(page.view().connection.phase).toBe("signed-out"); expect(page.snapshot().draft.model).toBe(capabilities.nativeDefaults.modelId);
-    expect(page.button(labels().connect).props.disabled).toBe(true); expect(await value.disk()).toEqual(before);
+    expect(page.button(labels().connect).props.disabled).toBe(false);
+    expect(page.snapshot().piLoginAttempt).toBeNull(); expect(await value.disk()).toEqual(before);
     // The user explicitly removes the now-unverified model override; nothing auto-resets it.
     page.choose("Model", null);
     await vi.waitFor(() => expect(page.snapshot().draft).toEqual(nativePreferences));

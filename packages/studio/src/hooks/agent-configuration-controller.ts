@@ -134,6 +134,7 @@ interface PiAttemptRecord {
   closeResult?: StudioPiCloseResult;
   closeUncertain?: boolean;
   closeDetail?: TextView;
+  startRejection?: StudioPiAccountErrorCode;
 }
 // Pi handles are local correlation for one transport/context, never credentials.
 // Detaching browser work does not close the service-owned attempt or replay start.
@@ -166,14 +167,21 @@ function piCodeDescription(code: StudioPiAccountErrorCode): TextView {
   const copy = piErrorCopy[code];
   return { zh: `${copy.zh}（${code}）在线账号与执行尚未验证。`, en: `${copy.en} (${code}) The online account and execution remain unverified.` };
 }
+function piFailureCode(error: unknown): StudioPiAccountErrorCode | undefined {
+  if (!(error instanceof ApiResponseError) || !error.payload || typeof error.payload !== "object" || !("error" in error.payload)) return;
+  const value = (error.payload as { error?: { code?: unknown } }).error;
+  const code = value && typeof value === "object" ? value.code : undefined;
+  const native = typeof code === "string" && code.startsWith("PI_") ? code.slice(3).toLowerCase().replaceAll("_", "-") : "";
+  return Object.hasOwn(piErrorCopy, native) ? native as StudioPiAccountErrorCode : undefined;
+}
 function piFailureDescription(error: unknown): TextView {
   // Only the finite public error code is trusted for copy. SDK text, cause,
   // callback contents and arbitrary HTTP messages never enter a snapshot.
   if (error instanceof ApiResponseError && error.payload && typeof error.payload === "object" && "error" in error.payload) {
     const value = (error.payload as { error?: { code?: unknown } }).error;
     const code = value && typeof value === "object" ? value.code : undefined;
-    const native = typeof code === "string" && code.startsWith("PI_") ? code.slice(3).toLowerCase().replaceAll("_", "-") : "";
-    if (Object.hasOwn(piErrorCopy, native)) return piCodeDescription(native as StudioPiAccountErrorCode);
+    const native = piFailureCode(error);
+    if (native) return piCodeDescription(native);
     if (code === "PI_INVALID_REQUEST" || code === "PI_INVALID_ATTEMPT" || code === "PI_SERVICE_UNAVAILABLE" || code === "PI_LOGOUT_UNSUPPORTED")
       return { zh: `Pi 认证请求被拒绝或服务不可用（${code}）；在线账号与执行尚未验证。`, en: `Pi authentication was rejected or unavailable (${code}); the online account and execution remain unverified.` };
   }
@@ -185,6 +193,10 @@ function piAttemptDescription(value: StudioPiLoginAttempt): TextView {
   if (value.status === "closed") return { zh: "原 Pi 登录尝试已关闭；这不会退出已有账号。当前连接与执行观察独立。", en: "The original Pi attempt is closed. This does not sign out an existing account; current connection and execution observations are separate." };
   if (value.status === "unknown") return piUncertain;
   return { zh: "Pi 登录尝试已观察；请使用本次链接和当前回调提示。在线账号与执行尚未验证。", en: "Pi sign-in attempt observed. Use this attempt's link and current callback prompt; the online account and execution remain unverified." };
+}
+function piRecordDescription(attempt: PiAttemptRecord): TextView {
+  return attempt.dto!.status === "reserved" && !attempt.dto!.error && attempt.startRejection
+    ? piCodeDescription(attempt.startRejection) : piAttemptDescription(attempt.dto!);
 }
 function piCloseDescription(result: StudioPiCloseResult): TextView {
   if (result.outcome === "unknown") return result.attempt.error ? { zh: `${piUncertain.zh}${piCodeDescription(result.attempt.error).zh}`, en: `${piUncertain.en} ${piCodeDescription(result.attempt.error).en}` } : piUncertain;
@@ -603,7 +615,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     if (!attempt) return;
     piView = attempt;
     if (attempt.closeRequested) void observePiClose(attempt);
-    else if (attempt.dto) piAuthDetail = piAttemptDescription(attempt.dto);
+    else if (attempt.dto) piAuthDetail = piRecordDescription(attempt);
   }
   function showPiReceipt(attempt: PiAttemptRecord) {
     piView = attempt;
@@ -667,12 +679,16 @@ export function createAgentConfigurationController(transport: AgentConfiguration
       operation.action = "start"; publish();
       const started = await request(signal => transport.pi!.startLogin(attempt.dto!.handle, signal), false, true);
       if (attempt.closeRequested || !currentPi(operation.token) || piOperation !== operation || !matchesPiAttempt(attempt)) return;
-      attempt.dto = freezePiAttempt(started, attempt.dto.handle); piView = attempt; piAuthDetail = piAttemptDescription(attempt.dto); publish();
+      attempt.startRejection = undefined;
+      attempt.dto = freezePiAttempt(started, attempt.dto.handle); piView = attempt; piAuthDetail = piRecordDescription(attempt); publish();
       // Observe local OAuth/catalog independently; a successful start is not
       // model access or execution validation.
       await refreshState();
     } catch (error) {
-      if (currentPi(operation.token) && piOperation === operation && !attempt.closeRequested) { piAuthDetail = piFailureDescription(error); publish(); }
+      if (currentPi(operation.token) && piOperation === operation && !attempt.closeRequested) {
+        if (operation.action === "start" && attempt.dto?.status === "reserved" && !attempt.dto.error) attempt.startRejection = piFailureCode(error);
+        piAuthDetail = piFailureDescription(error); publish();
+      }
     } finally { attempt.detached = true; if (piOperation === operation) piOperation = null; publish(); }
   }
   async function refreshPiLogin() {
@@ -687,9 +703,14 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     try {
       const dto = await request(signal => transport.pi!.readLogin(attempt.dto!.handle, signal), false, true);
       if (!currentPi(token) || epoch !== piReadEpoch || !matchesPiAttempt(attempt) || piOperation || attempt.closeRequested) return;
-      attempt.dto = freezePiAttempt(dto, attempt.dto.handle); piView = attempt; piAuthDetail = piAttemptDescription(attempt.dto); publish();
+      attempt.dto = freezePiAttempt(dto, attempt.dto.handle);
+      if (attempt.dto.status !== "reserved" || attempt.dto.error) attempt.startRejection = undefined;
+      piView = attempt; piAuthDetail = piRecordDescription(attempt); publish();
       if (piTerminal(attempt.dto) && attempt.dto.status === "saved") await refreshState();
-    } catch (error) { if (currentPi(token) && epoch === piReadEpoch && matchesPiAttempt(attempt)) { piAuthDetail = piFailureDescription(error); publish(); } }
+    } catch (error) { if (currentPi(token) && epoch === piReadEpoch && matchesPiAttempt(attempt)) {
+      if (piFailureCode(error)) attempt.startRejection = undefined;
+      piAuthDetail = piFailureDescription(error); publish();
+    } }
   }
   async function replyPiLogin(intent: { readonly target: TargetView; readonly attemptHandle: string; readonly promptId: string }, callbackArg: string) {
     const attempt = piAttempts.get(key(target));
@@ -712,6 +733,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     const attempt = piAttempts.get(key(target));
     if (disposed || !sameTarget(intentTarget, target) || !matchesPiAttempt(attempt) || (handle !== undefined && attempt.dto?.handle !== handle)) return;
     if (attempt.closeResult && !attempt.closeUncertain && attempt.closeResult.outcome !== "unknown") { observePiClose(attempt); publish(); return; }
+    attempt.startRejection = undefined;
     attempt.closeRequested = true; piReadEpoch++; piView = attempt;
     if (!attempt.dto) {
       piAuthDetail = { zh: "原 Pi 尝试的关闭意图已记录；本次标识返回后仅关闭，不启动登录。", en: "Close recorded for the original Pi attempt. A returned handle will only be closed; sign-in will not start." }; publish(); return;

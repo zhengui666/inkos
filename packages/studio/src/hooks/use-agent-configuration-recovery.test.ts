@@ -52,7 +52,7 @@ type Action = "reserve" | "start" | "close" | "reply" | "attempt-read";
 interface HttpCall {
   readonly url: string; readonly method: string; readonly body: unknown; readonly signal: AbortSignal;
   readonly keepalive: boolean | undefined; readonly action?: Action;
-  aborted: boolean; rejection?: unknown; reply(value: unknown): void; reject(error: unknown): void;
+  aborted: boolean; rejection?: unknown; reply(value: unknown, status?: number): void; reject(error: unknown): void;
 }
 function observed(phase: NonNullable<HarnessState["connection"]>["phase"] = "signed-out", generation: number | null = null): HarnessState {
   return { ...unavailableHarnessState("codex"), availability: "available", installation: "installed",
@@ -93,7 +93,7 @@ async function setup(pi = false) {
     const pending = new Promise<Response>((yes, no) => { resolve = yes; reject = no; });
     const call: HttpCall = { url, method, signal, action, body: init?.body ? JSON.parse(String(init.body)) : undefined,
       keepalive: init?.keepalive, aborted: signal.aborted,
-      reply: value => { signal.removeEventListener("abort", abort); resolve(Response.json(value)); },
+      reply: (value, status = 200) => { signal.removeEventListener("abort", abort); resolve(Response.json(value, { status })); },
       reject: error => { call.rejection = error; signal.removeEventListener("abort", abort); reject(error); } };
     const abort = () => { call.aborted = true; call.reject(new DOMException("The offline fetch was aborted", "AbortError")); };
     signal.addEventListener("abort", abort, { once: true }); calls.push(call);
@@ -333,6 +333,23 @@ describe("offline default hook preserves numeric origin evidence without correla
 
 
 describe("offline Pi default hook uses public attempts and detach-only HTTP recovery", () => {
+  it("S2: default-transport remount and periodic reserved GET preserve the finite start refusal without mutation", async () => {
+    const f = await setup(true); f.piAttempt(publicPiAttempt("reserved")); f.held.add("start");
+    const first = f.mount(); await flush(); f.connect(first); await flush();
+    f.action("start")[0]!.reply({ error: { code: "PI_SCOPE_BUSY", message: "PRIVATE-HTTP-REFUSAL" } }, 409); await flush();
+    expect(first.snapshot().piAuthDetail?.en).toMatch(/scope.*busy/i); first.unmount();
+    f.held.add("attempt-read"); const returned = f.mount(); await flush();
+    expect(returned.snapshot().piLoginAttempt).toMatchObject({ handle: piHandle, status: "reserved", challenge: null, prompt: null });
+    expect(returned.snapshot().piAuthDetail?.en).toMatch(/scope.*busy/i);
+    f.action("attempt-read").at(-1)!.reply({ attempt: publicPiAttempt("reserved") }); f.held.delete("attempt-read"); await flush();
+    await returned.controller().refresh(); await vi.advanceTimersByTimeAsync(2_001); await flush();
+    expect(returned.snapshot().piAuthDetail?.en).toMatch(/scope.*busy/i); expect(returned.snapshot().piAuthBusy).toBeNull();
+    expect(JSON.stringify(returned.snapshot())).not.toContain("PRIVATE-HTTP-REFUSAL"); expect(f.mutations()).toHaveLength(2);
+    expect(f.action("reserve")).toHaveLength(1); expect(f.action("start")).toHaveLength(1); expect(f.action("reply")).toHaveLength(0); expect(f.action("close")).toHaveLength(0);
+    returned.controller().closePiLogin(returned.snapshot().target, piHandle); await flush();
+    expect(returned.snapshot().piCloseResult?.outcome).toBe("closed"); expect(returned.snapshot().piAuthDetail?.en).not.toMatch(/scope.*busy/i);
+  });
+
   it("mount/refresh/remount without a known Pi handle performs only public GET observations", async () => {
     const fixture = await setup(true), first = fixture.mount(); await flush();
     expect(first.snapshot().target).toEqual({ harness: "pi", contextKey: piContext });

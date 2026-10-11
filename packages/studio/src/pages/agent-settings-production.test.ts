@@ -1,4 +1,4 @@
-import { Children, createElement, isValidElement, type ReactElement, type ReactNode } from "react";
+import { Children, cloneElement, createElement, isValidElement, type ReactElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -11,7 +11,8 @@ import { AgentSettings } from "./AgentSettings";
 import { ProjectSettings } from "./ProjectSettings";
 import type { TFunction } from "../hooks/use-i18n";
 
-// Replace only the React subscription boundary. Every intent uses the real controller,
+// Replace the React subscription boundary and schedule component-local hooks offline.
+// Every intent uses the real controller,
 // HTTP transport, mounted production routes, real Core attempts/SQLite owner and filesystem CAS.
 // The synthetic protocol peer proves no OAuth, native process or model execution.
 const holder = vi.hoisted(() => ({ controller: null as ReturnType<typeof createAgentConfigurationController> | null }));
@@ -19,6 +20,38 @@ vi.mock("../hooks/use-agent-configuration", () => ({ useAgentConfiguration: () =
   const controller = holder.controller!;
   return { controller, snapshot: controller.getSnapshot() };
 } }));
+
+interface LocalSlot { value?: unknown; dependencies?: readonly unknown[]; cleanup?: () => void }
+interface LocalFrame { cursor: number; slots: LocalSlot[]; effects: (() => void)[]; mounted: boolean; schedule(): void }
+const localBoundary = vi.hoisted(() => {
+  let active: LocalFrame | undefined;
+  return { enter: (frame: LocalFrame) => { active = frame; }, leave: () => { active = undefined; }, current: () => active };
+});
+vi.mock("react", async () => {
+  const actual = await vi.importActual<typeof import("react")>("react");
+  const same = (a?: readonly unknown[], b?: readonly unknown[]) => !!a && !!b && a.length === b.length && a.every((item, index) => Object.is(item, b[index]));
+  return { ...actual,
+    useState: <T>(initial: T | (() => T)) => {
+      const frame = localBoundary.current(); if (!frame) return actual.useState(initial);
+      const index = frame.cursor++, slot = frame.slots[index] ??= { value: typeof initial === "function" ? (initial as () => T)() : initial };
+      return [slot.value as T, (value: T | ((old: T) => T)) => {
+        const next = typeof value === "function" ? (value as (old: T) => T)(slot.value as T) : value;
+        if (!frame.mounted || Object.is(next, slot.value)) return;
+        slot.value = next; frame.schedule();
+      }] as const;
+    },
+    useRef: <T>(initial: T) => {
+      const frame = localBoundary.current(); if (!frame) return actual.useRef(initial);
+      return (frame.slots[frame.cursor++] ??= { value: { current: initial } }).value as { current: T };
+    },
+    useEffect: (effect: () => void | (() => void), dependencies?: readonly unknown[]) => {
+      const frame = localBoundary.current(); if (!frame) return actual.useEffect(effect, dependencies);
+      const index = frame.cursor++, old = frame.slots[index]; if (old && same(old.dependencies, dependencies)) return;
+      const slot: LocalSlot = { dependencies }; frame.slots[index] = slot;
+      frame.effects.push(() => { old?.cleanup?.(); const cleanup = effect(); if (cleanup) slot.cleanup = cleanup; });
+    },
+  };
+});
 
 // Offline protocol peer: no process, credentials, OAuth or model execution.
 class UiPeer implements CodexClient {
@@ -68,19 +101,63 @@ function native(node: ReactNode, tag: string): Element[] {
   const found: Element[] = [];
   Children.forEach(node, child => {
     if (!isValidElement<Record<string, unknown>>(child)) return;
-    if (typeof child.type === "function") {
-      found.push(...native((child.type as (props: Record<string, unknown>) => ReactNode)(child.props), tag));
-    } else {
-      if (child.type === tag) found.push(child);
-      found.push(...native(child.props.children as ReactNode, tag));
-    }
+    if (child.type === tag) found.push(child);
+    found.push(...native(child.props.children as ReactNode, tag));
   });
   return found;
 }
 function contents(node: ReactNode): string {
   return Children.toArray(node).map(child => isValidElement<{ children?: ReactNode }>(child) ? contents(child.props.children) : String(child)).join("");
 }
-const tree = (isZh = false) => AgentSettings({ isZh });
+// Persistent per-component frames preserve local input and cleanup across queries.
+// Capture also supplies React's actual SSR dispatcher for unmocked hooks/context.
+// Product components, intent handlers, controller, transport and Core are unchanged.
+function createPageView(isZh: boolean) {
+  const controller = holder.controller!, frames = new Map<string, LocalFrame>();
+  let output: ReactNode, mounted = true, queued = false;
+  const schedule = () => {
+    if (!mounted || queued) return; queued = true;
+    void Promise.resolve().then(() => { queued = false; if (mounted) render(); });
+  };
+  const render = () => {
+    const used = new Set<string>();
+    const expand = (node: ReactNode, path: string): ReactNode => Children.map(node, (child, index) => {
+      if (!isValidElement<Record<string, unknown>>(child)) return child;
+      const nextPath = `${path}/${index}`;
+      if (typeof child.type !== "function") return cloneElement(child, {}, expand(child.props.children as ReactNode, nextPath));
+      const Component = child.type as (props: Record<string, unknown>) => ReactNode;
+      const props = child.props;
+      const key = `${nextPath}:${Component.name}:${child.key ?? ""}`; used.add(key);
+      const frame = frames.get(key) ?? { cursor: 0, slots: [], effects: [], mounted: true, schedule };
+      frames.set(key, frame); frame.cursor = 0;
+      let result: ReactNode = null;
+      function Capture() {
+        localBoundary.enter(frame);
+        try { result = Component(props); } finally { localBoundary.leave(); }
+        return null;
+      }
+      renderToStaticMarkup(createElement(Capture));
+      return expand(result, key);
+    });
+    output = expand(createElement(AgentSettings, { isZh }), "root");
+    for (const [key, frame] of frames) {
+      if (!used.has(key)) { frame.mounted = false; frame.slots.forEach(slot => slot.cleanup?.()); frames.delete(key); }
+      else for (const effect of frame.effects.splice(0)) effect();
+    }
+  };
+  const unsubscribe = controller.subscribe(schedule); render();
+  return { tree: () => { render(); return output; }, dispose: () => {
+    mounted = false; unsubscribe();
+    for (const frame of frames.values()) { frame.mounted = false; frame.slots.forEach(slot => slot.cleanup?.()); }
+    frames.clear();
+  } };
+}
+const pageViews = new Map<boolean, ReturnType<typeof createPageView>>();
+const tree = (isZh = false) => {
+  let page = pageViews.get(isZh); if (!page) { page = createPageView(isZh); pageViews.set(isZh, page); }
+  return page.tree();
+};
+const disposePageViews = () => { for (const page of pageViews.values()) page.dispose(); pageViews.clear(); };
 function button(label: string, isZh = false) {
   const result = native(tree(isZh), "button").find(item => contents(item.props.children as ReactNode) === label);
   expect(result, `missing ${label}`).toBeDefined(); return result!;
@@ -115,7 +192,7 @@ describe("native UI → production API → real Core attempts/SQLite owner/CAS w
     controller = createAgentConfigurationController(createAgentConfigurationTransport(fetchImpl)); holder.controller = controller; http.length = 0;
     await controller.refresh();
   });
-  afterEach(async () => { controller.dispose(); holder.controller = null; await shutdownStudioServer(app); await rm(root, { recursive: true, force: true }); vi.unstubAllEnvs(); });
+  afterEach(async () => { disposePageViews(); controller.dispose(); holder.controller = null; await shutdownStudioServer(app); await rm(root, { recursive: true, force: true }); vi.unstubAllEnvs(); });
   const settled = () => vi.waitFor(() => expect(controller.getSnapshot().authBusy).toBeNull());
   const owner = () => new CodexAuthenticationOwner(peer);
   async function signIn() {
@@ -155,8 +232,14 @@ describe("native UI → production API → real Core attempts/SQLite owner/CAS w
     (radio.props.onChange as () => void)();
     await vi.waitFor(() => expect(controller.getSnapshot().state?.harnessId).toBe("pi"));
     expect(native(tree(), "select").map(item => item.props["aria-label"])).toEqual(["Model"]);
-    expect(button("Sign in with ChatGPT").props.disabled).toBe(true);
-    (button("Sign in with ChatGPT").props.onClick as () => void)();
+    // Pi2 permits an explicit request, but this scenario only observes and saves preferences.
+    // Do not begin OAuth to test isolation; read-only mount/refresh must never start it.
+    expect(controller.getSnapshot().piCapabilities).toMatchObject({ canStartLogin: true, canReply: false, canCloseAttempt: false, canLogout: false });
+    expect(button("Sign in with ChatGPT").props.disabled).toBe(false);
+    expect(button("Sign out of ChatGPT").props.disabled).toBe(true);
+    expect(button("Sign out of ChatGPT").props.onClick).toBeUndefined();
+    expect(renderToStaticMarkup(tree())).toContain("Pi sign-out is unavailable on this page.");
+    expect(http.some(call => call.method === "POST" && call.path.includes("/pi/login/"))).toBe(false);
     expect(peer.calls.length).toBe(callsBeforePi);
     expect(button("Check status").props.disabled).toBeFalsy();
     expect(native(tree(), "button").some(item => contents(item.props.children as ReactNode) === "Bind current ChatGPT model connection")).toBe(false);
@@ -166,7 +249,8 @@ describe("native UI → production API → real Core attempts/SQLite owner/CAS w
     expect(peer.calls.length).toBe(callsBeforePi); expect(controller.getSnapshot().state?.account).toBeNull();
     expect(renderToStaticMarkup(tree(true))).toContain("已保存，待连接");
     expect(renderToStaticMarkup(tree())).toContain("Current run configuration remains frozen");
-    expect(renderToStaticMarkup(tree())).toContain("This page does not yet provide Pi sign-in or sign-out");
+    expect(renderToStaticMarkup(tree())).toContain("A sign-in request entry point does not verify deployment or execution.");
+    expect(http.some(call => call.method === "POST" && call.path.includes("/pi/login/"))).toBe(false);
     expect(renderToStaticMarkup(tree())).not.toContain("Pi production execution is unavailable");
   });
 

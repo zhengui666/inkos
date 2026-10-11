@@ -2,7 +2,7 @@ import { Children, cloneElement, isValidElement, type ReactElement, type ReactNo
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { unavailableHarnessState, type AgentSettings as Settings, type DeviceLoginAttemptCloseResult, type HarnessState, type StudioPiLoginAttempt } from "../shared/agent-configuration";
 import type { AgentConfigurationSnapshot } from "../hooks/agent-configuration-controller";
-import type { PiAuthenticationView, TargetView } from "../components/agent-configuration-ui/view-model";
+import type { ConnectionView, PiAuthenticationView, TargetView } from "../components/agent-configuration-ui/view-model";
 
 interface Slot { dependencies?: readonly unknown[]; value?: unknown; cleanup?: () => void; subscribe?: unknown }
 interface PageFrame { cursor: number; slots: Slot[]; effects: (() => void)[]; mounted: boolean; schedule(): void; snapshot?: () => AgentConfigurationSnapshot }
@@ -187,6 +187,8 @@ async function controlledPi(isZh = false) {
   const { offlinePiSaved } = await import("../components/agent-configuration-ui/fixtures");
   const actions = { intent: vi.fn(), reply: vi.fn(), close: vi.fn(), save: vi.fn(), select: vi.fn() };
   let target: TargetView = { harness: "pi", contextKey: "pi-controlled-context" };
+  let connection: ConnectionView = { target, phase: "signing-in" };
+  let disabled = false;
   let auth: PiAuthenticationView = { target, phase: "awaiting-user", capabilities: { canStartLogin: true, canCloseAttempt: true, canReply: true, canLogout: false },
     handle: "pi-controlled-handle", promptId: "pi-controlled-prompt", authorizationUrl: "https://auth.openai.com/api/accounts/authorize?state=OFFLINE", busy: null,
     canClose: true, catalogConfirmed: false };
@@ -196,7 +198,7 @@ async function controlledPi(isZh = false) {
     frame.cursor = 0; boundary.enter(frame);
     try {
       tree = expand(AgentConfigurationPanel({ id: "pi-controlled", view: { ...offlinePiSaved, target,
-        connection: { target, phase: "signing-in" }, piAuthentication: auth }, isZh, canSave: true, hasChanges: true,
+        connection, piAuthentication: auth }, isZh, disabled, canSave: true, hasChanges: true,
         onConnectionIntent: actions.intent, onPiReply: actions.reply, onPiClose: actions.close,
         onSaveIntent: actions.save, onSelectionIntent: actions.select, onHarnessChange: vi.fn() }));
     } finally { boundary.leave(); }
@@ -207,6 +209,8 @@ async function controlledPi(isZh = false) {
   const button = (label: string) => controls("button").find(element => contents(element.props.children as ReactNode) === label)!;
   const page = { actions, controls, button, text: () => contents(tree),
     set: (patch: Partial<PiAuthenticationView>) => { auth = { ...auth, ...patch }; render(); },
+    connection: (value: ConnectionView) => { connection = value; render(); },
+    disabled: (value: boolean) => { disabled = value; render(); },
     target: () => target,
     switchTarget: (value: TargetView) => { target = value; render(); },
     input: () => controls("input").find(element => element.props["aria-label"] === (isZh ? "Pi · 登录回调网址" : "Pi · Sign-in callback URL"))!,
@@ -278,7 +282,7 @@ describe("Pi-specific controlled callback and independent capabilities", () => {
   it.each([false, true])("keeps local credentials, catalog, execution, Close uncertainty and save messages separate (isZh=%s)", async isZh => {
     const page = await controlledPi(isZh); page.set({ phase: "saved", busy: null, catalogConfirmed: false, detail: { zh: "目录请求失败", en: "Catalog request failed" } });
     expect(page.controls("a")).toHaveLength(0); expect(page.controls("form")).toHaveLength(0);
-    expect(page.text()).toMatch(isZh ? /本地凭证已保存，模型目录待确认/ : /Local credentials saved; model catalog unconfirmed/);
+    expect(page.text()).toMatch(isZh ? /本次尝试曾完成本地保存，模型目录待确认/ : /This attempt previously completed local saving; model catalog unconfirmed/);
     expect(page.text()).toMatch(isZh ? /执行尚未验证/ : /execution remain unverified/);
     expect(page.text()).toMatch(isZh ? /目录请求失败/ : /Catalog request failed/);
     page.set({ closeOutcome: "already-committed" }); expect(page.text()).toMatch(isZh ? /关闭不会退出/ : /Close does not sign out/);
@@ -308,13 +312,59 @@ describe("Pi-specific controlled callback and independent capabilities", () => {
     const idle = adaptAgentConfiguration(input); expect(idle.piAuthentication?.phase).toBe("idle"); expect(idle.piAuthentication?.closeOutcome).toBeUndefined();
     const view = adaptAgentConfiguration({ ...input, piLoginAttempt: savedAttempt, piAuthDetail: { zh: "目录失败", en: "Catalog failed" },
       piCloseResult: { outcome: "already-committed", attempt: savedAttempt } });
-    expect(view.connection.phase).toBe("oauth-present"); expect(view.connection.accountLabel).toBeUndefined();
+    expect(view.connection.phase).toBe("unverified"); expect(view.connection.accountLabel).toBeUndefined();
     expect(view.catalog.phase).toBe("unavailable"); expect(view.execution).toMatchObject({ phase: "unverified", evidence: "unverified" });
     expect(view.save.phase).toBe("saved"); expect(view.piAuthentication).toMatchObject({ phase: "saved", catalogConfirmed: false, closeOutcome: "already-committed" });
     expect(view.piAuthentication).not.toHaveProperty("callbackUrl"); expect(view.piAuthentication).not.toHaveProperty("deploymentVerified");
     const staleClose = adaptAgentConfiguration({ ...input, piLoginAttempt: savedAttempt,
       piCloseResult: { outcome: "unknown", attempt: { ...savedAttempt, handle: "pi-other-attempt" } } });
     expect(staleClose.piAuthentication?.closeOutcome).toBeUndefined();
+  });
+
+  it.each(["missing", "unknown", "no-observation", "oauth-present"] as const)("S1: saved history cannot replace current %s authentication or a failed catalog", async local => {
+    const { adaptAgentConfiguration, toSelection } = await import("./agent-configuration-adapter");
+    for (const isZh of [false, true]) {
+      const page = await controlledPi(isZh), target = page.target();
+      const attempt: StudioPiLoginAttempt = { harnessId: "pi", handle: "saved-history", status: "saved", expiresAt: 123,
+        canReply: false, challenge: null, prompt: null, error: null };
+      const state: HarnessState | null = local === "no-observation" ? null : { ...unavailableHarnessState("pi"),
+        availability: "available", installation: "installed", localAuthentication: local,
+        scope: { harnessId: "pi", authContextRef: target.contextKey, ownerGeneration: 3, adapterVersion: "offline", catalogVersion: "offline" } };
+      const draft = { model: "retained-model", effort: "retained-effort", speed: null };
+      const view = adaptAgentConfiguration({ target, ownerGeneration: 3, state, draft, saved: nativePreferences,
+        savePhase: "saved", piLoginAttempt: attempt, piCloseResult: { outcome: "already-committed", attempt } });
+      expect(view.connection.phase).toBe(local === "missing" ? "signed-out" : local === "oauth-present" ? "oauth-present" : "unverified");
+      expect(view.piAuthentication).toMatchObject({ phase: "saved", handle: attempt.handle, closeOutcome: "already-committed", catalogConfirmed: false });
+      expect(view.selection).toEqual(toSelection(draft)); expect(view.save).toMatchObject({ phase: "saved", selection: toSelection(nativePreferences) });
+      expect(view.connection.accountLabel).toBeUndefined(); expect(view.catalog.phase).toBe("unavailable");
+      expect(view.execution).toMatchObject({ phase: "unverified", evidence: "unverified" });
+      page.connection(view.connection); page.set(view.piAuthentication!);
+      expect(page.text()).toMatch(isZh ? /本次尝试曾完成本地保存/ : /This attempt previously completed local saving/);
+      expect(page.text()).toMatch(local === "missing" ? isZh ? /当前未发现本地 OAuth/ : /No local OAuth found in the current observation/
+        : local === "oauth-present" ? isZh ? /当前发现本地 OAuth/ : /Local OAuth found in the current observation/
+          : isZh ? /当前本地认证尚未确认/ : /Current local authentication is unconfirmed/);
+      for (const action of Object.values(page.actions)) expect(action).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([false, true])("direct disabled Pi Connect handler emits no authentication or save action (isZh=%s)", async isZh => {
+    for (const block of ["capability", "disabled"] as const) {
+      const page = await controlledPi(isZh); page.set({ phase: "idle", busy: null, handle: undefined, promptId: undefined,
+        canClose: false, capabilities: { canStartLogin: block === "disabled", canReply: false, canCloseAttempt: false, canLogout: false } });
+      page.disabled(block === "disabled");
+      const connect = page.button(isZh ? "使用 ChatGPT 登录" : "Sign in with ChatGPT"); expect(connect.props.disabled).toBe(true);
+      (connect.props.onClick as () => void)();
+      const logout = page.button(isZh ? "退出 ChatGPT" : "Sign out of ChatGPT"); expect(logout.props.disabled).toBe(true); expect(logout.props.onClick).toBeUndefined();
+      for (const action of Object.values(page.actions)) expect(action).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([false, true])("S2: an idle reserved attempt announces that start has not begun and retains its finite refusal (isZh=%s)", async isZh => {
+    const page = await controlledPi(isZh); page.set({ phase: "reserved", busy: null,
+      detail: { zh: "Pi 登录上下文忙碌（scope-busy）", en: "Pi login scope is busy (scope-busy)" } });
+    expect(page.text()).toMatch(isZh ? /本次已预留，尚未开始/ : /This attempt is reserved and has not started/);
+    expect(page.text()).toMatch(/scope-busy/);
+    page.set({ busy: "reserve" }); expect(page.text()).toMatch(isZh ? /正在准备本次 Pi 登录/ : /Preparing this Pi sign-in/);
   });
 });
 
@@ -389,7 +439,7 @@ describe("real Pi AgentSettings with default hook and transport (offline React b
     page.catalog(false); page.submit(callback); await flush();
     expect(page.action("reply")[0]!.body).toEqual({ attemptHandle: "pi-real-page-handle", promptId: "pi-real-page-prompt", callbackUrl: callback });
     expect(JSON.stringify(page.snapshot())).not.toContain(callback); expect(page.snapshot().draft.model).toBe("other");
-    expect(page.text()).toMatch(isZh ? /本地凭证已保存，模型目录待确认/ : /Local credentials saved; model catalog unconfirmed/);
+    expect(page.text()).toMatch(isZh ? /本次尝试曾完成本地保存，模型目录待确认/ : /This attempt previously completed local saving; model catalog unconfirmed/);
     page.click(isZh ? "保存默认配置 · Pi" : "Save defaults · Pi"); await flush();
     expect(page.snapshot().savePhase).toBe("saved"); expect(page.snapshot().baseline?.modelConnectionRef).toBe("existing-codex-owned-ref");
     expect(page.snapshot().baseline?.harnessPreferences.pi.model).toBe("other"); expect(page.snapshot().state?.execution).toBeNull();

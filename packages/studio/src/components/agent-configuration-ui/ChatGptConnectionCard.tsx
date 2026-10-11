@@ -25,12 +25,12 @@ function officialPiUrl(value: string | undefined): string | null {
 }
 const piPhaseLabels: Record<PiAuthenticationView["phase"], { zh: string; en: string }> = {
   idle: { zh: "Pi 登录尚未开始。", en: "Pi sign-in has not started." },
-  reserved: { zh: "正在准备本次 Pi 登录。", en: "Preparing this Pi sign-in." },
+  reserved: { zh: "本次已预留，尚未开始。", en: "This attempt is reserved and has not started." },
   starting: { zh: "正在启动官方 ChatGPT 登录。", en: "Starting official ChatGPT sign-in." },
   "awaiting-user": { zh: "等待手动完成 ChatGPT 登录并粘贴最终回调网址。", en: "Waiting for you to complete ChatGPT sign-in and paste the final callback URL." },
   exchanging: { zh: "正在交换本次授权并保存本地凭证，结果尚未确认。", en: "Exchanging this authorization and saving local credentials; outcome unconfirmed." },
   closing: { zh: "正在关闭本次 Pi 登录，关闭结果尚未确认。", en: "Closing this Pi sign-in; Close outcome unconfirmed." },
-  saved: { zh: "本次 Pi 凭证已在本地保存。", en: "This Pi credential has been saved locally." },
+  saved: { zh: "本次尝试曾完成本地保存。", en: "This attempt previously completed local saving." },
   closed: { zh: "本次 Pi 登录已关闭；执行尚未验证。", en: "This Pi sign-in is closed; execution remains unverified." },
   failed: { zh: "本次 Pi 登录未完成，请核对错误。", en: "This Pi sign-in did not complete. Review the error." },
   unknown: { zh: "本次 Pi 登录结果不确定，请核对同一尝试。", en: "This Pi sign-in outcome is unknown. Check the same attempt." },
@@ -48,12 +48,14 @@ function PiConnectionControls({ id = "pi-chatgpt", target, connection, piAuthent
   const replyAllowed = matches && phase === "awaiting-user" && !!auth.handle && !!auth.promptId && !!url && auth.capabilities.canReply && !auth.busy && !disabled && !!onPiReply;
   const closeAllowed = matches && auth.canClose && (auth.handle ? auth.capabilities.canCloseAttempt : auth.busy === "reserve") && !disabled && auth.busy !== "close" && !!onPiClose;
   const connectAllowed = matches && auth.capabilities.canStartLogin && !pending && !auth.busy && !disabled;
-  const saved = matches && (phase === "saved" || auth.closeOutcome === "already-committed" || (sameTarget(target, connection.target) && connection.phase === "oauth-present"));
+  const saved = matches && (phase === "saved" || auth.closeOutcome === "already-committed");
+  const localPhase = sameTarget(target, connection.target) ? connection.phase : "unverified";
   return <div className="space-y-3">
-    <p role="status" aria-live="polite" aria-atomic="true">{localize(isZh, piPhaseLabels[phase])}</p>
-    {matches && auth.closeOutcome === "already-committed" && <p role="status" aria-live="polite">{text(isZh, "登录已经提交，本地凭证已保存；关闭不会退出账号。", "Sign-in already committed and local credentials saved; Close does not sign out.")}</p>}
+    <p role="status" aria-live="polite" aria-atomic="true">{matches && auth.busy === "reserve" ? text(isZh, "正在准备本次 Pi 登录。", "Preparing this Pi sign-in.") : localize(isZh, piPhaseLabels[phase])}</p>
+    <p role="status" aria-live="polite" aria-atomic="true">{localPhase === "oauth-present" ? text(isZh, "当前发现本地 OAuth。", "Local OAuth found in the current observation.") : localPhase === "signed-out" ? text(isZh, "当前未发现本地 OAuth。", "No local OAuth found in the current observation.") : text(isZh, "当前本地认证尚未确认。", "Current local authentication is unconfirmed.")}</p>
+    {matches && auth.closeOutcome === "already-committed" && <p role="status" aria-live="polite">{text(isZh, "本次尝试曾完成本地保存；关闭不会退出账号。", "This attempt previously completed local saving; Close does not sign out.")}</p>}
     {matches && auth.closeOutcome === "unknown" && <p role="alert">{text(isZh, "关闭结果不确定；请核对同一尝试，不会自动重放登录或退出。", "Close outcome is unknown. Check the same attempt; sign-in or logout is not replayed automatically.")}</p>}
-    {saved && <p role="status" aria-live="polite">{auth.catalogConfirmed ? text(isZh, "模型目录已观察，在线账号与执行尚未验证。", "Model catalog observed; online account and execution remain unverified.") : text(isZh, "本地凭证已保存，模型目录待确认；在线账号与执行尚未验证。", "Local credentials saved; model catalog unconfirmed. Online account and execution remain unverified.")}</p>}
+    {saved && <p role="status" aria-live="polite">{auth.catalogConfirmed ? text(isZh, "模型目录已观察，在线账号与执行尚未验证。", "Model catalog observed; online account and execution remain unverified.") : text(isZh, "本次尝试曾完成本地保存，模型目录待确认；在线账号与执行尚未验证。", "This attempt previously completed local saving; model catalog unconfirmed. Online account and execution remain unverified.")}</p>}
     <p className="text-xs text-muted-foreground">{text(isZh, "登录请求入口不证明部署或执行条件已验证。保存默认配置与认证分别处理。", "A sign-in request entry point does not verify deployment or execution. Saving defaults and authentication are handled separately.")}</p>
     {url && <a className={buttonClass} href={url} target="_blank" rel="noopener noreferrer" aria-label={text(isZh, "Pi · 打开官方 ChatGPT 登录页面", "Pi · Open official ChatGPT sign-in page")}>{text(isZh, "打开官方 ChatGPT 登录页面", "Open official ChatGPT sign-in page")}</a>}
     {matches && pending && auth.authorizationUrl && !url && phase !== "closing" && <p role="alert">{text(isZh, "官方登录网址尚未核实，请核对状态。", "The official sign-in URL is unverified. Check status.")}</p>}

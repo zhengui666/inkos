@@ -299,6 +299,37 @@ function setupPi(timeout = 15_000) {
 }
 
 describe("Pi authentication uses independent public attempts and captured browser intents (offline)", () => {
+  it("S2: synchronous scope-busy start refusal survives reserved reads, then explicit Close and new intent replace it", async () => {
+    const f = setupPi(); await f.controller.refresh(); f.edit("retained-busy-draft");
+    f.pi.startLogin.mockRejectedValueOnce(new ApiResponseError("PRIVATE-REFUSAL", 409, { error: { code: "PI_SCOPE_BUSY", message: "PRIVATE-REFUSAL" } }));
+    f.pi.readLogin.mockResolvedValue(piAttempt("reserved")); f.connect(); await flush();
+    const before = f.controller.getSnapshot(); expect(before.piAuthDetail?.en).toMatch(/scope.*busy/i);
+    for (let index = 0; index < 2; index++) {
+      await f.controller.refresh(); const current = f.controller.getSnapshot();
+      expect(current.piLoginAttempt).toMatchObject({ handle: piHandle, status: "reserved", error: null });
+      expect(current.piAuthBusy).toBeNull(); expect(current.piAuthDetail?.en).toMatch(/scope.*busy/i);
+      expect(current.draft).toEqual(before.draft); expect(current.revision).toBe(before.revision); expect(current.savePhase).toBe(before.savePhase);
+      expect(current.baseline?.modelConnectionRef).toBe(before.baseline?.modelConnectionRef); expect(JSON.stringify(current)).not.toContain("PRIVATE-REFUSAL");
+    }
+    expect(f.pi.reserveLogin).toHaveBeenCalledTimes(1); expect(f.pi.startLogin).toHaveBeenCalledTimes(1); expect(f.pi.replyLogin).not.toHaveBeenCalled();
+    f.controller.closePiLogin(knownPiTarget, piHandle); await flush();
+    expect(f.controller.getSnapshot().piCloseResult?.outcome).toBe("closed"); expect(f.controller.getSnapshot().piAuthDetail?.en).not.toMatch(/scope.*busy/i);
+    const next = "fresh-after-busy"; f.pi.reserveLogin.mockResolvedValue(piAttempt("reserved", next)); f.pi.startLogin.mockResolvedValue(piAttempt("awaiting-user", next));
+    f.connect(); await flush(); expect(f.controller.getSnapshot().piLoginAttempt?.handle).toBe(next); expect(f.controller.getSnapshot().piAuthDetail?.en).not.toMatch(/scope.*busy/i);
+    f.noCodex(); f.controller.dispose();
+  });
+
+  it.each(["PI_ATTEMPT_EXPIRED", "PI_UNKNOWN_HANDLE", "PI_SERVICE_STOPPED"] as const)("S2: authoritative %s read refusal takes priority over an earlier scope-busy start", async code => {
+    const f = setupPi(); await f.controller.refresh();
+    f.pi.startLogin.mockRejectedValueOnce(new ApiResponseError("PRIVATE-START", 409, { error: { code: "PI_SCOPE_BUSY" } }));
+    f.connect(); await flush(); f.pi.readLogin.mockRejectedValue(new ApiResponseError("PRIVATE-READ", 410, { error: { code } }));
+    await f.controller.refreshPiLogin(); expect(f.controller.getSnapshot().piAuthDetail?.en).not.toMatch(/scope.*busy/i);
+    expect(f.controller.getSnapshot().piAuthDetail?.en).toContain(code.slice(3).toLowerCase().replaceAll("_", "-"));
+    const returned = createAgentConfigurationController(f.transport, knownPiTarget); await returned.refresh();
+    expect(returned.getSnapshot().piAuthDetail?.en).not.toMatch(/scope.*busy/i); expect(f.pi.startLogin).toHaveBeenCalledTimes(1);
+    f.noCodex(); returned.dispose(); f.controller.dispose();
+  });
+
   it("synchronously deduplicates Connect and exposes entry capabilities without online or deployment evidence", async () => {
     const f = setupPi(); await f.controller.refresh(); const reserve = deferred<StudioPiLoginAttempt>(); f.pi.reserveLogin.mockReturnValue(reserve.promise);
     f.connect(); f.connect(); f.controller.connectionIntent({ action: "sign-out", target: knownPiTarget });

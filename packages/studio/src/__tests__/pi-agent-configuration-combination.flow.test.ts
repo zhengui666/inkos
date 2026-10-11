@@ -149,10 +149,10 @@ afterEach(async () => {
 
 describe("actual Studio Pi dispatcher and durable request history (offline native transport)", () => {
   it("freezes the running Pi request after saving Codex, then records the next actual Codex run separately", async () => {
-    let nextCodexRevision = -1;
+    let nextCodexRevision = -1, nextCodexRequestId: string | undefined;
     const codex = new CodexFixture(() => {
       const context = currentCodexRun(); if (!context) throw new Error("Expected actual Codex admission");
-      nextCodexRevision = context.selection.configRevision;
+      nextCodexRevision = context.selection.configRevision; nextCodexRequestId = context.history?.coreRequestId;
       return { text: JSON.stringify({ status: "answered", message: "Next actual Codex answer" }) };
     });
     const fixture = await studio("valid", codex), sessionId = await fixture.session(), gate = hold();
@@ -209,10 +209,13 @@ describe("actual Studio Pi dispatcher and durable request history (offline nativ
     expect(finalSettings.selectedHarnessId).toBe("codex"); expect(finalSettings.revision).toBe(nextCodexRevision);
     expect(nextCodexRevision).toBeGreaterThan(saved.revision);
     expect(recorded.projected.issues).toEqual([]); expect(recorded.projected.requests).toHaveLength(2);
-    expect(recorded.projected.requests[0]).toEqual(pi);
-    expect(recorded.projected.requests[1]).toMatchObject({ transcriptStatus: "committed", recording: "recorded",
+    // Projection order follows random request IDs; locate each immutable admission by identity.
+    expect(recorded.projected.requests.find(request => request.coreRequestId === pi.coreRequestId)).toEqual(pi);
+    expect(nextCodexRequestId).toBeDefined();
+    const nextCodex = recorded.projected.requests.find(request => request.coreRequestId === nextCodexRequestId);
+    expect(nextCodex).toMatchObject({ transcriptStatus: "committed", recording: "recorded",
       selection: { saved: { harnessId: "codex", revision: nextCodexRevision }, selection: { harnessId: "codex", configRevision: nextCodexRevision } } });
-    expect(recorded.projected.requests[1]!.dispatches.map(dispatch => dispatch.operation)).toEqual(["codex-thread-start", "codex-turn-start"]);
+    expect(nextCodex!.dispatches.map(dispatch => dispatch.operation)).toEqual(["codex-thread-start", "codex-turn-start"]);
     expectNoPrivateHistory(recorded.projected);
     const restored = await (await fixture.app.request(`/api/v1/sessions/${sessionId}`)).json();
     expect(restored.chatRequest.status).toBe("completed");

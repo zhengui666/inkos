@@ -11,6 +11,7 @@ import type { StudioPiLoginAttempt as Attempt, StudioPiCloseResult as CloseResul
 import type { AgentConfigurationSnapshot } from "../hooks/agent-configuration-controller";
 import { startStudioServer } from "../api/server.js";
 import { loadPiNativeAuthStorage } from "../../../core/src/runtime/auth/pi-native-store-compat.js";
+import { loadPiOpenAIOAuth } from "../../../core/src/runtime/auth/pi-native-login.js";
 
 // Vitest 3 lacks import.meta.resolve. Forward the unmodified compatibility
 // module through Node; this is not a deployment proof or service contract shim.
@@ -71,7 +72,7 @@ function hold() {
   releases.push(release); return { wait, release, entered, enter };
 }
 type Action = "reserve" | "start" | "reply" | "close" | "read" | "save";
-interface Call { action?: Action; method: string; handle?: string; keys: string[]; aborted: boolean }
+interface Call { action?: Action; method: string; handle?: string; keys: string[]; aborted: boolean; status?: number }
 interface Fixture {
   root: string; agentDir: string; base: string; service: PiAccountService;
   runner: Awaited<ReturnType<typeof startStudioServer>>;
@@ -141,6 +142,7 @@ async function fixture(deferCreation?: ReturnType<typeof hold>, codexPeer?: Code
     if (target.origin === f.base) f.calls.push(call);
     init?.signal?.addEventListener("abort", () => { call.aborted = true; }, { once: true });
     const response = await nativeFetch(absolute, init);
+    call.status = response.status;
     const delay = action && f.delays.get(action);
     if (delay) { f.delays.delete(action!); delay.enter(); await delay.wait; }
     return response;
@@ -196,6 +198,15 @@ function observeSubscriptions(service: PiAccountService) {
   });
   return count;
 }
+async function observeOfficialLoginSignals(settlementGate?: ReturnType<typeof hold>) {
+  const oauth = await loadPiOpenAIOAuth(), original = oauth.login, signals: AbortSignal[] = [];
+  vi.spyOn(oauth, "login").mockImplementation(async function(this: typeof oauth, interaction, options) {
+    signals.push(interaction.signal);
+    try { return await original.call(this, interaction, options); }
+    finally { if (settlementGate) { settlementGate.enter(); await settlementGate.wait; } }
+  });
+  return signals;
+}
 function consoleValue(value: unknown): string {
   if (typeof value === "string") return value;
   const seen = new WeakSet<object>();
@@ -212,7 +223,10 @@ beforeEach(() => {
   vi.stubEnv("INKOS_CODEX_STATE_ROOT", ""); delete process.env.INKOS_CODEX_STATE_ROOT;
   vi.stubEnv("PI_OAUTH_CALLBACK_HOST", "127.0.0.1");
   consoleMessages = [];
-  for (const method of ["log", "warn", "error"] as const) vi.spyOn(console, method).mockImplementation((...values) => { consoleMessages.push(values.map(consoleValue).join(" ")); });
+  for (const method of Object.getOwnPropertyNames(console)) {
+    if (typeof console[method as keyof typeof console] !== "function" || method.startsWith("_")) continue;
+    vi.spyOn(console, method as "log").mockImplementation((...values) => { consoleMessages.push(values.map(consoleValue).join(" ")); });
+  }
 });
 afterEach(async () => {
   for (const mount of mounts.splice(0)) mount.unmount();
@@ -499,6 +513,37 @@ describe("host-owned Close and actual TCP response loss", () => {
 });
 
 describe("real Studio runner shutdown and independent settings/auth CAS", () => {
+  it.each(["manual-wait", "token-exchange", "native-write-complete"] as const)("D1: shutdown first aborts its own live %s without a prior Close and drains the real operation", async boundary => {
+    const f = await fixture(), gate = hold(), before = await bytes(f);
+    const signals = await observeOfficialLoginSignals(boundary === "manual-wait" ? gate : undefined);
+    if (boundary === "token-exchange") f.tokenReply = async () => { gate.enter(); await gate.wait; return token(); };
+    if (boundary === "native-write-complete") {
+      const { AuthStorage } = await loadPiNativeAuthStorage(), original = AuthStorage.prototype.modify;
+      vi.spyOn(AuthStorage.prototype, "modify").mockImplementation(async function(this: typeof AuthStorage.prototype, ...args) {
+        const result = await original.call(this, ...args); gate.enter(); await gate.wait; return result;
+      });
+    }
+    const attempt = await reserve(f); await start(f, attempt.handle); const waiting = await awaiting(f, attempt.handle);
+    if (boundary !== "manual-wait") { await reply(f, waiting); await gate.entered; }
+    expect(signals).toHaveLength(1); const signal = signals[0]!;
+    expect(signal.aborted).toBe(false); expect(f.service.readLoginAttempt(attempt.handle).status).toBe(boundary === "manual-wait" ? "awaiting-user" : "exchanging");
+    expect(f.calls.filter(call => call.action === "close")).toHaveLength(0);
+    const realHttpClose = f.runner.server.close; let closeCalls = 0;
+    vi.spyOn(f.runner.server, "close").mockImplementation(function(this: typeof f.runner.server, ...args) {
+      closeCalls++; expect(signal.aborted).toBe(true); return Reflect.apply(realHttpClose, this, args);
+    });
+    let settled = false;
+    const shutting = f.runner.shutdown(); pending.push(shutting);
+    expect(f.runner.shutdown()).toBe(shutting); expect(signal.aborted).toBe(true); expect(closeCalls).toBe(1);
+    void shutting.then(() => { settled = true; }); await gate.entered; await browserTurn(); expect(settled).toBe(false);
+    expect(await bytes(f) === before).toBe(boundary !== "native-write-complete");
+    gate.release(); await shutting; expect(settled).toBe(true); expect(f.runner.server.listening).toBe(false);
+    expect(f.service.readLoginAttempt(attempt.handle).status).toBe(boundary === "native-write-complete" ? "saved" : "closed");
+    expect((await owner(f)).pendingLogin === undefined).toBe(true); expect(f.calls.filter(call => call.action === "close")).toHaveLength(0);
+    expect(f.counts).toEqual({ token: boundary === "manual-wait" ? 0 : 1, codex: 0, tokenContract: boundary === "manual-wait" ? 0 : 1 });
+    if (boundary !== "manual-wait") expect(f.tokenSignals[0]).toBe(signal);
+    await releasedPort();
+  });
   it("shutdown owns injected services even without any Pi route, caches its promise and leaves another service alone", async () => {
     const f = await fixture(), own = f.service.reserveLoginAttempt(), other = await PiAccountService.create(f.root), theirs = other.reserveLoginAttempt();
     try {
@@ -619,22 +664,139 @@ async function pageTarget(page: Awaited<ReturnType<typeof mountPage>>, harness: 
   }, { timeout: 5000 });
 }
 async function browserTurn() { for (let index = 0; index < 10; index++) await new Promise<void>(done => setImmediate(done)); }
+async function durableHistory(f: Fixture, sessionId: string) {
+  const transcript = await readTranscriptEvents(f.root, sessionId), store = new CreativeEpisodeStore(join(f.root, ".inkos", "harness.sqlite"));
+  try {
+    const episodes = store.listEpisodes(), events = episodes.flatMap(episode => store.listEvents(episode.id));
+    const session = (await (await f.request(`/api/v1/sessions/${sessionId}`)).json()).session;
+    return { transcript, episodes, events, session, history: projectRunHistory({ sessionId, transcript, episodes, events }) };
+  } finally { store.close(); }
+}
 describe("real Page → Panel → Card → default singleton transport over actual TCP", () => {
-  it.each([false, true])("manual callback reaches the real public service while no private callback enters snapshots or storage (isZh=%s)", async isZh => {
+  it.each([false, true])("S1: a saved Page attempt preserves its receipt after current native authentication disappears or becomes unreadable (isZh=%s)", async isZh => {
+    const f = await fixture(), page = await mountPage(isZh); page.chooseModel("gpt-5.4");
+    page.click(page.labels.connect); await pageStatus(page, "awaiting-user");
+    page.submit(callback(page.snapshot().piLoginAttempt!)); await pageStatus(page, "saved");
+    await vi.waitFor(() => expect(page.snapshot().state?.localAuthentication).toBe("oauth-present"));
+    const before = page.snapshot(), settings = await readAgentSettings(f.root), mutations = f.calls.filter(call => call.method !== "GET").length;
+    for (const local of ["missing", "unknown"] as const) {
+      if (local === "missing") await rm(join(f.agentDir, "auth.json")); else await writeFile(join(f.agentDir, "auth.json"), "{unreadable-offline-fixture");
+      page.click(page.labels.check); await vi.waitFor(() => expect(page.snapshot().state?.localAuthentication).toBe(local));
+      expect(page.snapshot().piLoginAttempt).toMatchObject({ handle: before.piLoginAttempt!.handle, status: "saved" });
+      expect(page.text()).toMatch(isZh ? /本次尝试曾完成本地保存/ : /This attempt previously completed local saving/);
+      expect(page.text()).toMatch(local === "missing" ? isZh ? /当前未发现本地 OAuth/ : /No local OAuth found in the current observation/
+        : isZh ? /当前本地认证尚未确认/ : /Current local authentication is unconfirmed/);
+      expect(page.snapshot().draft).toEqual(before.draft); expect(page.snapshot().revision).toBe(before.revision); expect(page.snapshot().savePhase).toBe(before.savePhase);
+      expect(page.snapshot().baseline?.modelConnectionRef).toBe(before.baseline?.modelConnectionRef); expect(await readAgentSettings(f.root)).toEqual(settings);
+      expect(page.snapshot().state?.account).toBeNull(); expect(page.snapshot().state?.execution).toBeNull();
+      expect(f.calls.filter(call => call.method !== "GET")).toHaveLength(mutations); expect(f.counts).toEqual({ token: 1, codex: 0, tokenContract: 1 });
+    }
+  });
+
+  it("S2: real same-scope start 409 remains visible after reserved GET and remount while the other public service stays active", async () => {
+    const f = await fixture(), signals = await observeOfficialLoginSignals(), other = await PiAccountService.create(f.root);
+    const theirs = other.reserveLoginAttempt(other.readLoginExpectation());
+    try {
+      other.startLoginAttempt(theirs.handle); await vi.waitFor(() => expect(other.readLoginAttempt(theirs.handle).status).toBe("awaiting-user"));
+      expect(signals).toHaveLength(1); const otherSignal = signals[0]!, authBefore = await bytes(f), ownerBefore = await readFile(join(f.agentDir, "inkos-connection.json"), "utf8");
+      const settings = await readAgentSettings(f.root), page = await mountPage(); page.click(page.labels.connect);
+      await vi.waitFor(() => expect(page.snapshot().piAuthDetail?.en).toMatch(/scope.*busy/i));
+      const handle = page.snapshot().piLoginAttempt!.handle;
+      expect(f.calls.filter(call => call.action === "start")).toMatchObject([{ handle, status: 409 }]);
+      expect(await read(f, handle)).toMatchObject({ handle, status: "reserved", error: null });
+      const readsBeforeCheck = f.calls.filter(call => call.action === "read").length;
+      page.click(page.labels.check); await vi.waitFor(() => expect(f.calls.filter(call => call.action === "read" && call.status === 200).length).toBeGreaterThan(readsBeforeCheck), { timeout: 5000 });
+      await browserTurn();
+      expect(page.snapshot().piAuthDetail?.en).toMatch(/scope.*busy/i); expect(page.text()).toMatch(/This attempt is reserved and has not started/);
+      page.unmount(); const returned = await mountPage();
+      await vi.waitFor(() => expect(returned.snapshot().piLoginAttempt?.handle).toBe(handle));
+      expect(returned.snapshot().piAuthDetail?.en).toMatch(/scope.*busy/i);
+      returned.click(returned.labels.close); await pageStatus(returned, "closed");
+      expect(returned.snapshot().piAuthDetail?.en).not.toMatch(/scope.*busy/i);
+      expect(otherSignal.aborted).toBe(false); expect(other.readLoginAttempt(theirs.handle).status).toBe("awaiting-user");
+      expect(await bytes(f)).toBe(authBefore); expect(await readFile(join(f.agentDir, "inkos-connection.json"), "utf8")).toBe(ownerBefore);
+      expect(await readAgentSettings(f.root)).toEqual(settings); expect(signals).toHaveLength(1); expect(f.counts).toEqual({ token: 0, codex: 0, tokenContract: 0 });
+      expect(f.calls.filter(call => call.action === "reserve")).toHaveLength(1); expect(f.calls.filter(call => call.action === "start")).toHaveLength(1);
+      expect(f.calls.filter(call => call.action === "reply" || call.action === "save")).toHaveLength(0);
+    } finally { await other.closeLoginAttempt(theirs.handle); await other.dispose(); }
+    await releasedPort();
+  });
+
+  it.each([["manual", false], ["manual", true], ["loopback", false], ["loopback", true]] as const)("D3: %s callback reaches the real public service while no private callback enters snapshots or storage (isZh=%s)", async (mode, isZh) => {
     const f = await fixture(), storage = { setItem: vi.fn(), getItem: vi.fn(), removeItem: vi.fn() };
     vi.stubGlobal("localStorage", storage); vi.stubGlobal("sessionStorage", storage);
-    const page = await mountPage(isZh); expect(f.calls.filter(call => call.method !== "GET")).toHaveLength(0);
-    page.click(page.labels.connect); await pageStatus(page, "awaiting-user");
+    const created = await f.request("/api/v1/sessions", post({ sessionKind: "chat" })); expect(created.status).toBe(200);
+    const sessionId = (await created.json()).session.sessionId as string, historyBefore = await durableHistory(f, sessionId);
+    const settingsBefore = await readAgentSettings(f.root), { AuthStorage } = await loadPiNativeAuthStorage(), original = AuthStorage.prototype.modify;
+    let nativeWrites = 0;
+    vi.spyOn(AuthStorage.prototype, "modify").mockImplementation(function(this: typeof AuthStorage.prototype, ...args) { nativeWrites++; return original.call(this, ...args); });
+    const mutationsBeforePage = f.calls.filter(call => call.method !== "GET").length;
+    const page = await mountPage(isZh); expect(f.calls.filter(call => call.method !== "GET")).toHaveLength(mutationsBeforePage);
+    page.chooseModel("gpt-5.4"); const draftBefore = page.snapshot().draft, revisionBefore = page.snapshot().revision;
+    const connect = page.button(page.labels.connect).props.onClick as () => void;
+    connect(); connect(); await pageStatus(page, "awaiting-user");
     await vi.waitFor(() => expect(page.snapshot().piLoginAttempt?.canReply).toBe(true), { timeout: 8000 });
     const attempt = page.snapshot().piLoginAttempt!, href = page.native("a").find(item => item.props["aria-label"] === (isZh ? "Pi · 打开官方 ChatGPT 登录页面" : "Pi · Open official ChatGPT sign-in page"));
     expect(href?.props.href === attempt.challenge!.url).toBe(true); expect(href?.props.rel).toBe("noopener noreferrer");
-    page.submit(callback(attempt)); await pageStatus(page, "saved");
+    const callbackUrl = callback(attempt), stateValue = new URL(attempt.challenge!.url).searchParams.get("state")!;
+    if (mode === "manual") { page.submit(callbackUrl); page.submit(callbackUrl); }
+    else {
+      expect((await globalThis.fetch(callback(attempt, true))).status).toBe(400); expect(f.counts.token).toBe(0);
+      expect((await globalThis.fetch(callbackUrl)).status).toBe(200);
+    }
+    await pageStatus(page, "saved");
+    expect(await read(f, attempt.handle)).toMatchObject({ handle: attempt.handle, status: "saved", challenge: null, prompt: null, error: null });
+    expect((await reply(f, attempt, callbackUrl)).status).toBe(409);
+    const different = f.service.reserveLoginAttempt();
+    const cross = await f.request(`${path}/login/reply`, post({ attemptHandle: different.handle, promptId: attempt.prompt!.promptId, callbackUrl }));
+    expect(cross.status).toBe(409); expect((await cross.json()).error.code).toBe("PI_PROMPT_NOT_CURRENT");
+    expect(f.counts.token).toBe(1); expect(nativeWrites).toBe(1);
+    const nativeAuth = JSON.parse(await bytes(f)); expect(nativeAuth.openai.access === secrets[1] && nativeAuth.openai.refresh === secrets[2]).toBe(true);
+    expect(nativeAuth.other.key).toBe("synthetic-preserve-other"); expect((await owner(f)).pendingLogin === undefined).toBe(true);
+    expect(page.snapshot().draft).toEqual(draftBefore); expect(page.snapshot().revision).toBe(revisionBefore); expect(await readAgentSettings(f.root)).toEqual(settingsBefore);
+    expect(page.text()).toMatch(isZh ? /本次尝试曾完成本地保存/ : /This attempt previously completed local saving/);
+    expect(page.snapshot().state?.account).toBeNull(); expect(page.snapshot().state?.execution).toBeNull();
+    const historyAfter = await durableHistory(f, sessionId); expect(historyAfter).toEqual(historyBefore);
+    const visible = JSON.stringify({ snapshot: page.snapshot(), historyAfter, settings: await readAgentSettings(f.root) });
+    expect([...secrets, callbackUrl, stateValue, attempt.challenge!.url].some(secret => visible.includes(secret))).toBe(false);
     expect(JSON.stringify(page.snapshot()).includes(secrets[0])).toBe(false);
     expect(page.native("input").some(input => String(input.props.value ?? "").includes(secrets[0]))).toBe(false);
     expect(page.text().includes(isZh ? "尚未验证" : "unverified")).toBe(true);
     expect(storage.setItem).not.toHaveBeenCalled(); expect(storage.removeItem).not.toHaveBeenCalled();
     expect(f.counts).toEqual({ token: 1, codex: 0, tokenContract: 1 });
-    expect(f.calls.filter(call => call.action === "reserve")).toHaveLength(1); expect(f.calls.filter(call => call.action === "reply")).toHaveLength(1);
+    expect(f.calls.filter(call => call.action === "reserve")).toHaveLength(1); expect(f.calls.filter(call => call.action === "start")).toHaveLength(1);
+    expect(f.calls.filter(call => call.action === "reply")).toHaveLength(mode === "manual" ? 3 : 2);
+    expect(f.calls.filter(call => call.action === "save")).toHaveLength(0);
+  });
+  it.each([false, true])("D4: an actual SDK token-endpoint failure cannot expose its sensitive body through HTTP, Page, console, existing logs or durable history (isZh=%s)", async isZh => {
+    const f = await fixture(), storage = { setItem: vi.fn(), getItem: vi.fn(), removeItem: vi.fn() };
+    vi.stubGlobal("localStorage", storage); vi.stubGlobal("sessionStorage", storage);
+    const created = await f.request("/api/v1/sessions", post({ sessionKind: "chat" })); expect(created.status).toBe(200);
+    const sessionId = (await created.json()).session.sessionId as string, historyBefore = await durableHistory(f, sessionId), settingsBefore = await readAgentSettings(f.root), authBefore = await bytes(f);
+    const eventController = new AbortController(), events: string[] = [];
+    const response = await f.request("/api/v1/events", { signal: eventController.signal }); expect(response.status).toBe(200);
+    const reader = response.body!.getReader(), decoder = new TextDecoder();
+    const observing = (async () => { try { for (;;) { const chunk = await reader.read(); if (chunk.done) break; events.push(decoder.decode(chunk.value)); } } catch (error) { if (!eventController.signal.aborted) throw error; } })();
+    pending.push(observing);
+    try {
+      f.tokenReply = async () => new Response(JSON.stringify({ error: "invalid_grant", error_description: secrets[5], access_token: secrets[1], refresh_token: secrets[2] }), { status: 400 });
+      const page = await mountPage(isZh); page.chooseModel("gpt-5.4"); const draftBefore = page.snapshot().draft;
+      page.click(page.labels.connect); await pageStatus(page, "awaiting-user"); await vi.waitFor(() => expect(page.snapshot().piLoginAttempt?.canReply).toBe(true), { timeout: 8000 });
+      const attempt = page.snapshot().piLoginAttempt!, callbackUrl = callback(attempt), stateValue = new URL(attempt.challenge!.url).searchParams.get("state")!;
+      page.submit(callbackUrl); await pageStatus(page, "failed");
+      const terminal = await read(f, attempt.handle); expect(terminal.error).toBe("login-failed"); safe(terminal);
+      const stateResponse = await f.request(`${path}/state`), settingsResponse = await f.request("/api/v1/agent-configuration/settings"), logsResponse = await f.request("/api/v1/logs");
+      expect([stateResponse.status, settingsResponse.status, logsResponse.status]).toEqual([200, 200, 200]);
+      const publicObservations = [terminal, await stateResponse.json(), await settingsResponse.json(), await logsResponse.json()];
+      const historyAfter = await durableHistory(f, sessionId); expect(historyAfter).toEqual(historyBefore);
+      expect(page.snapshot().draft).toEqual(draftBefore); expect(await readAgentSettings(f.root)).toEqual(settingsBefore); expect(await bytes(f)).toBe(authBefore);
+      await browserTurn(); eventController.abort(); await observing;
+      const exposed = JSON.stringify({ publicObservations, snapshot: page.snapshot(), text: page.text(), events, consoleMessages, historyAfter });
+      expect([...secrets, callbackUrl, stateValue, attempt.challenge!.url].some(secret => exposed.includes(secret))).toBe(false);
+      expect(/code_verifier|code=|state=/.test(exposed)).toBe(false); expect(events.join("")).toContain("event: ping");
+      expect(storage.setItem).not.toHaveBeenCalled(); expect(storage.removeItem).not.toHaveBeenCalled();
+      expect(f.counts).toEqual({ token: 1, codex: 0, tokenContract: 1 }); expect(f.calls.filter(call => call.action === "save")).toHaveLength(0);
+    } finally { eventController.abort(); await observing; }
   });
   it("Close before a late reserve response only closes its returned handle and never starts OAuth", async () => {
     const f = await fixture(), gate = hold(); f.delays.set("reserve", gate);
