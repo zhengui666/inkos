@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { randomUUID } from "node:crypto";
 import {
   AgentSettingsConflictError, AgentSettingsPatchSchema, CodexAuthenticationOwner, RuntimeCapabilityError,
-  RuntimeAuthenticationError, observeCodexRuntime, bindCodexModelConnection,
+  RuntimeAuthenticationError, observeCodexRuntime, observePiRuntime, bindCodexModelConnection,
   parseHarnessCapabilityCatalog, readAgentSettings, updateAgentSettings,
   type HarnessCapabilityCatalog, type HarnessId, type CodexAccountService, type CodexDeviceLogin, type CodexConnectionRecord,
 } from "@actalk/inkos-core";
@@ -42,7 +42,20 @@ export function createAgentConfigurationDependencies(projectRoot: string, accoun
     accountService,
     bindConnection: async (expectedRevision, signal) => bindCodexModelConnection(projectRoot, await accountService.getRuntimeClient(), { expectedRevision, signal }),
     observeHarness: async (id, signal) => {
-      if (id === "pi") return unavailableHarnessState(id);
+      if (id === "pi") {
+        const observation = await observePiRuntime(projectRoot, signal);
+        const scope = observation.authContextRef ? { harnessId: id, authContextRef: observation.authContextRef,
+          ownerGeneration: observation.owner?.authGeneration ?? null, adapterVersion: observation.descriptor?.adapterVersion ?? "unobserved",
+          catalogVersion: `probe-${randomUUID()}` } : null;
+        const catalog = observation.descriptor?.capabilities, ownership = observation.catalogOwnership;
+        const matched = scope && catalog?.harnessId === id && ownership?.harnessId === id
+          && ownership.authContextRef === scope.authContextRef && ownership.authGeneration === scope.ownerGeneration
+          && ownership.adapterVersion === scope.adapterVersion;
+        return { harnessId: id, availability: "available", scope, installation: observation.installation,
+          localAuthentication: observation.authentication, account: null,
+          catalog: matched ? { scope, value: catalog, speedSupport: Object.fromEntries(catalog.models.map(model => [model.modelId, "unsupported" as const])) } : null,
+          execution: null };
+      }
       signal?.throwIfAborted();
       const initialClient = await accountService.getRuntimeClient();
       const initialStamp = ownerStamp(new CodexAuthenticationOwner(initialClient).snapshot());
@@ -142,6 +155,7 @@ export function createAgentConfigurationRoutes(projectRoot: string, dependencies
       catalog = { scope: { ...scope! }, value, speedSupport: Object.fromEntries(value.models.map(model => [model.modelId, state.catalog!.speedSupport[model.modelId] ?? "unknown"])) };
     }
     return { harnessId: id, availability: state.availability, scope, installation: state.installation,
+      ...(id === "pi" && state.localAuthentication ? { localAuthentication: state.localAuthentication } : {}),
       account: state.account?.type === "chatgpt" ? { type: "chatgpt", ...(state.account.label ? { label: state.account.label } : {}) } : null,
       ...(state.connection ? { connection: { phase: state.connection.phase, login: publicLogin(state.connection.login), connectionRef: state.connection.connectionRef } } : {}),
       catalog, execution: state.execution ? { scope: { harnessId: state.execution.scope.harnessId, authContextRef: state.execution.scope.authContextRef,

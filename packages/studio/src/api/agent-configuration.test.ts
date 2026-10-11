@@ -95,7 +95,7 @@ describe("real configuration storage routes", () => {
     expect(response.status).toBe(422);
     expect((await readAgentSettings(root)).revision).toBe(0);
   });
-  it("keeps Pi unavailable and leaves authentication mutations unmounted", async () => {
+  it("keeps an absent observation dependency unavailable and leaves Pi authentication mutations unmounted", async () => {
     const server = app();
     const state = (await (await server.request("/api/v1/agent-configuration/harnesses/pi/state")).json()).state;
     expect(state).toMatchObject({ harnessId: "pi", availability: "unavailable", scope: null, catalog: null, execution: null, account: null });

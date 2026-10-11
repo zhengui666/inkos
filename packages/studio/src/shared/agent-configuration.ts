@@ -24,6 +24,8 @@ export interface HarnessState {
   readonly availability: "available" | "unavailable";
   readonly scope: EvidenceScope | null;
   readonly installation: "installed" | "missing" | "unknown";
+  // Pi's scoped local OAuth presence is separate from a verified online account.
+  readonly localAuthentication?: "missing" | "oauth-present" | "unknown";
   readonly account: { readonly type: "chatgpt"; readonly label?: string } | null;
   readonly connection?: {
     readonly phase: "signed-out" | "signing-in" | "signed-in" | "failed" | "uncertain";

@@ -31,14 +31,19 @@ export function adaptAgentConfiguration(input: ConfigurationAdapterInput): Confi
   const execution = state?.execution && state.scope && sameScope(state.scope, state.execution.scope)
     && samePreferences(draft, state.execution.preferences) ? state.execution : null;
   const connectionObserved = state?.account?.type === "chatgpt";
+  const localPhase = target.harness === "pi" && state?.localAuthentication
+    ? state.localAuthentication === "oauth-present" ? "oauth-present" : state.localAuthentication === "missing" ? "signed-out" : "unverified" : undefined;
+  const connectionPhase = localPhase ?? (state?.connection?.phase === "signing-in" ? "signing-in" : connectionObserved ? "signed-in"
+    : state?.connection && state.connection.phase !== "signed-in" ? state.connection.phase : "unverified");
   const ready = execution?.phase === "ready" && connectionObserved && state?.installation === "installed" && catalog !== null && nativeValid
     && catalog.value.supportsChatGptOauth && catalog.value.supportsTools && catalog.value.supportsStreaming;
   const view: ConfigurationView = {
     target, selection: toSelection(draft),
     installation: { target, phase: installation === "installed" ? "installed" : installation === "missing" ? "missing" : "unverified" },
-    connection: { target, phase: state?.connection?.phase === "signing-in" ? "signing-in" : connectionObserved ? "signed-in" : state?.connection && state.connection.phase !== "signed-in" ? state.connection.phase : "unverified",
+    connection: { target, phase: connectionPhase,
       ...(state?.connection?.phase === "signing-in" && state.connection.login?.status === "pending" ? { attemptKey: state.connection.login.loginId } : {}),
-      ...(connectionObserved && state.connection?.phase !== "signing-in" && state.account?.label ? { accountLabel: state.account.label } : {}),
+      ...(connectionPhase === "signed-in" && state?.account?.label ? { accountLabel: state.account.label } : {}),
+      ...(localPhase === "oauth-present" ? { detail: { zh: "本地授权与模型目录不证明在线账号权限或实际执行。", en: "Local authorization and the model catalog do not verify online account entitlement or actual execution." } } : {}),
       ...(!state ? { detail: { zh: "真实连接观察接口尚不可用。", en: "Actual connection observation is unavailable." } } : {}) },
     catalog: { target, phase: catalog && nativeValid ? "available" : "unavailable", models: nativeValid ? models.map(model => ({
       key: model.modelId, label: label(model.modelId), reasoningOptions: model.efforts.map(key => ({ key, label: label(key) })),

@@ -5,6 +5,12 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { CodexFixture } from "../../../core/src/__tests__/codex-fixture.js";
 const createCodexClient = vi.hoisted(() => vi.fn());
 vi.mock("../../../core/src/codex/client.js", () => ({ createCodexClient }));
+// Vitest 3's transformed import.meta has no resolve. Execute the unchanged
+// audited loader through Node; the official SDK/storage methods remain real.
+vi.mock("../../../core/src/runtime/auth/pi-native-store-compat.js", async () => {
+  const { createRequire } = await import("node:module");
+  return createRequire(import.meta.url)("../../../core/src/runtime/auth/pi-native-store-compat.ts");
+});
 import { CreativeEpisodeStore, createCodexAccountService, currentCodexRun, evictAgentCache,
   projectRunHistory, readAgentSettings, readTranscriptEvents, RUN_HISTORY_EVENT_TYPE } from "@actalk/inkos-core";
 import { createStudioServer, shutdownStudioServer } from "../api/server.js";
@@ -12,12 +18,18 @@ beforeEach(() => {
   vi.stubEnv("INKOS_CODEX_HOME", ""); delete process.env.INKOS_CODEX_HOME;
   vi.stubEnv("INKOS_CODEX_STATE_ROOT", ""); delete process.env.INKOS_CODEX_STATE_ROOT;
 });
-afterEach(() => { vi.unstubAllEnvs(); });
+afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
 
 // The actual Studio chat caller, Core queue, request snapshot and durable stores
 // run unchanged. Only the native protocol peer is offline; this is not inference.
 it("the production Studio chat caller records its frozen Codex configuration after saving Pi and blocks the next request without fallback", async () => {
   const root = await mkdtemp(join(tmpdir(), "inkos-studio-run-history-"));
+  // The newly saved Pi default has no credential in its explicitly isolated
+  // native directory, even if the developer's ambient Pi home is authenticated.
+  vi.stubEnv("PI_CODING_AGENT_DIR", join(root, "missing-pi-home"));
+  const network = vi.fn(async () => { throw new Error("External network forbidden"); });
+  vi.stubGlobal("fetch", network);
+  createCodexClient.mockClear();
   let entered!: () => void, release!: () => void;
   const started = new Promise<void>(resolve => { entered = resolve; });
   const gate = new Promise<void>(resolve => { release = resolve; });
@@ -64,8 +76,11 @@ it("the production Studio chat caller records its frozen Codex configuration aft
     expect(JSON.stringify(history)).not.toContain("connectionRef"); expect(JSON.stringify(history)).not.toContain("authContextRef");
     const beforeNext = { peers: createCodexClient.mock.calls.length, rpc: fixture.requests.length, turns: fixture.turns.length };
     const blocked = await app.request("/api/v1/agent", post({ sessionId, instruction: "Use the newly saved Pi default" }));
-    expect(blocked.status).toBe(500); expect(await blocked.text()).toContain("not connected");
+    expect(blocked.status).toBe(500);
+    expect(await blocked.json()).toMatchObject({ error: { code: "INKOS_ACTION_ERROR",
+      message: expect.stringContaining("Pi requires an existing ChatGPT OAuth credential") } });
     expect({ peers: createCodexClient.mock.calls.length, rpc: fixture.requests.length, turns: fixture.turns.length }).toEqual(beforeNext);
+    expect(network).not.toHaveBeenCalled();
     expect((await readAgentSettings(root)).selectedHarnessId).toBe("pi");
     const restored = await (await app.request(`/api/v1/sessions/${sessionId}`)).json();
     expect(restored.session.messages.some((message: { content: string }) => message.content === "Offline production caller answer")).toBe(true);

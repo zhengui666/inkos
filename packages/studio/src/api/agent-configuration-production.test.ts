@@ -11,6 +11,12 @@ import { createStudioServer, shutdownStudioServer } from "./server.js";
 import { createAgentConfigurationController, createAgentConfigurationTransport } from "../hooks/agent-configuration-controller";
 import { adaptAgentConfiguration, toSelection } from "../pages/agent-configuration-adapter";
 
+// Forward the actual loader across Vitest 3's missing import.meta.resolve.
+vi.mock("../../../core/src/runtime/auth/pi-native-store-compat.js", async () => {
+  const { createRequire } = await import("node:module");
+  return createRequire(import.meta.url)("../../../core/src/runtime/auth/pi-native-store-compat.ts");
+});
+
 // Protocol fixture only: no native process, OAuth, provider credential or inference.
 class ProtocolPeer implements CodexClient {
   readonly codexHome: string;
@@ -84,6 +90,7 @@ describe("mounted Studio routes with real Core account/attempt/SQLite owner and 
     vi.stubEnv("INKOS_CODEX_HOME", ""); delete process.env.INKOS_CODEX_HOME;
     vi.stubEnv("INKOS_CODEX_STATE_ROOT", ""); delete process.env.INKOS_CODEX_STATE_ROOT;
     root = await mkdtemp(join(tmpdir(), "inkos-studio-real-bridge-"));
+    vi.stubEnv("PI_CODING_AGENT_DIR", join(root, "unconfigured-pi"));
     await mkdir(join(root, ".inkos", "codex", "home"), { recursive: true, mode: 0o700 });
     peer = new ProtocolPeer(root);
     factory = vi.fn(async (_projectDir: string): Promise<CodexClient> => { if (peer.closed) peer = new ProtocolPeer(root); return peer; });
@@ -227,11 +234,14 @@ describe("mounted Studio routes with real Core account/attempt/SQLite owner and 
     expect(peer.count("account/login/start")).toBe(0);
   });
 
-  it("keeps Pi saved and unavailable without using the Codex peer or falling back", async () => {
+  it("keeps Pi saved with explicitly missing native OAuth without using the Codex peer or falling back", async () => {
     const response = await app.request(`${prefix}/settings`, put({ expectedRevision: 0, patch: { selectedHarnessId: "pi", harnessPreferences: { pi: native } } }));
     expect(response.status).toBe(200); expect((await response.json()).settings.selectedHarnessId).toBe("pi");
     const pi = await app.request(`${prefix}/harnesses/pi/state`);
-    expect(await pi.json()).toEqual({ state: { harnessId: "pi", availability: "unavailable", scope: null, installation: "unknown", account: null, catalog: null, execution: null } });
+    const observed = (await pi.json()).state;
+    expect(observed).toMatchObject({ harnessId: "pi", availability: "available", installation: "installed", localAuthentication: "missing", account: null, catalog: null, execution: null });
+    expect(observed.scope).toMatchObject({ harnessId: "pi", ownerGeneration: null });
+    expect(existsSync(join(root, "unconfigured-pi"))).toBe(false);
     expect((await bind(1)).status).toBe(422);
     expect((await app.request(`${prefix}/settings`, put({ expectedRevision: 1, patch: { harnessPreferences: { pi: { model: "gpt-6.1-sol" } } } }))).status).toBe(422);
     expect((await readAgentSettings(root)).selectedHarnessId).toBe("pi");

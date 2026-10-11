@@ -53,8 +53,9 @@ function SavedHarnessDefaults({ saved, isZh, onSettings }: Props & { readonly sa
     ownerGeneration: state?.scope?.ownerGeneration ?? null, state, draft: preferences, saved: preferences, savePhase: "saved" });
   const status = observation.loading ? text(isZh, "正在核对状态…", "Checking status…")
     : observation.error ? text(isZh, "状态读取失败", "Status read failed")
-    : harness === "pi" ? text(isZh, "在线账号与执行尚未验证", "Online account and execution unverified")
+    : harness === "pi" && view.connection.phase === "oauth-present" ? text(isZh, "本地 OAuth 已检测，在线账号与执行尚未验证", "Local OAuth detected; online account and execution unverified")
     : view.connection.phase === "signed-out" ? text(isZh, "尚未登录 ChatGPT", "Not signed in to ChatGPT")
+    : harness === "pi" ? text(isZh, "在线账号与执行尚未验证", "Online account and execution unverified")
     : text(isZh, "执行尚未验证", "Execution unverified");
   const label = [harnessLabel(harness), preferences.model ?? text(isZh, "原生默认模型", "Native default model"), preferences.effort, preferences.speed, status].filter(Boolean).join(" · ");
   return <DefaultsButton isZh={isZh} onSettings={onSettings} label={label} />;

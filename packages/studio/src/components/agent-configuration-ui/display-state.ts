@@ -48,6 +48,7 @@ export const installationLabels: Record<ConfigurationView["installation"]["phase
 export const connectionLabels: Record<ConfigurationView["connection"]["phase"], TextView> = {
   unverified: { zh: "尚未验证", en: "Not yet verified" }, "signed-out": { zh: "尚未登录 ChatGPT", en: "Not signed in to ChatGPT" },
   "signing-in": { zh: "等待 ChatGPT 登录", en: "Waiting for ChatGPT sign-in" }, "signed-in": { zh: "已登录 ChatGPT", en: "Signed in to ChatGPT" },
+  "oauth-present": { zh: "已检测到本地 OAuth，在线账号尚未验证", en: "Local OAuth detected; online account unverified" },
   expired: { zh: "ChatGPT 登录已过期", en: "ChatGPT sign-in expired" }, failed: { zh: "ChatGPT 登录失败", en: "ChatGPT sign-in failed" },
   uncertain: { zh: "登录结果不确定", en: "Sign-in result uncertain" },
 };

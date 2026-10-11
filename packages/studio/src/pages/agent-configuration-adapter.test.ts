@@ -85,4 +85,15 @@ describe("pure owner evidence mapping", () => {
     expect(view.catalog.models).toEqual([]);
     expect(isExecutionReady(view)).toBe(false);
   });
+  it.each(["missing", "oauth-present", "unknown"] as const)("keeps Pi local authentication %s separate from account and execution", localAuthentication => {
+    const piScope = { ...scope, harnessId: "pi" as const, ownerGeneration: null };
+    const piTarget = { harness: "pi" as const, contextKey: piScope.authContextRef };
+    const observed: HarnessState = { ...state, harnessId: "pi", scope: piScope, localAuthentication, account: null, catalog: null };
+    const view = adaptAgentConfiguration({ target: piTarget, ownerGeneration: null, state: observed, draft, saved: draft, savePhase: "saved" });
+    expect(view.connection.phase).toBe(localAuthentication === "missing" ? "signed-out" : localAuthentication === "oauth-present" ? "oauth-present" : "unverified");
+    expect(view.connection.accountLabel).toBeUndefined(); expect(isExecutionReady(view)).toBe(false); expect(view.execution.phase).toBe("unverified");
+    const otherContext = adaptAgentConfiguration({ target: { ...piTarget, contextKey: "different" }, ownerGeneration: null,
+      state: observed, draft, saved: draft, savePhase: "saved" });
+    expect(otherContext.connection.phase).toBe("unverified"); expect(otherContext.connection.accountLabel).toBeUndefined();
+  });
 });

@@ -16,7 +16,7 @@ export function ChatGptConnectionCard({ target, connection, isZh, disabled, conn
   const phase = matches ? connection.phase : "unverified";
   const signedIn = phase === "signed-in";
   const pending = phase === "signing-in";
-  const canConnect = matches && !["unverified", "uncertain"].includes(phase);
+  const canConnect = matches && !["unverified", "uncertain", "oauth-present"].includes(phase);
   const error = ["expired", "failed", "uncertain"].includes(phase) || !matches || (pending && !connection.attemptKey);
   const authDisabled = disabled || !authManagementAvailable;
   const connectBlocked = !authManagementAvailable || (connectDisabled ?? disabled);

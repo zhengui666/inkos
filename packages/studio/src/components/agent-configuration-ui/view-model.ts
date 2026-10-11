@@ -8,7 +8,7 @@ export interface InstallationView extends ScopedView {
   readonly phase: "unverified" | "checking" | "installed" | "missing" | "failed" | "uncertain";
 }
 export interface ConnectionView extends ScopedView {
-  readonly phase: "unverified" | "signed-out" | "signing-in" | "signed-in" | "expired" | "failed" | "uncertain";
+  readonly phase: "unverified" | "signed-out" | "signing-in" | "signed-in" | "oauth-present" | "expired" | "failed" | "uncertain";
   readonly accountLabel?: string;
   readonly attemptKey?: string;
 }
