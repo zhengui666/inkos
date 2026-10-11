@@ -1,10 +1,13 @@
 import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { once } from "node:events";
+import { serve } from "@hono/node-server";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { CodexFixture } from "../../../core/src/__tests__/codex-fixture.js";
 
 const createCodexClient = vi.hoisted(() => vi.fn());
+const nativeHttpFetch = globalThis.fetch.bind(globalThis);
 vi.mock("../../../core/src/codex/client.js", () => ({ createCodexClient }));
 // Only Vitest 3's absent import.meta.resolve is bypassed. This returns the real
 // Node-loaded compatibility module, not a replacement auth/storage contract.
@@ -337,5 +340,83 @@ describe("actual Studio Pi dispatcher and durable request history (offline nativ
     // durable user cancellation; failure evidence stays in the transcript.
     expect(stopped.chatRequest.retry).toBeUndefined(); expect(stopped.chatRequest.error).toBeUndefined();
     expect((await readAgentSettings(fixture.root)).selectedHarnessId).toBe("pi");
+  }, 30_000);
+
+  it("ties one actual TCP HTTP chat request through official Pi dispatch to the same persisted SQLite and transcript history", async () => {
+    const fixture = await studio();
+    const server = serve({ fetch: fixture.app.fetch, hostname: "127.0.0.1", port: 0 });
+    const received: Array<{ method: string | undefined; path: string | undefined }> = [];
+    server.on("request", request => received.push({ method: request.method, path: request.url }));
+    try {
+      if (!server.listening) await once(server, "listening");
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected actual loopback TCP server");
+      const base = `http://127.0.0.1:${address.port}`;
+      const created = await nativeHttpFetch(`${base}/api/v1/sessions`, post({ sessionKind: "chat" }));
+      expect(created.status, await created.clone().text()).toBe(200);
+      const { session } = await created.json();
+      const sessionId: string = session.sessionId; fixture.sessions.add(sessionId);
+      const instruction = "Answer the unique offline TCP Pi chain canary.";
+      const message = "Same TCP HTTP Pi request persisted.";
+      const transportRequestId = "offline-tcp-pi-chat-transport";
+      const admissions: Array<{ harnessId: "pi"; sessionId: string; coreRequestId: string; episodeId: string }> = [];
+      const network = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        expect(urlOf(input)).toBe("https://api.openai.com/v1/responses");
+        expect(init?.method?.toUpperCase()).toBe("POST");
+        expect(String(init?.body)).toContain(instruction);
+        const context = currentRuntimeRun();
+        if (context?.harnessId !== "pi" || !context.history) throw new Error("Expected actual history-bound Pi admission");
+        admissions.push({ harnessId: context.harnessId, sessionId: context.history.sessionId,
+          coreRequestId: context.history.coreRequestId, episodeId: context.history.episodeId });
+        return rawResponse(message, "offline-tcp-pi-response");
+      });
+      // Only the SDK's external Responses bytes are synthetic. The HTTP client
+      // uses captured native fetch against the real loopback listener.
+      vi.stubGlobal("fetch", network);
+      const response = await nativeHttpFetch(`${base}/api/v1/agent`, post({ sessionId, instruction, clientRequestId: transportRequestId }));
+      const reply = await response.json();
+      const restoredResponse = await nativeHttpFetch(`${base}/api/v1/sessions/${sessionId}`);
+      expect(restoredResponse.status).toBe(200);
+      const restored = await restoredResponse.json();
+      const durable = await history(fixture.root, sessionId); // Reopens the actual SQLite store and reads transcript bytes.
+      expect(admissions).toHaveLength(1); expect(network).toHaveBeenCalledOnce();
+      expect(durable.projected.issues).toEqual([]); expect(durable.projected.requests).toHaveLength(1);
+      const admission = admissions[0]!, run = durable.projected.requests[0]!;
+      const started = durable.transcript.find(event => event.type === "request_started");
+      const committed = durable.transcript.find(event => event.type === "request_committed");
+      const episode = durable.episodes.find(item => item.id === admission.episodeId);
+      // Studio's clientRequestId and Core's request ID are distinct namespaces.
+      // The single received chat, unique prompt, actual admission and durable IDs
+      // establish this same-request chain without inventing a transport→Core ID.
+      const proof = {
+        http: { receivedChats: received.filter(item => item.method === "POST" && item.path === "/api/v1/agent").length,
+          status: response.status, response: reply.response, sessionId: restored.session.sessionId,
+          transportRequestId: restored.chatRequest.requestId, requestStatus: restored.chatRequest.status },
+        admission,
+        transcript: { startedRequestId: started?.requestId, input: started?.type === "request_started" ? started.input : undefined,
+          committedRequestId: committed?.requestId },
+        sqlite: { episodeId: episode?.id, status: episode?.status },
+        history: { sessionId: run.sessionId, coreRequestId: run.coreRequestId, transcriptStatus: run.transcriptStatus,
+          episodeStatus: run.episodeStatus, recording: run.recording, dispatches: run.dispatches },
+      };
+      expect(proof).toMatchObject({
+        http: { receivedChats: 1, status: 200, response: message, sessionId, transportRequestId, requestStatus: "completed" },
+        admission: { harnessId: "pi", sessionId, coreRequestId: admission.coreRequestId, episodeId: `episode-${admission.coreRequestId}` },
+        transcript: { startedRequestId: admission.coreRequestId, input: instruction, committedRequestId: admission.coreRequestId },
+        sqlite: { episodeId: admission.episodeId, status: "completed" },
+        history: { sessionId, coreRequestId: admission.coreRequestId, transcriptStatus: "committed", episodeStatus: "completed", recording: "recorded",
+          dispatches: [{ sessionId, coreRequestId: admission.coreRequestId, operation: "pi-prompt", agentRole: "main",
+            piSessionId: expect.any(String), modelCallId: expect.any(String), wire: { model: "gpt-5.4", effort: "low", serviceTier: null } }] },
+      });
+      expect(admission.coreRequestId).not.toBe(transportRequestId);
+      expect(run.dispatches).toHaveLength(1); expect(run.observations.every(item => item.linked)).toBe(true);
+      expect(restored.session.messages.filter((item: { content: string }) => item.content === message)).toHaveLength(1);
+      expect(createCodexClient).not.toHaveBeenCalled(); expect(fixture.accountPeerFactory).not.toHaveBeenCalled();
+      expectNoPrivateHistory(proof);
+      console.info("TCP_HTTP_PI_SAME_REQUEST", JSON.stringify(proof));
+    } finally {
+      if ("closeAllConnections" in server) server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
   }, 30_000);
 });
