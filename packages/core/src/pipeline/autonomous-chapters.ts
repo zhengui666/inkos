@@ -1,4 +1,4 @@
-import { readChapterReviewInputs, readChapterReviewInputsSync, sameChapterReviewInputs, sameChapterReviewPolicy, type ChapterReviewInputs, type ChapterReviewPolicy } from "./review-inputs.js";
+import { captureChapterReviewPolicy, readChapterReviewInputs, readChapterReviewInputsSync, sameChapterReviewInputs, sameChapterReviewPolicy, type ChapterReviewInputs, type ChapterReviewPolicy } from "./review-inputs.js";
 import { isCreationTransientFailure } from '../creation/transient.js';
 import { readFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
@@ -227,30 +227,52 @@ export class AutonomousChapterRunner {
         && observation.sourceRefs?.some(ref => ref.sourceId === `chapter-${job.chapter}` && ref.quote.trim()))) {
         return this.block(job, 'STORY_CLOSURE_REVIEW_REQUIRED', 'The final chapter has no source-supported story closure acceptance. The task cannot publish or finish on chapter count alone.');
       }
-      if (!issues.length) {
-        if (!sameChapterReviewInputs(result.reviewInputs, await readChapterReviewInputs(this.state.bookDir(job.workId), job.chapter))
-          || !sameChapterReviewPolicy(result.reviewPolicy, await this.currentReviewPolicy(job))) {
-          return this.invalidateReview(job);
-        }
+      const lengthFailure = result.delivery?.status === 'needs_revision' ? result.delivery : undefined;
+      const lengthReason = lengthFailure
+        ? `Host-measured chapter length: ${lengthFailure.measurements.count} (${lengthFailure.measurements.countingMode}); explicit allowed bounds: minimum ${lengthFailure.target.minChapterLength ?? 'none'}, maximum ${lengthFailure.target.maxChapterLength ?? 'none'}.`
+        : '';
+      if (issues.some(issue => issue.repairScope === "foundation")) {
+        return this.block(job, "CHAPTER_FOUNDATION_REVIEW_REQUIRED", "The review identifies a premise-level defect. Chapter repair cannot silently replace the accepted foundation.");
+      }
+      if (lengthFailure && issues.some(issue => issue.category === 'scope' || issue.category === 'execution')) {
+        return this.block(job, "CHAPTER_REVIEW_REQUIRED",
+          [...issues.map(issue => `${issue.code}: ${issue.summary}`), lengthReason].join("\n"));
+      }
+      if (!sameChapterReviewInputs(result.reviewInputs, await readChapterReviewInputs(this.state.bookDir(job.workId), job.chapter))
+        || !sameChapterReviewPolicy(result.reviewPolicy, await this.currentReviewPolicy(job))) {
+        return this.invalidateReview(job);
+      }
+      if (!issues.length && !lengthFailure) {
         job = { ...job, revisionId: reviewed.revisionId, reviewReceipt: {
           inputs: result.reviewInputs, reviewPolicy: result.reviewPolicy, revisionId: reviewed.revisionId, reviewedAt: now(), summary: result.summary, observations: result.observations,
         } };
         return this.advance(job, this.options.publisher ? "publishing" : "completed", "review-accepted");
       }
-      if (issues.some(issue => issue.repairScope === "foundation")) {
-        return this.block(job, "CHAPTER_FOUNDATION_REVIEW_REQUIRED", "The review identifies a premise-level defect. Chapter repair cannot silently replace the accepted foundation.");
-      }
       if (job.reviewAttempts >= 1 || ((job.reviewChecks ?? 0) - (this.options.persistentTransientRetries ? job.reviewUnavailableChecks ?? 0 : 0)) >= (this.options.maxAttempts ?? 3)
         || issues.some(issue => /(?:state-sync-required|state-validation|state-reconciliation)/u.test(issue.code))) {
-        return this.block(job, "CHAPTER_REVIEW_REQUIRED", issues.map(issue => `${issue.code}: ${issue.summary}`).join("\n"));
+        return this.block(job, issues.length ? "CHAPTER_REVIEW_REQUIRED" : "CHAPTER_LENGTH_OUT_OF_RANGE",
+          [...issues.map(issue => `${issue.code}: ${issue.summary}`), lengthReason].filter(Boolean).join("\n"));
       }
       if (this.options.shouldContinue?.(job.workId) === false) return job;
       job = { ...job, reviewAttempts: job.reviewAttempts + 1,
         reviewRepair: { revisionId: reviewed.revisionId, startedAt: now() } };
       this.store.save(job, "review-repair-started", now());
-      await runReview(() => this.pipeline.reviseDraft(job.workId, job.chapter, issues.some(issue => issue.repairScope === "structural") ? "rework" : "spot-fix",
-        "Correct only the retained source-supported review findings. Preserve original language, established facts and all unaffected prose.",
-        { reviewFindings: issues }));
+      const instruction = [
+        ...(issues.length ? ["Correct only the retained source-supported review findings. Preserve original language, established facts and all unaffected prose."] : []),
+        ...(lengthFailure ? [lengthReason,
+          "Revise into these explicit bounds using the smallest applicable edit. Preserve the original language, protected scope, established facts, active protagonist choices, opposition, causal consequences and earned emotional payoff. Keep paragraph preferences adaptable; do not mechanically pad or cut scenes."] : []),
+      ].join("\n");
+      try {
+        await runReview(() => this.pipeline.reviseDraft(job.workId, job.chapter,
+          !issues.length || issues.some(issue => issue.repairScope === "structural") ? "rework" : "spot-fix",
+          instruction,
+          // An empty retained-findings array causes reviseDraft to return early.
+          issues.length ? { reviewFindings: issues } : undefined));
+      } catch (error) {
+        if (!lengthFailure || signal.aborted) throw error;
+        return this.block(job, (error as { code?: string }).code ?? "CHAPTER_LENGTH_REPAIR_FAILED",
+          `${lengthReason}\nRepair failed: ${String(error)}`);
+      }
       // Reconcile and independently review the resulting current revision. An
       // interrupted repair uses this same path on resume, never a blind repair retry.
     }
@@ -299,8 +321,8 @@ export class AutonomousChapterRunner {
       if (current.revisionId !== job.revisionId || job.reviewReceipt?.revisionId !== current.revisionId
         || unresolvedReview(current.observations).length
         || !sameChapterReviewInputs(job.reviewReceipt?.inputs, readChapterReviewInputsSync(bookDir, job.chapter))
-        || !sameChapterReviewPolicy(job.reviewReceipt?.reviewPolicy, {
-          language: book.language, requireStoryClosure: this.options.requireStoryClosure?.(job.workId, job.chapter) === true })) {
+        || !sameChapterReviewPolicy(job.reviewReceipt?.reviewPolicy,
+          captureChapterReviewPolicy(book, this.options.requireStoryClosure?.(job.workId, job.chapter) === true))) {
         throw Object.assign(new Error("Review authority changed before submission authorization."), { code: "CHAPTER_REVIEW_INPUTS_CHANGED" });
       }
     };
@@ -328,7 +350,7 @@ export class AutonomousChapterRunner {
 
   private async currentReviewPolicy(job: ScheduledChapter): Promise<ChapterReviewPolicy> {
     const book = await this.state.loadBookConfig(job.workId);
-    return { requireStoryClosure: this.options.requireStoryClosure?.(job.workId, job.chapter) === true, language: book.language };
+    return captureChapterReviewPolicy(book, this.options.requireStoryClosure?.(job.workId, job.chapter) === true);
   }
 
   private async chapterRevision(workId: string, chapter: number) {

@@ -182,7 +182,8 @@ describe("captured authority through the real review pipeline", () => {
     const result = await f.pipeline.reviewChapter(f.book.id, 1);
     expect(result.reviewInputs).toEqual(expected);
     expect(Object.keys(result.reviewInputs)).toHaveLength(10);
-    expect(result.reviewPolicy).toEqual({ requireStoryClosure: false, language: "en" });
+    expect(result.reviewPolicy).toEqual({ requireStoryClosure: false, language: "en",
+      lengthBounds:{countingMode:"en_words",minChapterLength:null,maxChapterLength:null} });
     expect(capture).toHaveBeenCalledOnce(); expect(selection).toHaveBeenCalledOnce(); expect(prompts).toBe(2);
     expect(contractFromContext(context!)).toEqual(JSON.parse(expected.bookRulesJson).readerContract);
     for (const [key, source] of [["authorIntent", "story/author_intent.md"], ["currentFocus", "story/current_focus.md"], ["styleGuide", "story/style_guide.md"], ["parentCanon", "story/parent_canon.md"], ["fanficCanon", "story/fanfic_canon.md"]] as const) {
@@ -217,7 +218,8 @@ describe("captured authority through the real review pipeline", () => {
     const f = await reviewFixture(policy.language);
     installReviewTransport({ requireStoryClosure: policy.requireStoryClosure });
     const result = await f.pipeline.reviewChapter(f.book.id, 1, { requireStoryClosure: policy.requireStoryClosure });
-    expect(result.reviewPolicy).toEqual(policy);
+    expect(result.reviewPolicy).toEqual({...policy, lengthBounds:{
+      countingMode:policy.language === "en" ? "en_words" : "zh_chars",minChapterLength:null,maxChapterLength:null} });
     expect(result.reviewInputs).toEqual(authority("A"));
     expect(result.observations.some(observation => observation.code === "story-closure")).toBe(policy.requireStoryClosure);
   });

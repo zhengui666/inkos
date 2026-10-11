@@ -2,6 +2,9 @@ import { readFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
+import type { BookConfig } from '../models/book.js';
+import { LengthCountingModeSchema } from '../models/length-governance.js';
+import { buildLengthSpec } from '../utils/length-metrics.js';
 
 /** Literal authoritative inputs, read once and passed into the actual audit.
  * Missing files stay distinct from empty files. Generated intent/context
@@ -23,13 +26,34 @@ export type ChapterReviewInputs = z.infer<typeof ChapterReviewInputsSchema>;
 export const ChapterReviewPolicySchema = z.object({
   requireStoryClosure: z.boolean(),
   language: z.enum(['zh', 'en']),
+  // Mandatory even with no hard bounds: legacy approvals must be reviewed once.
+  lengthBounds: z.object({
+    countingMode: LengthCountingModeSchema,
+    minChapterLength: z.number().int().min(1).nullable(),
+    maxChapterLength: z.number().int().min(1).nullable(),
+  }).strict(),
 }).strict();
 export type ChapterReviewPolicy = z.infer<typeof ChapterReviewPolicySchema>;
+
+export function captureChapterReviewPolicy(
+  book: Pick<BookConfig, 'language' | 'chapterWordCount' | 'minChapterLength' | 'maxChapterLength'>,
+  requireStoryClosure = false,
+): ChapterReviewPolicy {
+  const spec = buildLengthSpec(book.chapterWordCount, book.language, book);
+  return { requireStoryClosure, language: book.language, lengthBounds: {
+    countingMode: spec.countingMode,
+    minChapterLength: spec.minChapterLength ?? null,
+    maxChapterLength: spec.maxChapterLength ?? null,
+  } };
+}
 
 export function sameChapterReviewPolicy(expected: unknown, current: ChapterReviewPolicy): boolean {
   const parsed = ChapterReviewPolicySchema.safeParse(expected);
   return parsed.success && parsed.data.requireStoryClosure === current.requireStoryClosure
-    && parsed.data.language === current.language;
+    && parsed.data.language === current.language
+    && parsed.data.lengthBounds.countingMode === current.lengthBounds.countingMode
+    && parsed.data.lengthBounds.minChapterLength === current.lengthBounds.minChapterLength
+    && parsed.data.lengthBounds.maxChapterLength === current.lengthBounds.maxChapterLength;
 }
 
 export async function readChapterReviewInputs(bookDir: string, chapter: number): Promise<ChapterReviewInputs> {

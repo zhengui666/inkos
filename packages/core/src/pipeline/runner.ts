@@ -1,4 +1,4 @@
-import { readChapterReviewInputs, type ChapterReviewInputs, type ChapterReviewPolicy } from "./review-inputs.js";
+import { captureChapterReviewPolicy, readChapterReviewInputs, type ChapterReviewInputs, type ChapterReviewPolicy } from "./review-inputs.js";
 import { captureDraftSources, sameDraftPlanningSources, assertPreparedDraftInputs, saveUnsettledDraft, loadUnsettledDraft, assertDraftSourcesCurrent, clearUnsettledDraft } from "./unsettled-draft.js";
 import { prepareStateReplay, commitStateReplay } from "../state/state-replay.js";
 import { withWorkMutationScope } from "../utils/work-mutation-scope.js";
@@ -841,7 +841,8 @@ export class PipelineRunner {
   /** Review the existing chapter and save observations without replanning its story. */
   async reviewChapter(bookId: string, chapterNumber?: number, options?: { readonly requireStoryClosure?: boolean }): Promise<AuditResult & { readonly chapterNumber: number; readonly reviewInputs: ChapterReviewInputs; readonly reviewPolicy: ChapterReviewPolicy; readonly delivery?: ReturnType<typeof chapterLengthDelivery> }> {
     const book = await this.state.loadBookConfig(bookId);
-    const reviewPolicy: ChapterReviewPolicy = { requireStoryClosure: options?.requireStoryClosure === true, language: book.language };
+    const spec = buildLengthSpec(book.chapterWordCount, book.language, book);
+    const reviewPolicy = captureChapterReviewPolicy(book, options?.requireStoryClosure === true);
     const bookDir = this.state.bookDir(bookId);
     const targetChapter = chapterNumber ?? (await this.state.getNextChapterNumber(bookId)) - 1;
     if (targetChapter < 1) {
@@ -894,7 +895,6 @@ export class PipelineRunner {
     });
 
     await syncWorkSourceArtifacts({ projectRoot: this.config.projectRoot, workId: bookId, accept: true, acceptPaths: ["source/chapters/index.json"] });
-    const spec=buildLengthSpec(book.chapterWordCount,book.language,book);
     const delivery=chapterLengthDelivery(countChapterLength(content,spec.countingMode),spec);
     return { ...result, chapterNumber: targetChapter, reviewInputs, reviewPolicy,...(delivery?{delivery}:{}) };
   }

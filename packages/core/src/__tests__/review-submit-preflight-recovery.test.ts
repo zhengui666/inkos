@@ -6,7 +6,7 @@ import { StateManager } from '../state/manager.js';
 import { syncWorkSourceArtifacts } from '../harness/source-sync.js';
 import { SchedulerStore, type ScheduledChapter } from '../pipeline/scheduler-store.js';
 import { AutonomousChapterRunner } from '../pipeline/autonomous-chapters.js';
-import { readChapterReviewInputs } from '../pipeline/review-inputs.js';
+import { captureChapterReviewPolicy, readChapterReviewInputs } from '../pipeline/review-inputs.js';
 import { PublishingStore } from '../publishing/store.js';
 import { ManualPublishingAdapter } from '../publishing/manual-adapter.js';
 import { createMegaNovelSchedulerPublisher } from '../publishing/scheduler-publisher.js';
@@ -59,14 +59,14 @@ async function setup() {
   const configure = () => createMegaNovelSchedulerPublisher(root, [{ workId: 'book', targetId: target.id,
     scope, firstNewChapter: 1, aiAssisted: true, browser }]);
   let publisher = configure(), clock = Date.now(), continuing = true, requireStoryClosure = false;
-  const capturePolicy = async () => ({ requireStoryClosure, language: (await state.loadBookConfig('book')).language });
+  const capturePolicy = async () => captureChapterReviewPolicy(await state.loadBookConfig('book'),requireStoryClosure);
   const pipeline = { writeChapters: vi.fn(), reviseDraft: vi.fn(), runWithAbortSignal: (_s: any, fn: any) => fn(),
     runWithAgentContext: (_ctx: any, fn: any) => fn(),
     reviewChapter: vi.fn(async (_workId?: string, _chapter?: number, options?: { requireStoryClosure?: boolean }) => ({
       chapterNumber: 1, summary: 'Offline audit of the captured inputs.',
       observations: options?.requireStoryClosure ? [closureObservation] : [],
       reviewInputs: await readChapterReviewInputs(bookDir, 1),
-      reviewPolicy: { requireStoryClosure: options?.requireStoryClosure === true, language: (await state.loadBookConfig('book')).language },
+      reviewPolicy: captureChapterReviewPolicy(await state.loadBookConfig('book'),options?.requireStoryClosure === true),
     })),
   };
   const createRunner = () => new AutonomousChapterRunner(root, pipeline as any, scheduler, {

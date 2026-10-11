@@ -76,7 +76,7 @@ it('keeps v2 authority, policy and frozen publication identity across a real SQL
     reviewRepair: { revisionId: 'reviewed-revision', startedAt: now - 1000 },
     failures: 3, nextAttemptAt: now + 1000, publicationStartedAt: now - 500,
     publication: { status: 'pending', remoteChapterId: 'frozen-remote', evidence: 'synthetic unknown readback' },
-    reviewReceipt: { inputs, reviewPolicy: { requireStoryClosure: true, language: 'en' },
+    reviewReceipt: { inputs, reviewPolicy: { requireStoryClosure: true, language: 'en', lengthBounds:{countingMode:'en_words',minChapterLength:null,maxChapterLength:null} },
       revisionId: 'reviewed-revision', reviewedAt: now - 1000, summary: 'Synthetic accepted audit', observations: [] } };
   ledger.save(retained, 'offline-combination');
   ledger.schedule('write', now + 3600000);

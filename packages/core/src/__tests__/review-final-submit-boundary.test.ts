@@ -7,7 +7,7 @@ import { syncWorkSourceArtifacts } from '../harness/source-sync.js';
 import { loadWorkManifest } from '../harness/work-store.js';
 import { SchedulerStore, type ScheduledChapter } from '../pipeline/scheduler-store.js';
 import { AutonomousChapterRunner } from '../pipeline/autonomous-chapters.js';
-import { ChapterReviewInputsSchema, readChapterReviewInputs, sameChapterReviewInputs } from '../pipeline/review-inputs.js';
+import { captureChapterReviewPolicy, ChapterReviewInputsSchema, readChapterReviewInputs, sameChapterReviewInputs } from '../pipeline/review-inputs.js';
 import { PublishingStore } from '../publishing/store.js';
 import { ManualPublishingAdapter } from '../publishing/manual-adapter.js';
 import { createMegaNovelSchedulerPublisher } from '../publishing/scheduler-publisher.js';
@@ -60,14 +60,14 @@ async function setup() {
   const configure = () => createMegaNovelSchedulerPublisher(root, [{ workId: 'book', targetId: target.id,
     scope, firstNewChapter: 1, aiAssisted: true, browser }]);
   let publisher = configure(), clock = Date.now(), continuing = true, requireStoryClosure = false;
-  const capturePolicy = async () => ({ requireStoryClosure, language: (await state.loadBookConfig('book')).language });
+  const capturePolicy = async () => captureChapterReviewPolicy(await state.loadBookConfig('book'),requireStoryClosure);
   const pipeline = { writeChapters: vi.fn(), reviseDraft: vi.fn(), runWithAbortSignal: (_s: any, fn: any) => fn(),
     runWithAgentContext: (_ctx: any, fn: any) => fn(),
     reviewChapter: vi.fn(async (_workId?: string, _chapter?: number, options?: { requireStoryClosure?: boolean }) => ({
       chapterNumber: 1, summary: 'Offline audit of the captured inputs.',
       observations: options?.requireStoryClosure ? [closureObservation] : [],
       reviewInputs: await readChapterReviewInputs(bookDir, 1),
-      reviewPolicy: { requireStoryClosure: options?.requireStoryClosure === true, language: (await state.loadBookConfig('book')).language },
+      reviewPolicy: captureChapterReviewPolicy(await state.loadBookConfig('book'),options?.requireStoryClosure === true),
     })),
   };
   const createRunner = () => new AutonomousChapterRunner(root, pipeline as any, scheduler, {
@@ -78,7 +78,7 @@ async function setup() {
   const first = scheduler.reserve('book', 1, clock, 1)!;
   const job: ScheduledChapter = { ...first, phase: 'reviewing' }; scheduler.save(job, 'offline-fixture');
   cleanups.push(async () => { await publisher.close(); scheduler.close(); store.close(); await rm(root, { recursive: true, force: true }); });
-  return { root, paths, bookDir, browser, snapshot, pipeline, store, job, capturePolicy,
+  return { root, state, paths, bookDir, browser, snapshot, pipeline, store, job, capturePolicy,
     setClosure: (value: boolean) => { requireStoryClosure = value; },
     setLanguage: async (language: 'zh' | 'en') => { await state.saveBookConfig('book', { ...await state.loadBookConfig('book'), language }); },
     publisher: () => publisher, latest: () => scheduler.latest('book')!,
@@ -214,8 +214,10 @@ function domFixture(initial: Identity = 'correct', transition?: Transition, acco
 
 // Actual production DOM submit runs against Page doubles copied from the repository auth-guard test.
 // Inject the concurrent change during the final guard immediately before Confirm.
-it.each(['language', 'closure', 'styleGuide'] as const)('rejects %s changing while the final guard awaits the retained snapshot', async kind => {
+it.each(['language', 'closure', 'styleGuide', 'add-min', 'add-max', 'remove-min', 'remove-max', 'change-min', 'change-max'] as const)('rejects %s changing while the final guard awaits the retained snapshot', async kind => {
   const f = await setup();
+  if(kind.startsWith('remove-')||kind.startsWith('change-')) await f.state.saveBookConfig('book', {
+    ...await f.state.loadBookConfig('book'), ...(kind.endsWith('min')?{minChapterLength:1}:{maxChapterLength:100}) });
   const dom = domFixture(); dom.state.title = 'Scene'; dom.state.body = content;
   const events = new EventEmitter();
   let connected = true, inFinalGuard = false, snapshotReads = 0, changed = false;
@@ -258,7 +260,13 @@ it.each(['language', 'closure', 'styleGuide'] as const)('rejects %s changing whi
       changed = true;
       if (kind === 'language') await f.setLanguage('zh');
       else if (kind === 'closure') f.setClosure(true);
-      else await writeFile(f.paths.styleGuide, 'Changed during last awaited snapshot read.');
+      else if(kind==='styleGuide') await writeFile(f.paths.styleGuide, 'Changed during last awaited snapshot read.');
+      else {
+        const book=await f.state.loadBookConfig('book');const {minChapterLength,maxChapterLength,...rest}=book;
+        const bounds=kind.endsWith('min')?{maxChapterLength,...(kind.startsWith('remove-')?{}:{minChapterLength:kind.startsWith('change-')?2:1})}
+          :{minChapterLength,...(kind.startsWith('remove-')?{}:{maxChapterLength:kind.startsWith('change-')?90:100})};
+        await f.state.saveBookConfig('book',{...rest,...bounds});
+      }
     }
   };
   const port = await connectMegaNovelCdpPort({ endpointURL: 'ws://127.0.0.1:9222/devtools/browser/offline',

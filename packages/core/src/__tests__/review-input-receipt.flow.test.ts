@@ -7,7 +7,7 @@ import { syncWorkSourceArtifacts } from '../harness/source-sync.js';
 import { loadWorkManifest } from '../harness/work-store.js';
 import { SchedulerStore, type ScheduledChapter } from '../pipeline/scheduler-store.js';
 import { AutonomousChapterRunner } from '../pipeline/autonomous-chapters.js';
-import { ChapterReviewInputsSchema, readChapterReviewInputs, sameChapterReviewInputs } from '../pipeline/review-inputs.js';
+import { captureChapterReviewPolicy, ChapterReviewInputsSchema, readChapterReviewInputs, sameChapterReviewInputs } from '../pipeline/review-inputs.js';
 import { PublishingStore } from '../publishing/store.js';
 import { ManualPublishingAdapter } from '../publishing/manual-adapter.js';
 import { createMegaNovelSchedulerPublisher } from '../publishing/scheduler-publisher.js';
@@ -60,14 +60,14 @@ async function setup() {
   const configure = () => createMegaNovelSchedulerPublisher(root, [{ workId: 'book', targetId: target.id,
     scope, firstNewChapter: 1, aiAssisted: true, browser }]);
   let publisher = configure(), clock = Date.now(), continuing = true, requireStoryClosure = false;
-  const capturePolicy = async () => ({ requireStoryClosure, language: (await state.loadBookConfig('book')).language });
+  const capturePolicy = async () => captureChapterReviewPolicy(await state.loadBookConfig('book'),requireStoryClosure);
   const pipeline = { writeChapters: vi.fn(), reviseDraft: vi.fn(), runWithAbortSignal: (_s: any, fn: any) => fn(),
     runWithAgentContext: (_ctx: any, fn: any) => fn(),
     reviewChapter: vi.fn(async (_workId?: string, _chapter?: number, options?: { requireStoryClosure?: boolean }) => ({
       chapterNumber: 1, summary: 'Offline audit of the captured inputs.',
       observations: options?.requireStoryClosure ? [closureObservation] : [],
       reviewInputs: await readChapterReviewInputs(bookDir, 1),
-      reviewPolicy: { requireStoryClosure: options?.requireStoryClosure === true, language: (await state.loadBookConfig('book')).language },
+      reviewPolicy: captureChapterReviewPolicy(await state.loadBookConfig('book'),options?.requireStoryClosure === true),
     })),
   };
   const createRunner = () => new AutonomousChapterRunner(root, pipeline as any, scheduler, {
@@ -78,7 +78,7 @@ async function setup() {
   const first = scheduler.reserve('book', 1, clock, 1)!;
   const job: ScheduledChapter = { ...first, phase: 'reviewing' }; scheduler.save(job, 'offline-fixture');
   cleanups.push(async () => { await publisher.close(); scheduler.close(); store.close(); await rm(root, { recursive: true, force: true }); });
-  return { root, paths, bookDir, browser, snapshot, pipeline, store, job, capturePolicy,
+  return { root, state, paths, bookDir, browser, snapshot, pipeline, store, job, capturePolicy,
     setClosure: (value: boolean) => { requireStoryClosure = value; },
     setLanguage: async (language: 'zh' | 'en') => { await state.saveBookConfig('book', { ...await state.loadBookConfig('book'), language }); },
     publisher: () => publisher, latest: () => scheduler.latest('book')!,
@@ -175,11 +175,13 @@ it.each(['submitted', 'submit_unknown', 'draft_unknown'] as const)('reconciles %
   const f = await setup();
   if (phase === 'submit_unknown') vi.mocked(f.browser.submit).mockRejectedValue(new Error('Offline lost acknowledgement'));
   if (phase === 'draft_unknown') vi.mocked(f.browser.createDraft).mockRejectedValue(new Error('Offline unknown autosave'));
-  const original = await f.run(f.job), receipt = original.reviewReceipt;
+  const original = await f.run(f.job);
+  const receipt={...original.reviewReceipt!,reviewPolicy:{language:'en',requireStoryClosure:false} as any};
+  f.save({...original,reviewReceipt:receipt});
   expect(original.phase).toBe('publishing');
   await writeFile(f.paths.brief, 'Reveal the sender now.'); await rm(f.paths.plan);
   await writeFile(f.paths.styleGuide, Buffer.from([0xc0, 0xaf]));
-  f.setClosure(true); await f.setLanguage('zh');
+  f.setClosure(true); await f.setLanguage('zh');await setBounds(f,{minChapterLength:2000,maxChapterLength:2500});
   // Unregistered prose is also irrelevant to readback of the already-frozen remote attempt.
   await writeFile(join(f.root, sourcePath), 'Unregistered newer prose, never submit this copy.');
   await f.restart(); const pending = await f.run(f.latest());
@@ -256,6 +258,7 @@ it('returns the exact pre-audit memo, brief and rules that shaped real PipelineR
   const initial = await f.capture();
   const plan = JSON.parse(initial.plan!); plan.memo.threadRefs = ['resolved-hook'];
   await writeFile(f.paths.plan, JSON.stringify(plan));
+  await setBounds(f,{minChapterLength:1,maxChapterLength:100});
   const expected = await f.capture();
   const selected = vi.spyOn(ComposerAgent.prototype, 'selectTaskContext').mockImplementationOnce(async input => {
     expect(input.goal).toBe(expected.authorBrief!.trim());
@@ -263,7 +266,7 @@ it('returns the exact pre-audit memo, brief and rules that shaped real PipelineR
     // These changes happen after context preparation has received its inputs.
     await writeFile(f.paths.plan, JSON.stringify({ ...plan, memo: { ...plan.memo, body: 'Reveal the sender.', threadRefs: [] } }));
     await writeFile(f.paths.brief, 'Reveal the sender.'); await writeFile(f.paths.rules, 'New rules.');
-    await f.setLanguage('zh');
+    await f.setLanguage('zh');await setBounds(f,{minChapterLength:2000,maxChapterLength:2500});
     return { chapter: 1, selectedContext: [] };
   });
   vi.spyOn(ContinuityAuditor.prototype, 'auditChapter').mockImplementationOnce(async (_dir, _content, _chapter, _genre, options) => {
@@ -277,7 +280,8 @@ it('returns the exact pre-audit memo, brief and rules that shaped real PipelineR
   const pipeline = new PipelineRunner({ projectRoot: f.root, client: {} as any, model: 'offline-no-provider' });
   const result = await pipeline.reviewChapter('book', 1);
   expect(result.reviewInputs).toEqual(expected); expect(result.reviewInputs).not.toEqual(await f.capture());
-  expect((result as any).reviewPolicy).toEqual({ requireStoryClosure: false, language: 'en' });
+  expect((result as any).reviewPolicy).toEqual({ requireStoryClosure: false, language: 'en', lengthBounds:{countingMode:'en_words',minChapterLength:1,maxChapterLength:100} });
+  expect(result.delivery).toMatchObject({status:'checks_passed',measurements:{countingMode:'en_words'},target:{minChapterLength:1,maxChapterLength:100}});
   expect(selected).toHaveBeenCalledOnce();
 });
 
@@ -394,4 +398,56 @@ it('preserves an existing frozen publication identity and editorial budget when 
   expect(f.store.listPackages()).toHaveLength(1); expect(f.store.listPackages()[0]!.manifest.id).toBe(frozen.manifest.id);
   expect(f.store.getMegaNovelRun(frozen.manifest.id, 1)?.remoteChapterId).toBe('remote-1');
   expect(f.browser.createDraft).toHaveBeenCalledOnce(); expect(f.browser.submit).not.toHaveBeenCalled();
+});
+
+
+const lengthPolicyChanges = [
+ ['add-min', {}, {minChapterLength:1}], ['add-max', {}, {maxChapterLength:100}],
+ ['remove-min', {minChapterLength:1}, {}], ['remove-max', {maxChapterLength:100}, {}],
+ ['change-min', {minChapterLength:1}, {minChapterLength:2}], ['change-max', {maxChapterLength:100}, {maxChapterLength:90}],
+] as const;
+async function setBounds(f: Awaited<ReturnType<typeof setup>>, bounds: {minChapterLength?:number;maxChapterLength?:number}) {
+ const book=await f.state.loadBookConfig('book'); const {minChapterLength, maxChapterLength, ...rest}=book;
+ await f.state.saveBookConfig('book',{...rest,...bounds});
+}
+it.each(lengthPolicyChanges)('invalidates an unsubmitted receipt when explicit bounds %s', async (_name,before,after) => {
+ const f=await setup();await setBounds(f,before);const accepted=await approvedButUnsubmitted(f);
+ await setBounds(f,after);const changed=await f.run(accepted);
+ expect(changed.phase).toBe('reviewing');expect(changed.reviewReceipt).toBeUndefined();expect(changed.reviewChecks).toBe(1);
+ expect(f.browser.createDraft).not.toHaveBeenCalled();expect(f.browser.submit).not.toHaveBeenCalled();
+ expect((await f.run(changed)).publication?.status).toBe('submitted');expect(f.pipeline.reviewChapter).toHaveBeenCalledTimes(2);
+});
+it.each(lengthPolicyChanges)('rejects captured explicit bounds changed during audit: %s', async (_name,before,after) => {
+ const f=await setup();await setBounds(f,before);
+ f.pipeline.reviewChapter.mockImplementationOnce(async()=>{
+  const reviewInputs=await f.capture(),reviewPolicy=await f.capturePolicy();await setBounds(f,after);
+  return {chapterNumber:1,summary:'Old policy audit',observations:[],reviewInputs,reviewPolicy};
+ });
+ const changed=await f.run(f.job);expect(changed.phase).toBe('reviewing');expect(changed.reviewReceipt).toBeUndefined();
+ expect(changed.reviewChecks).toBe(1);expect(f.browser.createDraft).not.toHaveBeenCalled();expect(f.browser.submit).not.toHaveBeenCalled();
+});
+it.each(lengthPolicyChanges)('rejects changed bounds at synchronous authorization after remote preparation: %s', async (_name,before,after) => {
+ const f=await setup();await setBounds(f,before);
+ vi.mocked(f.browser.createDraft).mockImplementationOnce(async input=>{
+  f.snapshot.candidates=[{remoteChapterId:'remote-1',number:1,title:input.title,content:input.content,status:'draft',aiDisclosure:'declared_ai',evidence:'Synthetic retained draft'}];
+ });
+ vi.mocked(f.browser.snapshot).mockImplementation(async()=>{
+  if(f.snapshot.candidates.length)await setBounds(f,after);
+  return structuredClone(f.snapshot);
+ });
+ const changed=await f.run(f.job);expect(changed.phase).toBe('reviewing');expect(changed.reviewReceipt).toBeUndefined();
+ expect(f.browser.createDraft).toHaveBeenCalledOnce();expect(f.browser.submit).not.toHaveBeenCalled();
+});
+it('reuses unchanged explicit bounds after restart and ignores changes to the soft target', async()=>{
+ const f=await setup();await setBounds(f,{minChapterLength:1,maxChapterLength:100});const accepted=await approvedButUnsubmitted(f);
+ await f.state.saveBookConfig('book',{...await f.state.loadBookConfig('book'),chapterWordCount:2400});await f.restart();
+ expect((await f.run(f.latest())).publication?.status).toBe('submitted');expect(f.pipeline.reviewChapter).toHaveBeenCalledOnce();
+ expect(f.browser.submit).toHaveBeenCalledOnce();expect(f.latest().reviewReceipt).toEqual(accepted.reviewReceipt);
+});
+it('requires one fresh review for an old unsubmitted policy lacking explicit length authority', async()=>{
+ const f=await setup();const accepted=await approvedButUnsubmitted(f);
+ const legacy={...accepted,reviewReceipt:{...accepted.reviewReceipt!,reviewPolicy:{language:'en',requireStoryClosure:false} as any}};
+ f.save(legacy);await f.restart();const changed=await f.run(f.latest());expect(changed.phase).toBe('reviewing');expect(changed.reviewReceipt).toBeUndefined();
+ expect((await f.run(changed)).publication?.status).toBe('submitted');expect(f.pipeline.reviewChapter).toHaveBeenCalledTimes(2);
+ expect(f.browser.createDraft).toHaveBeenCalledOnce();expect(f.browser.submit).toHaveBeenCalledOnce();
 });
