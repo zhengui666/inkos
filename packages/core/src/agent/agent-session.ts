@@ -1,12 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { Agent } from "../codex/agent.js";
+import { createRuntimeAgent, resolveRuntimeModel, type RuntimeAgent } from "../runtime/provider.js";
 import { finalizeAgentRequest } from "./request-lifecycle.js";
 import { withAgentRequestDeadline } from "./execution-deadline.js";
-import { guardCodexExecution, withCodexExecution } from "../runtime/execution.js";
-import { currentCodexRun, runWithCodexContext } from "../runtime/run-context.js";
+import { guardRuntimeExecution, withRuntimeExecution } from "../runtime/execution.js";
+import { currentRuntimeRun, runWithRuntimeContext } from "../runtime/run-context.js";
 import { appendRunSelection, type RunHistoryBinding } from "../runtime/run-history.js";
-import { resolveCodexModel } from "../codex/model.js";
 import { preserveToolArgumentTypes } from "./tool-arguments.js";
 import { createTurnCompletionTool, TurnArtifactDeliveries, TURN_COMPLETION_GUIDANCE, TURN_COMPLETION_TOOL, TurnCompletionSchema, parseTurnCompletion, type TurnCompletion } from "./turn-completion.js";
 import type { AgentEvent, AgentMessage } from "../codex/contracts.js";
@@ -205,7 +204,7 @@ interface CachedAgent {
   artifactDeliveries: TurnArtifactDeliveries;
   pendingWorkTransition?: AgentWorkTransition;
   completedPlayScene?: string;
-  agent: Agent;
+  agent: RuntimeAgent;
   sessionId: string;
   projectRoot: string;
   bookId: string | null;
@@ -585,6 +584,7 @@ export async function compileHarnessContextText(input: {
   readonly maxTokens: number;
   readonly signal?: AbortSignal;
 }): Promise<string> {
+  if (!currentRuntimeRun()) return withRuntimeExecution(input.projectRoot ?? process.cwd(), () => compileHarnessContextText(input), { signal: input.signal });
   const outputBudget = Math.min(input.maxTokens, 4096);
   const contextWindow = Number.isFinite(input.model.contextWindow) && input.model.contextWindow > 0
     ? input.model.contextWindow : 32_000;
@@ -598,7 +598,7 @@ export async function compileHarnessContextText(input: {
     return compileHarnessContextText({...input,userPrompt:summaries.join("\n\n"),maxTokens:outputBudget});
   }
   // No tools are offered to the semantic compiler; quoted records cannot cause actions.
-  const agent = new Agent({ projectRoot: input.projectRoot ?? process.cwd(), signal: input.signal,
+  const agent = await createRuntimeAgent({ projectRoot: input.projectRoot ?? process.cwd(), signal: input.signal,
     maxOutputTokens: outputBudget,
     initialState: { model: input.model, systemPrompt: `${input.systemPrompt}\n\nThe summary must fit within ${outputBudget} estimated tokens. Preserve protected facts and source pointers; omit less relevant details rather than exceeding the budget.`, tools: [], messages: [] } });
   await agent.prompt(input.userPrompt);
@@ -725,7 +725,7 @@ export async function runAgentSession(
   config: AgentSessionConfig,
   userMessage: string,
 ): Promise<AgentSessionResult> {
-  return runInAgentSessionQueue(config.projectRoot, config.sessionId, () => withAgentRequestDeadline(config.signal, signal => withCodexExecution(config.projectRoot, async () => {
+  return runInAgentSessionQueue(config.projectRoot, config.sessionId, () => withAgentRequestDeadline(config.signal, signal => withRuntimeExecution(config.projectRoot, async () => {
     let currentConfig = { ...config, signal };
     const visited = new Set<string>();
     let result = await runAgentSessionUnlocked(currentConfig, userMessage);
@@ -800,8 +800,8 @@ async function runAgentSessionUnlocked(
     requestedSkills: config.requestedSkills,
     disabledSkills: config.disabledSkills,
   });
-  const runtime = currentCodexRun()!;
-  const model = resolveCodexModel({ model: runtime.selection.modelId });
+  const runtime = currentRuntimeRun()!;
+  const model = resolveRuntimeModel();
   const requestedModelIdentity = JSON.stringify(runtime.selection);
   const allowSystemFileRead = config.allowSystemFileRead ?? envFlagEnabled(process.env.INKOS_AGENT_ALLOW_SYSTEM_READ, false);
   const suppressProductionTools = config.suppressProductionTools ?? false;
@@ -1036,7 +1036,7 @@ async function runAgentSessionUnlocked(
     const restoredContextBlock = restoredSystemContext.length > 0
       ? `\n\n## Restored committed context\n${restoredSystemContext.join("\n\n")}`
       : "";
-    const agent = new Agent({
+    const agent = await createRuntimeAgent({
       projectRoot,
       maxOutputTokens: agentOutputBudget(model),
       outputSchema: JSON.parse(JSON.stringify(TurnCompletionSchema)),
@@ -1297,7 +1297,7 @@ async function runAgentSessionUnlocked(
     // ----- Execute the turn -----
     config.signal?.addEventListener("abort", abortContainingWorkflow, { once: true });
     config.signal?.throwIfAborted();
-    await runWithCodexContext({ ...runtime, history }, () => withExecutionEvidence((type, payload) => cached!.harnessRuntime.episodes.append({
+    await runWithRuntimeContext({ ...runtime, history }, () => withExecutionEvidence((type, payload) => cached!.harnessRuntime.episodes.append({
       episodeId: episodeHandle.episode.id, workId: episodeHandle.episode.workId, type, payload,
     }), () => runWithAgentTrajectory({
       conversationId,
@@ -1323,11 +1323,12 @@ async function runAgentSessionUnlocked(
           if (!completionTool) throw new Error("The host completion validator is unavailable.");
           // Run the identical domain validator, without inventing a model tool
           // call or replaying any production action from the final response.
-          await guardCodexExecution(config.signal);
+          await guardRuntimeExecution(config.signal);
           await completionTool.execute("native-completion", parameters, config.signal);
+          await guardRuntimeExecution(config.signal);
           config.signal?.throwIfAborted();
         } catch (error) {
-          if ((error as { code?: string }).code === "RUNTIME_AUTH_REVOKED") throw error;
+          if (["RUNTIME_AUTH_REVOKED", "RUNTIME_HISTORY_WRITE_FAILED"].includes((error as { code?: string }).code ?? "")) throw error;
           config.signal?.throwIfAborted();
           completionError = error instanceof Error ? error : new Error(String(error));
           recordExecutionEvidence("turn-completion-rejected", { code: completionError.code ?? "TURN_COMPLETION_INVALID" });

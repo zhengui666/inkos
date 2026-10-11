@@ -56,7 +56,7 @@ export abstract class BaseAgent {
     resultTool: WorkerResultTool<TParameters>,
     options?: { readonly temperature?: number; readonly maxTokens?: number; readonly professionalGuidance?: boolean },
   ): Promise<{ readonly result: Static<TParameters>; readonly usage: LLMResponse["usage"] }> {
-    let usage: LLMResponse["usage"] = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+    let usage: LLMResponse["usage"] = undefined;
     const result = await runWorkerAgentTool(
       this.ctx.client,
       this.ctx.model,

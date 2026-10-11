@@ -54,8 +54,22 @@ const cases = [
     } },
 ] as const;
 
-describe.each(["zh", "en"] as const)("writer to settler evidence in %s", language => {
-  it.each(cases)("preserves the contract for $name", async scenario => {
+const knownUsage = { promptTokens: 10, completionTokens: 5, totalTokens: 15 };
+const usageCases = [
+  { label: "known + known", creative: knownUsage, settlement: knownUsage },
+  { label: "known + unknown", creative: knownUsage, settlement: undefined },
+  { label: "unknown + known", creative: undefined, settlement: knownUsage },
+  { label: "all unknown", creative: undefined, settlement: undefined },
+  { label: "resume old draft without usage + known", creative: undefined, settlement: knownUsage, resume: true },
+];
+const inputs = [
+  ...(["zh", "en"] as const).flatMap(language => cases.map(scenario => ({ language, scenario, usageCase: undefined,
+    name: `${language}: ${scenario.name}` }))),
+  ...usageCases.map(usageCase => ({ language: "en" as const, scenario: cases[0], usageCase,
+    name: `usage ${usageCase.label}` })),
+];
+describe("writer to settler evidence and usage propagation", () => {
+  it.each(inputs)("preserves the contract for $name", async ({ language, scenario, usageCase }) => {
     const root = await mkdtemp(join(tmpdir(), "inkos-prose-contract-")); roots.push(root);
     const bookDir = join(root, "works", book.id, "source");
     await saveWorkManifest(root, createWorkManifest({ id: book.id, title: book.title, profileId: "longform-novel", language }));
@@ -106,7 +120,8 @@ describe.each(["zh", "en"] as const)("writer to settler evidence in %s", languag
       body: "Required scene: resolve the collection attempt. Background: the letter stays sealed. Preserve the existing invitation without resolving it.", threadRefs: ["hook-existing"] };
     const externalContext = "Honor the current author request; keep the title Collection.";
     const projectionGuide = await readFile(new URL("../../skills/inkos-long-writing/references/state-projection.md", import.meta.url), "utf8");
-    worker.tool.mockImplementation(async (_client, _model, messages: LLMMessage[], tool) => {
+    worker.tool.mockImplementation(async (_client, _model, messages: LLMMessage[], tool, options) => {
+      options.onUsage?.(tool.name === "submit_chapter_draft" ? usageCase?.creative : usageCase?.settlement);
       const system = messages.filter(message => message.role === "system").map(message => message.content).join("\n");
       const user = messages.find(message => message.role === "user")!.content;
       // The linked method must reach both requests. Match the current contract's
@@ -138,8 +153,11 @@ describe.each(["zh", "en"] as const)("writer to settler evidence in %s", languag
           stateChanges: scenario.name, hookActivity: "", mood: "quiet", chapterType: "scene" } };
     });
     const result = await new WriterAgent({ client, model: "fixture", projectRoot: root, bookId: book.id }).writeChapter({
-      book: { ...book, language }, bookDir, chapterNumber: 6, chapterIntent: memo.goal, chapterMemo: memo, contextPackage, externalContext });
-    expect(worker.tool).toHaveBeenCalledTimes(2);
+      book: { ...book, language }, bookDir, chapterNumber: 6, chapterIntent: memo.goal, chapterMemo: memo, contextPackage, externalContext,
+      ...(usageCase && "resume" in usageCase ? { resumeDraft: { title: "Collection", content } } : {}) });
+    expect(worker.tool).toHaveBeenCalledTimes(usageCase && "resume" in usageCase ? 1 : 2);
+    expect(result.tokenUsage).toEqual(usageCase?.creative && usageCase?.settlement
+      ? { promptTokens: 20, completionTokens: 10, totalTokens: 30 } : undefined);
     expect(worker.text).not.toHaveBeenCalled();
     expect(result.content).toBe(content);
     expect(content).not.toMatch(/8400|8670|2100|2460/);

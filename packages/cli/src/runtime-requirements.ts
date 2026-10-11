@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 
 export const MIN_NODE_MAJOR = 22;
-export const MIN_NODE_VERSION = "22.16.0";
+export const MIN_NODE_VERSION = "22.19.0";
 export const NODE_PIN_VERSION = String(MIN_NODE_MAJOR);
 export const NODE_PIN_FILES = [".nvmrc", ".node-version"] as const;
 
@@ -100,7 +100,7 @@ export function evaluateNodeRuntimeSupport(options?: {
   const major = parseNodeMajor(nodeVersion);
   const minor = Number(nodeVersion.replace(/^v/i, "").split(".")[1] ?? 0);
 
-  if (major < MIN_NODE_MAJOR || (major === MIN_NODE_MAJOR && minor < 16)) {
+  if (major < MIN_NODE_MAJOR || (major === MIN_NODE_MAJOR && minor < 19)) {
     return {
       ok: false,
       detail: `Unsupported runtime ${nodeVersion}. InkOS requires Node ${MIN_NODE_VERSION}+.`,

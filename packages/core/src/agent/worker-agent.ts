@@ -1,4 +1,4 @@
-import { Agent } from "../codex/agent.js";
+import { createRuntimeAgent, resolveRuntimeModel, type RuntimeAgent } from "../runtime/provider.js";
 import { CodexCleanupError, CodexHostError, CodexModelError, CodexTurnIdentityError } from "../codex/provider-error.js";
 import type { AgentTool, AgentToolResult } from "../codex/contracts.js";
 import type { Api, AssistantMessage, Message, Model } from "@mariozechner/pi-ai";
@@ -10,14 +10,13 @@ import {
   type LLMResponse,
   type OnStreamProgress,
 } from "../llm/provider.js";
-import { resolveCodexModel } from "../codex/model.js";
 import { recordExecutionEvidence } from "../harness/execution-evidence.js";
 import { decodeWorkerOutput, workerOutputSchema } from "./worker-output.js";
 import { decodeStructuredFields } from "./structured-arguments.js";
 import { preserveToolArgumentTypes, toolArgumentIssues } from "./tool-arguments.js";
 import { isUnboundedWorkerExecution } from "./worker-execution-policy.js";
-import { RuntimeHistoryWriteError, guardCodexExecution, withCodexExecution } from "../runtime/execution.js";
-import { currentCodexRun } from "../runtime/run-context.js";
+import { RuntimeHistoryWriteError, guardRuntimeExecution, withRuntimeExecution } from "../runtime/execution.js";
+import { currentRuntimeRun } from "../runtime/run-context.js";
 import { RuntimeAuthenticationError } from "../runtime/auth/codex-owner.js";
 
 export interface WorkerAgentOptions {
@@ -65,7 +64,8 @@ function toAgentMessages(messages: ReadonlyArray<LLMMessage>, model: Model<Api>)
         });
 }
 
-function usageFrom(messages: ReadonlyArray<Message>): NonNullable<LLMResponse["usage"]> {
+function usageFrom(messages: ReadonlyArray<Message>): LLMResponse["usage"] {
+  if (messages.some(message => message.role === "assistant" && (!message.usage || ![message.usage.input, message.usage.output, message.usage.totalTokens].every(value => typeof value === "number" && Number.isFinite(value) && value >= 0)))) return undefined;
   return messages.reduce((usage, message) => {
     if (message.role === "assistant") {
       usage.promptTokens += message.usage.input;
@@ -102,16 +102,20 @@ class WorkerResultUncertainError extends Error {
 }
 
 function throwIfWorkerAborted(signal?: AbortSignal, failure?: unknown): void {
+  const rawCode = (failure as { code?: unknown } | undefined)?.code;
+  const failureCode = typeof rawCode === "string" ? rawCode : undefined;
+  if ((failure as { code?: string } | undefined)?.code === 'PI_CLEANUP_FAILED') return;
   if (failure instanceof CodexCleanupError || failure instanceof CodexHostError) return;
   // A late deadline cannot replace a retained runtime/native failure, including an
   // unconfirmed turn or uncertain tool outcome. Explicit caller cancellation wins.
   if ((failure instanceof RuntimeHistoryWriteError || failure instanceof RuntimeAuthenticationError
-    || failure instanceof CodexModelError || failure instanceof CodexTurnIdentityError || failure instanceof WorkerResultUncertainError)
+    || failure instanceof CodexModelError || failure instanceof CodexTurnIdentityError || failure instanceof WorkerResultUncertainError
+    || failureCode?.startsWith('PI_'))
     && signal?.aborted && (signal.reason as { code?: unknown })?.code === "WORKER_TIMEOUT") return;
   signal?.throwIfAborted();
 }
 
-function watchWorker(agent: Agent, options: WorkerAgentOptions, resultTool?: string): () => void {
+function watchWorker(agent: RuntimeAgent, options: WorkerAgentOptions, resultTool?: string): () => void {
   const monitor = createStreamMonitor(progress => {
     options.onStreamProgress?.(progress);
     recordExecutionEvidence("model-stream-progress", { ...(resultTool ? { resultTool } : {}), ...progress });
@@ -139,11 +143,11 @@ async function runTextWorker(
   options: WorkerAgentOptions = {},
 ): Promise<LLMResponse> {
   options.signal?.throwIfAborted();
-  const runtime = currentCodexRun()!;
-  const model = resolveCodexModel({ model: runtime.selection.modelId });
+  const runtime = currentRuntimeRun()!;
+  const model = resolveRuntimeModel();
   const promptMessages = toAgentMessages(messages, model);
   if (promptMessages.length === 0) throw new Error("Worker Agent requires at least one non-system message");
-  const agent = new Agent({
+  const agent = await createRuntimeAgent({
     projectRoot: runtime.projectRoot,
     signal: options.signal,
     ...(isUnboundedWorkerExecution() ? {} : { maxOutputTokens: options.maxTokens ?? client.defaults?.maxTokens ?? 32_768 }),
@@ -187,8 +191,8 @@ async function runStructuredWorker<TParameters extends TSchema>(
   options: WorkerAgentOptions = {},
 ): Promise<Static<TParameters>> {
   options.signal?.throwIfAborted();
-  const runtime = currentCodexRun()!;
-  const model = resolveCodexModel({ model: runtime.selection.modelId });
+  const runtime = currentRuntimeRun()!;
+  const model = resolveRuntimeModel();
   const promptMessages = toAgentMessages(messages, model);
   if (promptMessages.length === 0) throw new Error("Structured Worker Agent requires at least one non-system message");
   let submitted: Static<TParameters> | undefined;
@@ -228,16 +232,18 @@ async function runStructuredWorker<TParameters extends TSchema>(
       try {
         // prepareArguments has already validated without coercion. Preserve union
         // scalar types instead of converting the supplied JSON with Value.Parse.
-        await guardCodexExecution(options.signal);
+        await guardRuntimeExecution(options.signal);
         const result = validate ? await validate(params) : params;
         options.signal?.throwIfAborted();
+        await guardRuntimeExecution(options.signal);
         submitted = result;
         hasSubmitted = true;
       } catch (error) {
         if (error instanceof RuntimeAuthenticationError) throw error;
         lastValidationError = error instanceof Error ? error : new Error(String(error));
+        lastValidationError.code ??= "WORKER_DOMAIN_INVALID";
         recordExecutionEvidence("worker-result-invalid", {
-          code: lastValidationError.code ?? "WORKER_DOMAIN_INVALID",
+          code: lastValidationError.code,
           resultTool: resultTool.name,
           message: lastValidationError.message,
         });
@@ -246,7 +252,7 @@ async function runStructuredWorker<TParameters extends TSchema>(
       return { content: [{ type: "text", text: "Structured result received by the host." }], details: submitted! };
     },
   };
-  const agent = new Agent({
+  const agent = await createRuntimeAgent({
     projectRoot: runtime.projectRoot,
     signal: options.signal,
     ...(isUnboundedWorkerExecution() ? {} : { maxOutputTokens: options.maxTokens ?? client.defaults?.maxTokens ?? 32_768 }),
@@ -309,7 +315,7 @@ async function runStructuredWorker<TParameters extends TSchema>(
         lastAssistantText: last?.content.filter(part => part.type === "text").map(part => part.text).join(""),
       });
     }
-    options.onUsage?.(usageFrom(agent.state.messages));
+    options.onUsage?.(usageFrom(agent.state.messages.slice(promptMessages.length)));
     return submitted!;
   } catch (error) {
     const failure = preserveAttemptOutcome(error);
@@ -342,12 +348,12 @@ async function withWorkerDeadline<T>(options: WorkerAgentOptions, run: (bounded:
 }
 
 export function runWorkerAgent(client: LLMClient, modelId: string, messages: ReadonlyArray<LLMMessage>, options: WorkerAgentOptions = {}): Promise<LLMResponse> {
-  return withWorkerDeadline(options, bounded => withCodexExecution(options.projectRoot ?? client._codex?.projectRoot ?? process.cwd(),
+  return withWorkerDeadline(options, bounded => withRuntimeExecution(options.projectRoot ?? client._runtime?.projectRoot ?? client._codex?.projectRoot ?? process.cwd(),
     () => runTextWorker(client, modelId, messages, bounded), { signal: bounded.signal, settings: client._codex?.settings }));
 }
 
 export function runWorkerAgentTool<TParameters extends TSchema>(client: LLMClient, modelId: string,
   messages: ReadonlyArray<LLMMessage>, resultTool: WorkerResultTool<TParameters>, options: WorkerAgentOptions = {}): Promise<Static<TParameters>> {
-  return withWorkerDeadline(options, bounded => withCodexExecution(options.projectRoot ?? client._codex?.projectRoot ?? process.cwd(),
+  return withWorkerDeadline(options, bounded => withRuntimeExecution(options.projectRoot ?? client._runtime?.projectRoot ?? client._codex?.projectRoot ?? process.cwd(),
     () => runStructuredWorker(client, modelId, messages, resultTool, bounded), { signal: bounded.signal, settings: client._codex?.settings }));
 }

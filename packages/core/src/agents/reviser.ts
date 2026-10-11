@@ -93,7 +93,7 @@ export class ReviserAgent extends BaseAgent {
     targetText?:string,
     onCandidate?: (content: string) => Promise<void>,
   ): Promise<ReviseOutput> {
-    let planUsage={promptTokens:0,completionTokens:0,totalTokens:0};
+    let planUsage: ReviseOutput["tokenUsage"]={promptTokens:0,completionTokens:0,totalTokens:0};
     let contract:ReturnType<typeof textRangeEditContract>|ReturnType<typeof textSelectionEditContract>;
     if(targetText!==undefined)contract=textSelectionEditContract(originalChapter,targetText);
     else{
@@ -136,7 +136,7 @@ export class ReviserAgent extends BaseAgent {
     return {
       revisedContent,
       wordCount: revisedContent.length,
-      tokenUsage:{promptTokens:planUsage.promptTokens+usage.promptTokens,completionTokens:planUsage.completionTokens+usage.completionTokens,totalTokens:planUsage.totalTokens+usage.totalTokens},
+      tokenUsage:planUsage && usage ? {promptTokens:planUsage.promptTokens+usage.promptTokens,completionTokens:planUsage.completionTokens+usage.completionTokens,totalTokens:planUsage.totalTokens+usage.totalTokens} : undefined,
     };
   }
 

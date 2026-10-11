@@ -168,9 +168,7 @@ describe("chatCompletion via pi-ai", () => {
     ]);
 
     expect(result.content).toBe("hello world");
-    expect(result.usage.promptTokens).toBe(11);
-    expect(result.usage.completionTokens).toBe(7);
-    expect(result.usage.totalTokens).toBe(18);
+    expect(result.usage).toEqual({ promptTokens: 11, completionTokens: 7, totalTokens: 18 });
     expect(mockStreamSimple).toHaveBeenCalledOnce();
   });
 
@@ -876,8 +874,7 @@ describe("chatCompletion via pi-ai", () => {
     const result = await chatCompletion(client, "claude-sonnet-4-6", [{ role: "user", content: "nihao" }]);
 
     expect(result.content).toBe("你好，Anthropic!");
-    expect(result.usage.promptTokens).toBe(5);
-    expect(result.usage.completionTokens).toBe(3);
+    expect(result.usage).toMatchObject({ promptTokens: 5, completionTokens: 3 });
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(mockCompleteSimple).not.toHaveBeenCalled();
     expect(mockStreamSimple).not.toHaveBeenCalled();
@@ -924,9 +921,7 @@ describe("chatCompletion via pi-ai", () => {
     const result = await chatCompletion(client, "claude-sonnet-4-6", [{ role: "user", content: "nihao" }]);
 
     expect(result.content).toBe("你好");
-    expect(result.usage.promptTokens).toBe(4);
-    expect(result.usage.completionTokens).toBe(2);
-    expect(result.usage.totalTokens).toBe(6);
+    expect(result.usage).toEqual({ promptTokens: 4, completionTokens: 2, totalTokens: 6 });
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(mockCompleteSimple).not.toHaveBeenCalled();
     expect(mockStreamSimple).not.toHaveBeenCalled();

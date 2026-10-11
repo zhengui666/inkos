@@ -128,11 +128,11 @@ export class ContinuityAuditor extends BaseAgent {
     return {
       observations: result.observations,
       summary: result.summary,
-      tokenUsage: contract ? {
+      tokenUsage: contract ? usage && contract.usage ? {
         promptTokens: usage.promptTokens + contract.usage.promptTokens,
         completionTokens: usage.completionTokens + contract.usage.completionTokens,
         totalTokens: usage.totalTokens + contract.usage.totalTokens,
-      } : usage,
+      } : undefined : usage,
       ...(reviewedArtifact?{reviewedArtifact}:{}),
     };
   }

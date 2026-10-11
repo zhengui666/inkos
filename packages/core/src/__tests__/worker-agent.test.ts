@@ -5,10 +5,21 @@ import type { AgentEvent, AgentTool, BeforeToolCallContext } from "../codex/cont
 import { runWorkerAgent, runWorkerAgentTool } from "../agent/worker-agent.js";
 import { BaseAgent, type AgentContext } from "../agents/base.js";
 
-const mocks = vi.hoisted(() => ({ run: vi.fn(), constructed: vi.fn(), abort: vi.fn(), legacyTransport: vi.fn() }));
+const mocks = vi.hoisted(() => ({ run: vi.fn(), constructed: vi.fn(), abort: vi.fn(), legacyTransport: vi.fn(), admitted: vi.fn(), scope: "/tmp/inkos-worker-test" }));
 vi.mock("../llm/provider.js", async importOriginal => ({
   ...await importOriginal<typeof import("../llm/provider.js")>(),
   chatCompletion: mocks.legacyTransport,
+}));
+// The Agent is already a deterministic worker fixture. Admit its frozen synthetic
+// context here; owner/native lifecycle behavior is covered by the real Codex suites.
+vi.mock("../runtime/run-context.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../runtime/run-context.js")>(),
+  currentRuntimeRun: () => ({ harnessId: 'codex', projectRoot: mocks.scope, selection: { modelId: 'gpt-5.4' } }),
+}));
+vi.mock("../runtime/execution.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../runtime/execution.js")>(),
+  guardRuntimeExecution: async () => {},
+  withRuntimeExecution: async (project: string, task: () => Promise<unknown>, options: unknown) => { mocks.admitted(project, options); const prior = mocks.scope; mocks.scope = project; try { return await task(); } finally { mocks.scope = prior; } },
 }));
 vi.mock("../codex/agent.js", () => ({
   Agent: class {
@@ -94,7 +105,7 @@ class TwoStepWorker extends BaseAgent {
 }
 
 describe("Codex worker harness", () => {
-  beforeEach(() => { mocks.run.mockReset(); mocks.constructed.mockReset(); mocks.abort.mockReset(); mocks.legacyTransport.mockReset(); });
+  beforeEach(() => { mocks.run.mockReset(); mocks.constructed.mockReset(); mocks.abort.mockReset(); mocks.legacyTransport.mockReset(); mocks.admitted.mockReset(); });
   afterEach(() => { vi.restoreAllMocks(); });
 
   it("uses Codex project settings and preserves assistant history without calling the provider transport", async () => {
@@ -105,7 +116,7 @@ describe("Codex worker harness", () => {
     ]);
     const agent = mocks.constructed.mock.calls[0]![0] as Fixture;
     expect(agent.options.projectRoot).toBe("/tmp/inkos-worker-test");
-    expect(agent.options.settings).toEqual(client()._codex!.settings);
+    expect(mocks.admitted).toHaveBeenCalledWith("/tmp/inkos-worker-test", expect.objectContaining({ settings: client()._codex!.settings }));
     expect(agent.state.systemPrompt).toBe("你是审稿员");
     expect(agent.state.messages.slice(0, 3).map(message => message.role)).toEqual(["user", "assistant", "user"]);
     expect(result).toEqual({ content: "完成", usage: { promptTokens: 12, completionTokens: 3, totalTokens: 15 } });

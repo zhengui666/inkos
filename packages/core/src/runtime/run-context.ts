@@ -3,8 +3,11 @@ import type { CodexClient } from '../codex/app-server.js';
 import type { HarnessPreferences, RuntimeSelection } from './contracts.js';
 import type { CodexAuthenticationOwner } from './auth/codex-owner.js';
 import type { RunHistoryBinding } from './run-history.js';
+import type { PiExecutionLease } from './auth/pi-owner.js';
+import type { PiRuntimeContext } from './adapters/pi/runtime-context.js';
 
 export interface CodexRunContext {
+  readonly harnessId: 'codex';
   readonly projectRoot: string;
   readonly selection: Readonly<RuntimeSelection>;
   readonly saved: Readonly<HarnessPreferences>;
@@ -17,8 +20,22 @@ export interface CodexRunContext {
   takeClient(): Promise<CodexClient>;
   guard(client?: CodexClient, signal?: AbortSignal): Promise<void>;
 }
-const runs = new AsyncLocalStorage<CodexRunContext>();
-export function currentCodexRun(): CodexRunContext | undefined { return runs.getStore(); }
+export interface PiRunContext {
+  readonly harnessId: 'pi';
+  readonly projectRoot: string;
+  readonly selection: Readonly<RuntimeSelection>;
+  readonly saved: Readonly<HarnessPreferences>;
+  readonly history?: RunHistoryBinding;
+  readonly onHistoryFailure?: (failure: Error) => void;
+  readonly lease: PiExecutionLease;
+  readonly runtime: PiRuntimeContext;
+  guard(signal?: AbortSignal): Promise<void>;
+}
+export type RuntimeRunContext = CodexRunContext | PiRunContext;
+const runs = new AsyncLocalStorage<RuntimeRunContext>();
+export function currentRuntimeRun(): RuntimeRunContext | undefined { return runs.getStore(); }
+export function currentCodexRun(): CodexRunContext | undefined { const context = runs.getStore(); return context?.harnessId === 'pi' ? undefined : context; }
+export function runWithRuntimeContext<T>(context: RuntimeRunContext, task: () => Promise<T>): Promise<T> { return runs.run(context, task); }
 export function runWithCodexContext<T>(context: CodexRunContext, task: () => Promise<T>): Promise<T> {
   return runs.run(context, task);
 }

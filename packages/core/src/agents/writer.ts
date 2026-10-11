@@ -131,7 +131,7 @@ export class WriterAgent extends BaseAgent {
     // accept it after cancellation. A later authorized retry may resume it.
     this.ctx.signal?.throwIfAborted();
     const creative = { ...draft, wordCount: countChapterLength(draft.content, resolvedLengthSpec.countingMode) };
-    const creativeUsage = draft.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+    const creativeUsage = draft.tokenUsage;
 
     // ── Phase 2: State settlement (temperature 0.3) ──
     this.logInfo(resolvedLanguage, {
@@ -162,11 +162,11 @@ export class WriterAgent extends BaseAgent {
     const resolvedRuntimeStateDelta = runtimeStateArtifacts?.resolvedDelta ?? settlement.runtimeStateDelta;
 
     // ── Merge into WriteChapterOutput ──
-    const tokenUsage: TokenUsage = {
+    const tokenUsage: TokenUsage | undefined = creativeUsage && settleUsage ? {
       promptTokens: creativeUsage.promptTokens + settleUsage.promptTokens,
       completionTokens: creativeUsage.completionTokens + settleUsage.completionTokens,
       totalTokens: creativeUsage.totalTokens + settleUsage.totalTokens,
-    };
+    } : undefined;
 
     return {
       chapterNumber,
@@ -314,7 +314,7 @@ export class WriterAgent extends BaseAgent {
       readonly updatedState: string;
       readonly updatedHooks: string;
     };
-    usage: TokenUsage;
+    usage: TokenUsage | undefined;
   }> {
     const resolvedLang = params.language;
     this.logInfo(resolvedLang, {

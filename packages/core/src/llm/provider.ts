@@ -299,11 +299,12 @@ export function createStreamMonitor(
 
 export interface LLMResponse {
   readonly content: string;
+  /** Absent when the runtime did not report usage. */
   readonly usage: {
     readonly promptTokens: number;
     readonly completionTokens: number;
     readonly totalTokens: number;
-  };
+  } | undefined;
 }
 
 export interface LLMMessage {
@@ -322,6 +323,7 @@ export interface LLMClient {
   readonly _apiKey?: string;
   /** Agent workers use Codex account/settings; provider fields remain for non-agent calls. */
   readonly _codex?: { readonly projectRoot: string; readonly settings?: CodexSettings };
+  readonly _runtime?: { readonly projectRoot: string; readonly harnessId: "codex" | "pi" };
   readonly defaults: {
     readonly temperature: number;
     /**
@@ -337,11 +339,12 @@ export interface LLMClient {
 // === Factory ===
 
 export function createLLMClient(config: LLMConfig, projectRoot?: string): LLMClient {
-  if (config.service === "codex") {
+  if (config.service === "codex" || config.service === "pi") {
     return {
-      provider: "openai", service: "codex", configSource: config.configSource,
+      provider: "openai", service: config.service, configSource: config.configSource,
       apiFormat: "responses", stream: true,
-      _codex: { projectRoot: projectRoot ?? process.cwd() },
+      ...(config.service === "codex" ? { _codex: { projectRoot: projectRoot ?? process.cwd() } } : {}),
+      _runtime: { projectRoot: projectRoot ?? process.cwd(), harnessId: config.service },
       defaults: { temperature: 0.7, maxTokens: UNKNOWN_MODEL_FALLBACK_MAX_TOKENS, thinkingBudget: 0, extra: {} },
     };
   }
@@ -1495,8 +1498,8 @@ export async function chatCompletion(
     readonly retry?: boolean;
   },
 ): Promise<LLMResponse> {
-  if (client.service === "codex") {
-    throw new Error("Direct provider calls require explicit provider configuration. Codex text tasks use the Codex worker runtime.");
+  if (client.service === "codex" || client.service === "pi") {
+    throw new Error("Direct provider calls require explicit provider configuration. Agent text tasks use the selected harness runtime.");
   }
   const resolved = {
     temperature: clampTemperatureForModel(

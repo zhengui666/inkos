@@ -25,7 +25,7 @@ describe("runtime requirements", () => {
     expect(parseNodeMajor("v22.19.0")).toBe(22);
   });
 
-  it("rejects runtimes below Node 22", () => {
+  it("rejects runtimes below Node 22.19.0", () => {
     const result = evaluateNodeRuntimeSupport({
       nodeVersion: "v20.17.0",
       hasNodeSqlite: false,
@@ -33,8 +33,10 @@ describe("runtime requirements", () => {
 
     expect(result.ok).toBe(false);
     expect(evaluateNodeRuntimeSupport({nodeVersion:"v22.15.0",hasNodeSqlite:true}).ok).toBe(false);
-    expect(evaluateNodeRuntimeSupport({nodeVersion:"v22.16.0",hasNodeSqlite:true}).ok).toBe(true);
+    expect(evaluateNodeRuntimeSupport({nodeVersion:"v22.16.0",hasNodeSqlite:true}).ok).toBe(false);
+    expect(evaluateNodeRuntimeSupport({nodeVersion:"v22.18.99",hasNodeSqlite:true}).ok).toBe(false);
     expect(result.detail).toContain("v20.17.0");
+    expect(result.detail).toContain("Node 22.19.0+");
   });
 
   it("accepts supported runtimes", () => {

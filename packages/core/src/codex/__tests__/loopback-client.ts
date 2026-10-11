@@ -38,7 +38,6 @@ export async function createLoopbackCodexClient(root: string, fixtureOverrides: 
     'await import(pathToFileURL(script).href);',
   ].join('\n'), { mode: 0o600, flag: 'wx' });
   const client = await createCodexClient(root, {
-    stateRoot: join(root, 'state'), codexHome: join(root, 'state', 'home'),
     command: process.execPath, args: [launcher],
   });
   try {

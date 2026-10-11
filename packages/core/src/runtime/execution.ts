@@ -1,15 +1,17 @@
 import { resolve } from 'node:path';
 import { realpathSync } from 'node:fs';
+import { findPackageJSON } from 'node:module';
 import { createCodexClient } from '../codex/client.js';
 import { resolveCodexHome } from '../codex/app-server.js';
 import type { CodexClient } from '../codex/app-server.js';
 import type { CodexSettings } from '../codex/types.js';
-import { AgentSettingsSchema, type AgentSettings, type HarnessDescriptor } from './contracts.js';
+import { AgentSettingsSchema, type AgentSettings, type HarnessDescriptor, type ModelConnectionAdmission } from './contracts.js';
 import { AgentSettingsConflictError, readAgentSettings, updateAgentSettings } from './settings.js';
 import { resolveRuntimeSelection } from './selection.js';
 import { CodexAuthenticationOwner, RuntimeAuthenticationError, type CodexOwnerObservation } from './auth/codex-owner.js';
 import { CodexRuntimeAdapter, codexServiceTierRequestValue, type CodexNativeDefaultsEvidence } from './adapters/codex/adapter.js';
-import { currentCodexRun, runWithCodexContext, type CodexRunContext } from './run-context.js';
+import { currentCodexRun, currentRuntimeRun, runWithCodexContext, runWithRuntimeContext, type CodexRunContext, type PiRunContext } from './run-context.js';
+import { PiRuntimeAdapter } from './registry.js';
 import { appendRunDispatch, appendRunObservation, type RunHistoryBinding } from './run-history.js';
 import type { AgentModelCallTrace } from '../llm/agent-trajectory.js';
 
@@ -18,6 +20,132 @@ export interface CodexExecutionOptions {
   /** Legacy per-invocation overrides, validated once, never persisted or reapplied by workers. */
   settings?: CodexSettings;
   model?: string;
+}
+
+/** Queue entrypoint. Read the selected harness once; nested work inherits the frozen run. */
+export async function withRuntimeExecution<T>(projectRoot: string, task: () => Promise<T>, options: CodexExecutionOptions = {}): Promise<T> {
+  const current = currentRuntimeRun();
+  if (current) {
+    if (realpathSync(projectRoot) !== realpathSync(current.projectRoot)) throw new RuntimeAuthenticationError('Nested execution belongs to another project context');
+    await guardRuntimeExecution(options.signal); return task();
+  }
+  const settings = await readAgentSettings(projectRoot);
+  if (settings.selectedHarnessId === 'codex') return withCodexExecution(projectRoot, task, options);
+  if (options.model || options.settings) throw new RuntimeAuthenticationError('Codex invocation overrides cannot route Pi');
+  let owner: import('./auth/pi-owner.js').PiAuthenticationOwner;
+  try { const { PiAuthenticationOwner } = await import('./auth/pi-owner.js'); owner = await PiAuthenticationOwner.create(projectRoot); }
+  catch (error) {
+    if (error instanceof RuntimeAuthenticationError) throw error;
+    throw Object.assign(new Error('Pi native runtime is not available in this deployment'), { code: 'RUNTIME_HARNESS_NOT_CONNECTED' });
+  }
+  const { createPiRuntimeContext } = await import('./adapters/pi/runtime-context.js');
+  const connection = await owner.admit(options.signal);
+  const target = { harnessId: 'pi' as const, authContextRef: connection.authContextRef,
+    connectionRef: connection.connection.connectionRef, authGeneration: connection.authGeneration };
+  const lease = owner.lease(target);
+  let historyFailure: Error | undefined;
+  let authenticationFailure: RuntimeAuthenticationError | undefined;
+  const checkHistory = () => { if (historyFailure) throw historyFailure; if (authenticationFailure) throw authenticationFailure; };
+  const guard = async (signal?: AbortSignal) => {
+    checkHistory(); try { await lease.guard(signal); } catch (error) {
+      if (error instanceof RuntimeAuthenticationError) authenticationFailure ??= error;
+      throw historyFailure ?? authenticationFailure ?? error;
+    } checkHistory();
+  };
+  try {
+    await guard(options.signal);
+    const runtime = await createPiRuntimeContext({ ...owner.scope, speed: settings.harnessPreferences.pi.speed,
+      credentials: lease.credentials, resolveAuth: async (resolveAuth, signal) => {
+        await guard(signal);
+        try { const result = await lease.resolveAuth(resolveAuth, signal); await guard(signal); return result; }
+        catch (error) { if (error instanceof RuntimeAuthenticationError) authenticationFailure ??= error; throw historyFailure ?? authenticationFailure ?? error; }
+      } });
+    await guard(options.signal);
+    const harness = await new PiRuntimeAdapter(runtime).describe();
+    await guard(options.signal);
+    let desired = settings;
+    for (let attempt = 0; desired.modelConnectionRef === null; attempt++) {
+      if (attempt >= 8) throw new Error('Agent configuration kept changing during connection binding');
+      await guard(options.signal);
+      try { desired = await updateAgentSettings(projectRoot, { modelConnectionRef: target.connectionRef }, { expectedRevision: desired.revision }); }
+      catch (error) {
+        if ((error as { code?: string }).code !== 'AGENT_SETTINGS_REVISION_CONFLICT') throw error;
+        desired = await readAgentSettings(projectRoot);
+        if (desired.selectedHarnessId !== 'pi') throw new RuntimeAuthenticationError('The selected harness changed before admission');
+      }
+    }
+    const saved = Object.freeze({ ...desired.harnessPreferences.pi });
+    const selection = resolveRuntimeSelection({ settings: desired, harness, authContext: owner.context, connection });
+    const context: PiRunContext = { harnessId: 'pi', projectRoot: resolve(projectRoot), saved, selection, runtime, lease, guard,
+      onHistoryFailure(failure) { historyFailure ??= failure; } };
+    await guard(options.signal);
+    return await runWithRuntimeContext(context, task);
+  } finally { await lease.drain(); }
+}
+
+export async function guardRuntimeExecution(signal?: AbortSignal): Promise<void> {
+  const context = currentRuntimeRun();
+  if (!context) throw new RuntimeAuthenticationError('No admitted runtime context');
+  if (context.harnessId === 'pi') await context.guard(signal); else await context.guard(undefined, signal);
+}
+
+/** Local installation/OAuth/catalog evidence only; never account entitlement or execution evidence. */
+export interface PiRuntimeObservation {
+  readonly harnessId: 'pi';
+  readonly installation: 'installed' | 'missing' | 'unknown';
+  readonly authContextRef: string | null;
+  readonly authentication: 'missing' | 'oauth-present' | 'unknown';
+  readonly owner: Readonly<ModelConnectionAdmission> | null;
+  readonly descriptor: HarnessDescriptor | null;
+  readonly catalogOwnership: Readonly<{ harnessId: 'pi'; authContextRef: string;
+    authGeneration: number | null; adapterVersion: string }> | null;
+  readonly ready: boolean;
+  readonly readyReasons: readonly string[];
+}
+
+/** Passive Pi GET/preload never admits/binds a connection or resolves OAuth. */
+export async function observePiRuntime(projectRoot: string, signal?: AbortSignal): Promise<PiRuntimeObservation> {
+  signal?.throwIfAborted();
+  let installation: PiRuntimeObservation['installation'] = 'unknown';
+  let authContextRef: string | null = null;
+  let authentication: PiRuntimeObservation['authentication'] = 'unknown';
+  let owner: PiRuntimeObservation['owner'] = null;
+  let descriptor: HarnessDescriptor | null = null;
+  try {
+    try {
+      if (!findPackageJSON('@earendil-works/pi-coding-agent', import.meta.url)) {
+        installation = 'missing'; throw new Error('Pi SDK entry is not installed');
+      }
+    }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ERR_MODULE_NOT_FOUND') installation = 'missing';
+      throw error;
+    }
+    const { loadPiNativeAuthStorage } = await import('./auth/pi-native-store-compat.js');
+    await loadPiNativeAuthStorage(); signal?.throwIfAborted(); installation = 'installed';
+    const { PiAuthenticationOwner } = await import('./auth/pi-owner.js');
+    const trustedOwner = await PiAuthenticationOwner.create(projectRoot);
+    const observed = await trustedOwner.observeSnapshot(async () => {
+      const { createPiRuntimeContext } = await import('./adapters/pi/runtime-context.js');
+      return new PiRuntimeAdapter(await createPiRuntimeContext({ ...trustedOwner.scope, passiveObservation: true })).describe();
+    }, signal);
+    ({ authContextRef, authentication, owner, value: descriptor } = observed);
+  } catch { signal?.throwIfAborted(); }
+  signal?.throwIfAborted();
+  const catalogOwnership = descriptor && authContextRef ? { harnessId: 'pi' as const, authContextRef,
+    authGeneration: owner?.authGeneration ?? null, adapterVersion: descriptor.adapterVersion } : null;
+  const ready = installation === 'installed' && authentication === 'oauth-present' && descriptor?.ready === true;
+  const readyReasons = ready ? [] : [
+    ...({ installed: [], missing: ['pi-sdk-missing'], unknown: ['pi-sdk-unverified'] }[installation]),
+    ...(authentication !== 'oauth-present' ? [authentication === 'missing' ? 'pi-authentication-missing' : 'pi-authentication-unverified'] : []),
+    ...(installation === 'installed' && authentication === 'oauth-present' && !descriptor?.ready ? ['pi-catalog-unverified'] : []),
+  ];
+  const snapshot: PiRuntimeObservation = { harnessId: 'pi', installation, authContextRef, authentication, owner,
+    descriptor, catalogOwnership, ready, readyReasons };
+  function freeze(value: unknown): void {
+    if (value && typeof value === 'object') { for (const nested of Object.values(value)) freeze(nested); Object.freeze(value); }
+  }
+  freeze(snapshot); return snapshot;
 }
 
 export interface CodexRuntimeObservation extends Omit<CodexOwnerObservation<never>, 'value'> {
@@ -120,7 +248,7 @@ export async function withCodexExecution<T>(projectRoot: string, task: () => Pro
     let historyFailure: Error | undefined;
     const checkHistory = () => { if (historyFailure) throw historyFailure; };
     const context: CodexRunContext = {
-      projectRoot: resolve(projectRoot), saved, selection, owner,
+      harnessId: 'codex', projectRoot: resolve(projectRoot), saved, selection, owner,
       onHistoryFailure(failure) { historyFailure ??= failure; },
       async takeClient() {
         checkHistory();
@@ -207,7 +335,7 @@ export class RuntimeHistoryWriteError extends Error {
 function persistHistory(write: () => unknown): void {
   try { write(); } catch (error) {
     const failure = new RuntimeHistoryWriteError(error);
-    currentCodexRun()?.onHistoryFailure?.(failure);
+    currentRuntimeRun()?.onHistoryFailure?.(failure);
     throw failure;
   }
 }

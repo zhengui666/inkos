@@ -10,9 +10,9 @@ import type { LLMApiFormat } from "../llm/api-format.js";
 import { readAgentSettings } from "../runtime/settings.js";
 
 export type LLMConsumer = "studio" | "cli" | "daemon" | "deploy";
-export type LLMConfigMode = "studio-project" | "cli-project" | "environment" | "codex";
-export type LLMConfigPurpose = "provider" | "codex";
-export type LLMValueSource = "project" | "studio-secret" | "env" | "cli" | "default" | "codex-settings";
+export type LLMConfigMode = "studio-project" | "cli-project" | "environment" | "codex" | "pi";
+export type LLMConfigPurpose = "provider" | "codex" | "runtime";
+export type LLMValueSource = "project" | "studio-secret" | "env" | "cli" | "default" | "codex-settings" | "agent-settings";
 
 export class LLMConfigurationError extends Error {
   constructor(
@@ -79,7 +79,7 @@ export async function resolveEffectiveLLMConfig(
   input: ResolveEffectiveLLMConfigInput,
 ): Promise<EffectiveLLMConfigResult> {
   const config = await readProjectConfig(input.projectRoot);
-  if (input.purpose === "codex") return resolveCodexProjectConfig(config, input);
+  if (input.purpose === "codex" || input.purpose === "runtime") return resolveAgentProjectConfig(config, input);
   const llm = { ...((config.llm ?? {}) as Record<string, unknown>) };
   const services = normalizeServiceEntries(llm.services);
   const configMode = resolveConfigMode(input.consumer, llm.configSource, services);
@@ -135,26 +135,26 @@ export async function resolveEffectiveLLMConfig(
 }
 
 /**
- * Production text belongs to Codex, whose account and model settings are separate
+ * Production text belongs to the selected harness; its connection and preferences are separate
  * from image/direct-provider configuration. This is an in-memory compatibility
  * projection, never written back to inkos.json and never a provider fallback.
  */
-async function resolveCodexProjectConfig(
+async function resolveAgentProjectConfig(
   raw: Record<string, unknown>,
   input: ResolveEffectiveLLMConfigInput,
 ): Promise<EffectiveLLMConfigResult> {
   const settings = await readAgentSettings(input.projectRoot);
-  if (settings.selectedHarnessId !== 'codex') throw Object.assign(new Error('The selected Pi harness is not connected to this execution path'), { code: 'RUNTIME_HARNESS_NOT_CONNECTED' });
+  const selected = settings.selectedHarnessId;
   const legacy = objectValue(raw.llm);
   const config = ProjectConfigSchema.parse({
     ...raw,
     ...(input.consumer !== "studio" && mergedLLMEnv(input.envLayers).INKOS_DEFAULT_LANGUAGE
       ? { language: mergedLLMEnv(input.envLayers).INKOS_DEFAULT_LANGUAGE } : {}),
-    // Legacy per-worker provider overrides cannot choose a Codex model or budget.
+    // Legacy provider overrides cannot choose a harness model or budget.
     modelOverrides: undefined,
     llm: {
-      service: "codex", provider: "openai", configSource: input.consumer === "studio" ? "studio" : "env",
-      model: settings.harnessPreferences.codex.model ?? "codex-default", apiKey: "",
+      service: selected, provider: "openai", configSource: input.consumer === "studio" ? "studio" : "env",
+      model: settings.harnessPreferences[selected].model ?? `${selected}-default`, apiKey: "",
       // Required by the legacy LLMConfig shape, but no HTTP client is constructed
       // for this service and this reserved invalid endpoint is never contacted.
       baseUrl: "https://example.invalid/v1", apiFormat: "responses", stream: true,
@@ -166,7 +166,7 @@ async function resolveCodexProjectConfig(
   });
   return {
     config, llm: config.llm,
-    diagnostics: { configMode: "codex", serviceSource: "default", modelSource: "codex-settings",
+    diagnostics: { configMode: selected, serviceSource: "default", modelSource: selected === "pi" ? "agent-settings" : "codex-settings",
       apiKeySource: "default", warnings: [] },
   };
 }

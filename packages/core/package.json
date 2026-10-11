@@ -64,6 +64,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.1.0",
     "playwright-core": "1.61.0",
     "@mariozechner/pi-ai": "0.67.1",
     "@sinclair/typebox": "^0.34.49",
@@ -82,6 +83,6 @@
     "vitest": "^3.0.0"
   },
   "engines": {
-    "node": ">=22.16.0"
+    "node": ">=22.19.0"
   }
 }
