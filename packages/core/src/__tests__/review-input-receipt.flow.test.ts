@@ -93,10 +93,17 @@ async function setup() {
 
 async function approvedButUnsubmitted(f: Awaited<ReturnType<typeof setup>>) {
   f.pipeline.reviewChapter.mockImplementationOnce(async () => {
-    const reviewInputs = await f.capture(), reviewPolicy = await f.capturePolicy(); f.pause();
+    const reviewInputs = await f.capture(), reviewPolicy = await f.capturePolicy();
     return { chapterNumber: 1, summary: 'Offline reviewed inputs.', observations: reviewPolicy.requireStoryClosure ? [closureObservation] : [], reviewInputs, reviewPolicy };
   });
-  const accepted = await f.run(f.job); f.resume();
+  const save = SchedulerStore.prototype.save;
+  const committed = vi.spyOn(SchedulerStore.prototype, 'save').mockImplementation(function (this: SchedulerStore, job, event, now) {
+    save.call(this, job, event, now);
+    if (event === 'review-accepted') f.pause();
+  });
+  let accepted: ScheduledChapter;
+  try { accepted = await f.run(f.job); }
+  finally { committed.mockRestore(); f.resume(); }
   expect(accepted.phase).toBe('publishing'); expect(accepted.reviewReceipt?.inputs).toEqual(await f.capture());
   expect(f.browser.createDraft).not.toHaveBeenCalled();
   return accepted;

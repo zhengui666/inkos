@@ -71,6 +71,7 @@ export class Scheduler {
       requireStoryClosure: (workId, chapter) => this.creation.tasks.forWork(workId)?.plan.targetChapters === chapter,
       chapterIntent: (workId, chapter) => this.creation.intent(workId, chapter),
       shouldContinue: workId => this.creation.runnable(workId),
+      completionTarget: workId => this.creation.completionTarget(workId),
     });
     this.chapters = new AutonomousChapterRunner(config.projectRoot, this.pipeline, this.store, {
       publisher: config.publisher, retryDelayMs: config.retryDelayMs, onComplete: config.onChapterComplete,
@@ -214,6 +215,7 @@ export class Scheduler {
 
   private async prepareChapter(workId: string, resumeOnly: boolean): Promise<ScheduledChapter | undefined> {
     if (!this.running) return;
+    if (this.creation.tasks.forWork(workId)) this.creation.completionTarget(workId);
     if (!this.creation.runnable(workId)) return;
     const book = await this.state.loadBookConfig(workId);
     if (!["active", "outlining"].includes(book.status)) return;

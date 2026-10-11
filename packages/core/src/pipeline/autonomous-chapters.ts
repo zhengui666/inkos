@@ -52,6 +52,7 @@ export class AutonomousChapterRunner {
       requireStoryClosure?: (workId: string, chapter: number) => boolean;
       chapterIntent?: (workId: string, chapter: number) => string | undefined;
       shouldContinue?: (workId: string) => boolean;
+      completionTarget?: (workId: string) => 'reviewed' | 'published';
       publisher?: SchedulerPublisher; retryDelayMs: number; maxAttempts?: number;
       publicationPollMs?: number;
       now?: () => number; onComplete?: (workId: string, chapter: number) => void;
@@ -67,7 +68,7 @@ export class AutonomousChapterRunner {
     const reviewChecksBefore = job.reviewChecks ?? 0;
     try {
       // No new model work while the explicitly selected publishing destination is unavailable.
-      await this.options.publisher?.ready(job.workId, signal, job.phase === "publishing" || job.publicationStartedAt !== undefined ? job.chapter : undefined);
+      if (this.options.completionTarget?.(job.workId) !== 'reviewed') await this.options.publisher?.ready(job.workId, signal, job.phase === "publishing" || job.publicationStartedAt !== undefined ? job.chapter : undefined);
       if (this.options.shouldContinue?.(job.workId) === false) return job;
       if (job.phase === "writing") job = await this.write(job, signal);
       signal.throwIfAborted();
@@ -186,7 +187,7 @@ export class AutonomousChapterRunner {
     const skills = resolveProfileSkillActivations((await loadAvailableAgentSkills({ projectRoot: this.root })).skills, profile);
     const runReview = <T>(task: () => Promise<T>) => withExecutionEvidence(undefined,
       () => this.pipeline.runWithAgentContext({ signal, activatedSkills: skills }, task),
-      profile, work, "Review this retained chapter before autonomous publication.");
+      profile, work, "Review this retained chapter before chapter acceptance.");
     while (true) {
       signal.throwIfAborted();
       if (!["active", "outlining"].includes((await this.state.loadBookConfig(job.workId)).status)) return job;
@@ -243,10 +244,21 @@ export class AutonomousChapterRunner {
         return this.invalidateReview(job);
       }
       if (!issues.length && !lengthFailure) {
+        // Final async policy reads may admit a pause/cancel or edit. Authorize
+        // synchronously under the existing work lock, then commit without yielding.
+        signal.throwIfAborted();
+        const bookDir = this.state.bookDir(job.workId);
+        const book = BookConfigSchema.parse(JSON.parse(readFileSync(join(bookDir, 'book.json'), 'utf8')));
+        if (this.options.shouldContinue?.(job.workId) === false || !['active', 'outlining'].includes(book.status)) return job;
+        const current = this.chapterRevisionSync(job.workId, job.chapter);
+        if (current.revisionId !== reviewed.revisionId || unresolvedReview(current.observations).length
+          || !sameChapterReviewInputs(result.reviewInputs, readChapterReviewInputsSync(bookDir, job.chapter))
+          || !sameChapterReviewPolicy(result.reviewPolicy, captureChapterReviewPolicy(book, this.options.requireStoryClosure?.(job.workId, job.chapter) === true))) return this.invalidateReview(job);
+        const target = this.options.completionTarget?.(job.workId) ?? (this.options.publisher ? 'published' : 'reviewed');
         job = { ...job, revisionId: reviewed.revisionId, reviewReceipt: {
           inputs: result.reviewInputs, reviewPolicy: result.reviewPolicy, revisionId: reviewed.revisionId, reviewedAt: now(), summary: result.summary, observations: result.observations,
         } };
-        return this.advance(job, this.options.publisher ? "publishing" : "completed", "review-accepted");
+        return this.advance(job, target === 'published' ? "publishing" : "completed", "review-accepted");
       }
       if (job.reviewAttempts >= 1 || ((job.reviewChecks ?? 0) - (this.options.persistentTransientRetries ? job.reviewUnavailableChecks ?? 0 : 0)) >= (this.options.maxAttempts ?? 3)
         || issues.some(issue => /(?:state-sync-required|state-validation|state-reconciliation)/u.test(issue.code))) {

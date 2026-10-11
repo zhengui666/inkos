@@ -2,7 +2,7 @@ import type { Hono, Context } from 'hono';
 import { join } from 'node:path';
 import { CreationTaskStore, CreationRequestSchema, CreationControlSchema, CreationPlanUpdateSchema, inferCreationPlan,
   creationTaskView, RemoteWorkStore, remoteWorkView, SchedulerStore, ChapterGoalService,
-  createDefaultSchedulerPublisherRegistry, type ProjectConfig } from '@actalk/inkos-core';
+  createDefaultSchedulerPublisherRegistry, effectiveCreationDeliveryMode, type ProjectConfig } from '@actalk/inkos-core';
 
 export function registerCreationTaskRoutes(app: Hono, options: {
   root: string; loadConfig(): Promise<ProjectConfig>;
@@ -35,7 +35,7 @@ export function registerCreationTaskRoutes(app: Hono, options: {
     }
     catch (error) { runtimeError = String(error); }
   };
-  const view = ({ tasks, scheduler, remoteWorks }: Stores, id: string) => { const task = tasks.get(id); const remote = remoteWorks.forWork(task.workId); return {...creationTaskView(task, scheduler.chapters(task.workId)), remoteWork: remote ? remoteWorkView(remote) : null}; };
+  const view = ({ tasks, scheduler, remoteWorks }: Stores, id: string) => { const task = tasks.get(id); const remote = remoteWorks.forWork(task.workId); return {...creationTaskView(task, scheduler.chapters(task.workId), remote), remoteWork: remote ? remoteWorkView(remote) : null}; };
   const control = CreationControlSchema;
   const fail = (c: Context, error: unknown) => {
     const code = (error as { code?: string }).code;
@@ -81,10 +81,14 @@ export function registerCreationTaskRoutes(app: Hono, options: {
   app.post('/api/v1/creation-tasks/:id/resume', async c => {
     try {
       const { version } = control.parse(await c.req.json());
-      const { task, refreshPublisher } = withStores(({ tasks, scheduler }) => {
+      const { task, refreshPublisher } = withStores(({ tasks, scheduler, remoteWorks }) => {
         const previous = tasks.get(c.req.param('id'));
         const retained = scheduler.latest(previous.workId);
         if (previous.version !== version) throw Object.assign(new Error('Task changed. Refresh before retrying.'), { code: 'CREATION_VERSION_CONFLICT' });
+        const mode = effectiveCreationDeliveryMode(previous.request);
+        const currentView = creationTaskView(previous, scheduler.chapters(previous.workId), remoteWorks.forWork(previous.workId));
+        if (currentView.error?.code === 'CREATION_DELIVERY_HISTORY_CONFLICT') throw Object.assign(new Error(currentView.error.message), { code: currentView.error.code });
+        if (!previous.plan.platform) throw Object.assign(new Error('Select a creative target platform before starting.'), { code: 'CREATION_PLATFORM_REQUIRED' });
         if (retained?.error?.code === 'CREATION_TRANSIENT_WRITE_PAUSED') {
           const goals = new ChapterGoalService({ projectRoot: options.root });
           try { const goal = goals.get(retained.goalId, previous.workId); goals.retryTransientFailure(goal.id, goal.version, previous.workId); }
@@ -94,11 +98,11 @@ export function registerCreationTaskRoutes(app: Hono, options: {
         if (retained?.error?.code === 'CREATION_TRANSIENT_BACKOFF') scheduler.save({ ...retained, nextAttemptAt: Date.now() }, 'transient-retry-expedited');
         const task = tasks.control(c.req.param('id'), 'run', version);
         const job = scheduler.latest(task.workId);
-        if (job?.error && ['CREATION_PUBLISHER_REQUIRED', 'PUBLISHING_BINDING_MISSING', 'PUBLISHING_MANUAL_REQUIRED', 'PUBLISHING_TARGET_CONFLICT'].includes(job.error.code)) {
+        if (mode === 'publish' && job?.error && ['CREATION_PUBLISHER_REQUIRED', 'PUBLISHING_BINDING_MISSING', 'PUBLISHING_MANUAL_REQUIRED', 'PUBLISHING_TARGET_CONFLICT'].includes(job.error.code)) {
           scheduler.save({ ...job, phase: job.reviewReceipt ? 'publishing' : job.phase === 'blocked' ? 'writing' : job.phase,
             failures: 0, error: undefined, nextAttemptAt: Date.now() }, 'publication-setup-resumed');
         }
-        return { task, refreshPublisher: Boolean(job?.error && /(?:PUBLISHING_|CREATION_PUBLISHER_REQUIRED)/u.test(job.error.code)) };
+        return { task, refreshPublisher: mode === 'publish' && Boolean(job?.error && /(?:PUBLISHING_|CREATION_PUBLISHER_REQUIRED)/u.test(job.error.code)) };
       });
       await start(refreshPublisher);
       return c.json({ task: withStores(stores => view(stores, task.id)), runtimeError });

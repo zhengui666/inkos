@@ -66,9 +66,19 @@ describe('durable two-field creation intake', () => {
     const store = new CreationTaskStore(':memory:'); const input = request();
     try {
       const task = store.create(input, inferCreationPlan(input, config));
-      const view = creationTaskView(task, [{ workId: task.workId, chapter: 1, phase: 'publishing', reviewReceipt: { revisionId: 'r1' }, publication: { status: 'pending', evidence: 'simulated adapter receipt' } }] as any);
+      const view = creationTaskView(task, [{ workId: task.workId, chapter: 1, phase: 'publishing', revisionId: 'r1', reviewReceipt: {
+        revisionId: 'r1', reviewedAt: Date.now(), summary: 'Synthetic retained review.',
+        inputs: { version: 2, plan: null, authorBrief: null, bookRules: null, bookRulesJson: null, authorIntent: null, currentFocus: null, styleGuide: null, parentCanon: null, fanficCanon: null },
+        reviewPolicy: { requireStoryClosure: true, language: task.plan.language, lengthBounds: { countingMode: 'en_words', minChapterLength: null, maxChapterLength: null } },
+        observations: [{ code: 'story-closure', category: 'quality', assessment: 'observation', summary: 'Synthetic closure.', sourceRefs: [{ sourceId: 'chapter-1', quote: 'The promise is resolved.' }] }],
+      }, publication: { status: 'pending', evidence: 'simulated adapter receipt' } }] as any);
       expect(view.reviewedChapters).toBe(1); expect(view.publishedChapters).toBe(0);
       expect(view.receipts[0]?.publication?.evidence).toContain('simulated');
+      expect(view.publicationStatus).toBe('in_progress');
+      const waiting = { ...task, phase: 'blocked' as const, error: { code: 'CREATION_PUBLISHER_REQUIRED', message: 'Transport disconnected after submission.' } };
+      for (const status of ['pending', 'submitted'] as const) {
+        expect(creationTaskView(waiting, [{ ...view.receipts[0], phase: 'publishing', publication: { status } }] as any).publicationStatus).toBe('in_progress');
+      }
     } finally { store.close(); }
   });
 });

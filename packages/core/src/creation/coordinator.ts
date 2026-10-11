@@ -2,9 +2,18 @@ import { isCreationTransientFailure } from './transient.js';
 import { CreationPlannerAgent } from './planner.js';
 import { verifyCreationFoundation } from './foundation-recovery.js';
 import { join, resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
 import type { PipelineRunner } from '../pipeline/runner.js';
 import type { SchedulerStore, ScheduledChapter } from '../pipeline/scheduler-store.js';
-import type { SchedulerPublisher } from '../pipeline/autonomous-chapters.js';
+import { unresolvedReview, type SchedulerPublisher } from '../pipeline/autonomous-chapters.js';
+import { ChapterReviewInputsSchema, ChapterReviewPolicySchema, readChapterReviewInputsSync, sameChapterReviewInputs, captureChapterReviewPolicy, sameChapterReviewPolicy } from '../pipeline/review-inputs.js';
+import { ObservationSchema } from '../models/observation.js';
+import { ChapterMetaSchema } from '../models/chapter.js';
+import { BookConfigSchema } from '../models/book.js';
+import { workManifestPath } from '../harness/work-store.js';
+import { WorkManifestSchema } from '../harness/contracts.js';
+import { RemoteWorkStore } from '../publishing/work-creation-store.js';
+import type { RemoteWorkRun } from '../publishing/work-creation-contracts.js';
 import { StateManager } from '../state/manager.js';
 import { createBuiltInWorkProfileRegistry } from '../harness/builtin-profiles.js';
 import { withExecutionEvidence } from '../harness/execution-evidence.js';
@@ -12,16 +21,33 @@ import { syncWorkSourceArtifacts } from '../harness/source-sync.js';
 import { loadAvailableAgentSkills, resolveProfileSkillActivations } from '../skills/index.js';
 import { runInWorkMutationQueue, withWorkMutationScope } from '../utils/work-mutation-scope.js';
 import { CreationTaskStore } from './store.js';
-import { creationBook, creationError, creationInstruction, canResumeCreationTask, CreationPlanSchema, type CreationTask } from './contracts.js';
+import { creationBook, creationError, creationInstruction, canResumeCreationTask, effectiveCreationDeliveryMode, CreationPlanSchema, type CreationTask } from './contracts.js';
 
 /** An intake adapter for the existing scheduler, not a second writing engine. */
 export class CreationTaskCoordinator {
   readonly tasks: CreationTaskStore;
   private readonly state: StateManager;
+  private readonly remoteWorks: RemoteWorkStore;
   constructor(private readonly root: string, private readonly pipeline: PipelineRunner,
     private readonly scheduler: SchedulerStore, private readonly retryDelayMs: number) {
     this.tasks = new CreationTaskStore(join(root, '.inkos', 'harness.sqlite'));
     this.state = new StateManager(root);
+    this.remoteWorks = new RemoteWorkStore(join(root, '.inkos', 'harness.sqlite'));
+  }
+  completionTarget(workId: string): 'reviewed' | 'published' {
+    const task = this.tasks.forWork(workId);
+    if (!task) return 'published';
+    let mode;
+    try { mode = effectiveCreationDeliveryMode(task.request); }
+    catch (error) {
+      this.saveIfChanged(task.id, { phase: 'blocked', error: { code: 'CREATION_DELIVERY_MODE_INVALID', message: String(error) } });
+      throw creationError('CREATION_DELIVERY_MODE_INVALID', 'The retained delivery mode is invalid.');
+    }
+    if (mode === 'manuscript' && manuscriptHistoryConflict(task, this.scheduler.chapters(workId), this.remoteWorks.forWork(workId))) {
+      this.saveIfChanged(task.id, { phase: 'blocked', error: deliveryHistoryError() });
+      throw creationError('CREATION_DELIVERY_HISTORY_CONFLICT', deliveryHistoryError().message);
+    }
+    return mode === 'manuscript' ? 'reviewed' : 'published';
   }
   runnable(workId: string): boolean {
     const task = this.tasks.forWork(workId);
@@ -36,6 +62,7 @@ export class CreationTaskCoordinator {
     return {
       ready: async (workId, signal, chapter) => {
         signal.throwIfAborted();
+        if (this.completionTarget(workId) === 'reviewed') return;
         if (!this.runnable(workId)) throw creationError('CREATION_PAUSED', 'The creation task is paused or blocked.');
         if (configured) {
           try { await configured.ready(workId, signal, chapter); }
@@ -48,6 +75,7 @@ export class CreationTaskCoordinator {
         }
       },
       ...(configured?.reconcile ? { reconcile: async (input: Parameters<NonNullable<SchedulerPublisher['reconcile']>>[0]) => {
+        if (this.completionTarget(input.workId) === 'reviewed') return undefined;
         try { return await configured.reconcile!(input); }
         catch (error) {
           // An uncreated remote work cannot have a chapter attempt. Do not create it here.
@@ -59,6 +87,7 @@ export class CreationTaskCoordinator {
       } } : {}),
       publish: async input => {
         input.signal.throwIfAborted();
+        if (this.completionTarget(input.workId) === 'reviewed') throw creationError('CREATION_PUBLICATION_NOT_REQUESTED', 'This task requests a reviewed local manuscript.');
         if (!this.runnable(input.workId)) throw creationError('CREATION_PAUSED', 'The creation task is paused or blocked.');
         if (!configured) throw creationError('CREATION_PUBLISHER_REQUIRED', 'The reviewed draft is retained. Configure an explicit publisher/account/remote-book binding, then resume. Remote book creation, identity, tax and contract steps are not automatic.');
         try {
@@ -91,6 +120,7 @@ export class CreationTaskCoordinator {
   }
   async prepare(taskId: string, signal: AbortSignal): Promise<void> {
     let task = this.tasks.get(taskId);
+    this.completionTarget(task.workId);
     if (task.desiredState !== 'run' || task.phase === 'completed' || task.foundation === 'blocked' || task.nextAttemptAt > Date.now()) return;
     // Book settings and task controls are independent user-owned pauses. A
     // retained task's old run marker must not restart a currently paused book.
@@ -179,8 +209,23 @@ export class CreationTaskCoordinator {
   }
   sync(workId: string): void {
     const task = this.tasks.forWork(workId);
+    const target = this.completionTarget(workId);
     if (!task || task.foundation !== 'completed') return;
     const jobs = this.scheduler.chapters(workId), latest = jobs.at(-1);
+    if (target === 'reviewed') {
+      if (jobs.every(job => job.phase === 'completed') && reviewedComplete(task, jobs)) {
+        if (!this.retainedReviewsCurrent(task, jobs)) {
+          this.saveIfChanged(task.id, { phase: 'blocked', error: { code: 'CREATION_REVIEW_RECONCILIATION_REQUIRED', message: 'Retained review authority changed. No accepted chapter was rewritten or regenerated.' } });
+          return;
+        }
+        this.saveIfChanged(task.id, { phase: 'completed', error: undefined });
+        return;
+      }
+      if (jobs.length === task.plan.targetChapters && jobs.every(job => job.phase === 'completed')) {
+        this.saveIfChanged(task.id, { phase: 'blocked', error: { code: 'CREATION_REVIEW_RECONCILIATION_REQUIRED', message: 'Local completion requires matching modern review receipts and source-supported final closure.' } });
+        return;
+      }
+    }
     const complete = jobs.length === task.plan.targetChapters && jobs.every((job, i) => job.chapter === i + 1
       && job.phase === 'completed' && job.publication?.status === 'published' && Boolean(job.reviewReceipt));
     const closure = latest?.reviewReceipt?.observations.some(observation => observation.code === 'story-closure'
@@ -200,21 +245,81 @@ export class CreationTaskCoordinator {
     if (Object.entries(patch).every(([key, value]) => JSON.stringify(current[key as keyof CreationTask]) === JSON.stringify(value))) return;
     this.tasks.update(id, task => ({ ...task, ...patch }));
   }
-  close(): void { this.tasks.close(); }
+  private retainedReviewsCurrent(task: CreationTask, jobs: readonly ScheduledChapter[]): boolean {
+    try {
+      const bookDir = this.state.bookDir(task.workId);
+      const book = BookConfigSchema.parse(JSON.parse(readFileSync(join(bookDir, 'book.json'), 'utf8')));
+      const work = WorkManifestSchema.parse(JSON.parse(readFileSync(workManifestPath(this.root, task.workId), 'utf8')));
+      const index = ChapterMetaSchema.array().parse(JSON.parse(readFileSync(join(bookDir, 'chapters/index.json'), 'utf8')));
+      return jobs.every(job => {
+        const chapter = index.find(entry => entry.number === job.chapter);
+        const prefix = `source/chapters/${String(job.chapter).padStart(4, '0')}_`;
+        const revisions = work.artifacts.flatMap(artifact => artifact.revisions.filter(revision => revision.id === artifact.currentRevisionId && revision.path.startsWith(prefix) && revision.path.endsWith('.md')));
+        const revision = revisions[0];
+        return chapter !== undefined && !unresolvedReview(chapter.observations).length && revisions.length === 1 && revision !== undefined && revision.id === job.revisionId && Boolean(revision.snapshotPath)
+          && readFileSync(join(this.root, 'works', task.workId, revision.path)).equals(readFileSync(join(this.root, 'works', task.workId, revision.snapshotPath!)))
+          && sameChapterReviewInputs(job.reviewReceipt?.inputs, readChapterReviewInputsSync(bookDir, job.chapter))
+          && sameChapterReviewPolicy(job.reviewReceipt?.reviewPolicy, captureChapterReviewPolicy(book, job.chapter === task.plan.targetChapters));
+      });
+    } catch {
+      // Missing, malformed or unreadable retained authority cannot complete a task.
+      return false;
+    }
+  }
+  close(): void { try { this.remoteWorks.close(); } finally { this.tasks.close(); } }
 }
 
-export function creationTaskView(task: CreationTask, jobs: readonly ScheduledChapter[]) {
+function closureAccepted(job: ScheduledChapter): boolean {
+  return job.reviewReceipt?.observations.some(observation => observation.code === 'story-closure'
+    && observation.category === 'quality' && ['observation', 'resolved'].includes(observation.assessment ?? '')
+    && observation.sourceRefs?.some(ref => ref.sourceId === `chapter-${job.chapter}` && ref.quote.trim())) === true;
+}
+function validReviewReceipt(task: CreationTask, job: ScheduledChapter): boolean {
+  const receipt = job.reviewReceipt;
+  if (!receipt || !['publishing', 'completed'].includes(job.phase) || !job.revisionId || receipt.revisionId !== job.revisionId
+    || !ChapterReviewInputsSchema.safeParse(receipt.inputs).success) return false;
+  const policy = ChapterReviewPolicySchema.safeParse(receipt.reviewPolicy);
+  const observations = ObservationSchema.array().safeParse(receipt.observations);
+  return policy.success && policy.data.language === task.plan.language
+    && policy.data.requireStoryClosure === (job.chapter === task.plan.targetChapters)
+    && observations.success && !unresolvedReview(observations.data).length
+    && (job.chapter !== task.plan.targetChapters || closureAccepted(job));
+}
+function reviewedComplete(task: CreationTask, jobs: readonly ScheduledChapter[]): boolean {
+  return jobs.length === task.plan.targetChapters && jobs.every((job, i) => job.chapter === i + 1 && validReviewReceipt(task, job));
+}
+function manuscriptHistoryConflict(task: CreationTask, jobs: readonly ScheduledChapter[], remote?: RemoteWorkRun): boolean {
+  return task.phase === 'publishing' || task.error?.code === 'CREATION_DELIVERY_HISTORY_CONFLICT' || Boolean(remote)
+    || jobs.some(job => job.phase === 'publishing' || job.publicationStartedAt !== undefined || job.publication !== undefined);
+}
+function deliveryHistoryError() {
+  return { code: 'CREATION_DELIVERY_HISTORY_CONFLICT', message: 'Publication history conflicts with this manuscript request. Reconcile the retained history; no publication or chapter replay was attempted.' };
+}
+
+export function creationTaskView(task: CreationTask, jobs: readonly ScheduledChapter[], remote?: RemoteWorkRun) {
+  const deliveryMode = effectiveCreationDeliveryMode(task.request);
+  const conflict = deliveryMode === 'manuscript' && manuscriptHistoryConflict(task, jobs, remote);
   const latest = jobs.at(-1);
   const phase = latest && !['completed', 'blocked', 'planning'].includes(task.phase)
     ? latest.phase === 'completed' ? task.phase : latest.phase === 'reviewing' && latest.reviewRepair ? 'revising' : latest.phase : task.phase;
-  return { ...task, canResume: canResumeCreationTask(task), status: task.desiredState === 'paused' && task.phase !== 'completed' ? 'paused' : phase,
-    writtenChapters: jobs.filter(job => job.writingCompleted || (job.reviewChecks ?? 0) > 0 || Boolean(job.reviewReceipt) || ['reviewing', 'publishing', 'completed'].includes(job.phase)).length,
-    reviewedChapters: jobs.filter(job => Boolean(job.reviewReceipt)).length,
-    publishedChapters: jobs.filter(job => job.publication?.status === 'published').length,
+  const writtenChapters = jobs.filter(job => job.writingCompleted || (job.reviewChecks ?? 0) > 0 || Boolean(job.reviewReceipt) || ['reviewing', 'publishing', 'completed'].includes(job.phase)).length;
+  const publishedChapters = jobs.filter(job => job.publication?.status === 'published').length;
+  const unknownHistory = jobs.some(job => job.publication && !['published', 'submitted', 'pending'].includes(job.publication.status))
+    || remote?.phase === 'create_unknown' || /^(?:PUBLISHING_|REMOTE_WORK_).*(?:RECONCILIATION|HISTORY|CONFLICT|INTEGRITY)/u.test(task.error?.code ?? latest?.error?.code ?? '');
+  const contentStatus: 'reviewed_complete' | 'in_progress' | 'not_started' = reviewedComplete(task, jobs) && task.error?.code !== 'CREATION_REVIEW_RECONCILIATION_REQUIRED'
+    ? 'reviewed_complete' : writtenChapters ? 'in_progress' : 'not_started';
+  const publicationStatus: 'reconciliation_required' | 'not_requested' | 'published' | 'blocked' | 'in_progress' | 'not_started' = conflict || unknownHistory ? 'reconciliation_required'
+    : deliveryMode === 'manuscript' ? 'not_requested'
+    : jobs.length === task.plan.targetChapters && publishedChapters === task.plan.targetChapters && jobs.every((job, i) => job.chapter === i + 1) ? 'published'
+    : jobs.some(job => ['pending', 'submitted'].includes(job.publication?.status ?? '')) ? 'in_progress'
+    : /PUBLISHER|PUBLISHING|REMOTE_WORK/u.test(task.error?.code ?? latest?.error?.code ?? '') ? 'blocked'
+    : jobs.some(job => job.publication || job.publicationStartedAt !== undefined || job.phase === 'publishing') || (remote?.attempts ?? 0) > 0 ? 'in_progress' : 'not_started';
+  return { ...task, deliveryMode, contentStatus, publicationStatus, canResume: !conflict && canResumeCreationTask(task), status: conflict ? 'blocked' : task.desiredState === 'paused' && task.phase !== 'completed' ? 'paused' : phase,
+    writtenChapters, reviewedChapters: jobs.filter(job => validReviewReceipt(task, job)).length, publishedChapters,
     currentChapter: latest?.chapter ?? 0, stage: latest?.phase ?? task.phase,
     nextAttemptAt: latest?.nextAttemptAt ?? task.nextAttemptAt,
-    error: task.error ?? latest?.error,
-    receipts: jobs.filter(job => job.publication).map(job => ({ chapter: job.chapter, revisionId: job.revisionId,
+    error: conflict ? deliveryHistoryError() : task.error ?? latest?.error,
+    receipts: jobs.filter(job => job.reviewReceipt || job.publication).map(job => ({ chapter: job.chapter, revisionId: job.revisionId,
       review: job.reviewReceipt, publication: job.publication })),
   };
 }
