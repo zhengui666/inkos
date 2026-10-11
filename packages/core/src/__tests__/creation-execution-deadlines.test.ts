@@ -1,5 +1,9 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Agent } from "../codex/agent.js";
+import type { CodexClient, CodexRequestOptions } from "../codex/client.js";
 import { resolveCodexModel } from "../codex/model.js";
 import { withAgentRequestDeadline } from "../agent/execution-deadline.js";
 import { withUnboundedWorkerExecution } from "../agent/worker-execution-policy.js";
@@ -8,8 +12,8 @@ import { CodexFixture } from "./codex-fixture.js";
 const mocks = vi.hoisted(() => ({ createClient: vi.fn() }));
 vi.mock("../codex/client.js", () => ({ createCodexClient: mocks.createClient }));
 const settings = { model: "gpt-6.1-sol", reasoningEffort: "ultra" as const, serviceTier: "priority" as const };
-function agent(signal?: AbortSignal) {
-  return new Agent({ projectRoot: "/tmp/creation-deadline-test", signal, settings,
+function agent(signal?: AbortSignal, projectRoot = "/tmp/creation-deadline-test") {
+  return new Agent({ projectRoot, signal, settings,
     initialState: { model: resolveCodexModel(settings), systemPrompt: "Create", tools: [], messages: [] } });
 }
 function deferred() {
@@ -79,7 +83,8 @@ describe("scoped creation execution deadlines", () => {
     expect(threads).toHaveLength(2);
     for (const thread of threads) expect(thread.params).toMatchObject({ model: settings.model, serviceTier: "priority" });
     for (const turn of fixture.requests.filter(request => request.method === "turn/start")) {
-      expect(turn.params).toMatchObject({ effort: "ultra", serviceTier: "priority", serviceTierForTurn: "priority" });
+      expect(turn.params).toMatchObject({ effort: "ultra", serviceTierForTurn: "priority" });
+      expect(turn.params).not.toHaveProperty("serviceTier");
     }
     expect(fixture.requests.filter(request => request.method === "turn/interrupt")).toHaveLength(1);
   });
@@ -95,5 +100,81 @@ describe("scoped creation execution deadlines", () => {
     await expect(running).rejects.toThrow("user cancelled creation");
     expect(fixture.requests.filter(request => request.method === "turn/interrupt")).toHaveLength(1);
     await expect(agent().prompt("legacy")).rejects.toThrow("INKOS_AGENT_IDLE_TIMEOUT_MS");
+  });
+
+  it.each(["resolved", "rejected"] as const)("settles a delayed %s interrupt ACK before closing a stalled model peer", async ack => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    vi.stubEnv("INKOS_AGENT_IDLE_TIMEOUT_MS", "50");
+    vi.stubEnv("INKOS_CODEX_HOME", undefined);
+    vi.stubEnv("INKOS_CODEX_STATE_ROOT", undefined);
+    const root = await mkdtemp(join(tmpdir(), "inkos-interrupt-ack-"));
+    const modelEntered = deferred(), interruptEntered = deferred(), releaseAck = deferred();
+    const ackError = new Error("Synthetic interrupt ACK rejected");
+    const events: Array<{ event: string; closed: boolean }> = [];
+    const dispatchClosed: boolean[] = [], requestTimeouts: Array<number | undefined> = [];
+    let modelPeer: CodexClient | undefined, settled = false;
+    const fixture = new CodexFixture(() => { modelEntered.resolve(); return { hold: true }; });
+    mocks.createClient.mockImplementation(async (projectRoot: string) => {
+      const peer = await fixture.createClient(projectRoot);
+      const request = peer.request.bind(peer), close = peer.close.bind(peer);
+      peer.request = async <T>(method: string, params?: unknown, options?: CodexRequestOptions): Promise<T> => {
+        if (method === "turn/start") modelPeer = peer;
+        if (method !== "turn/interrupt") return request<T>(method, params, options);
+        dispatchClosed.push(peer.closed); requestTimeouts.push(options?.timeoutMs);
+        events.push({ event: "interrupt-request", closed: peer.closed });
+        interruptEntered.resolve();
+        // The real fixture must accept the request while open; hold only its ACK.
+        const response = await request<T>(method, params, options);
+        await releaseAck.promise;
+        events.push({ event: `interrupt-ack-${ack}`, closed: peer.closed });
+        if (ack === "rejected") throw ackError;
+        return response;
+      };
+      peer.close = async () => {
+        if (peer === modelPeer && !peer.closed) events.push({ event: "peer-close", closed: peer.closed });
+        await close();
+      };
+      return peer;
+    });
+    const host = agent(undefined, root);
+    const running = host.prompt("legacy");
+    const observed = running.then(() => {
+      settled = true; events.push({ event: "caller-resolved", closed: modelPeer?.closed ?? false });
+      return undefined;
+    }, error => {
+      settled = true; events.push({ event: "caller-rejected", closed: modelPeer?.closed ?? false });
+      return error;
+    });
+    try {
+      expect(await Promise.race([modelEntered.promise.then(() => true), observed.then(() => false)])).toBe(true);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(await Promise.race([interruptEntered.promise.then(() => true), observed.then(() => false)])).toBe(true);
+      expect(dispatchClosed).toEqual([false]);
+      expect(requestTimeouts).toEqual([5000]);
+      expect(fixture.requests.filter(request => request.method === "turn/interrupt")).toHaveLength(1);
+      expect(modelPeer?.closed).toBe(false);
+      expect(settled).toBe(false);
+      expect(events).toEqual([{ event: "interrupt-request", closed: false }]);
+      releaseAck.resolve();
+      const error = await observed;
+      expect(error).toMatchObject({ code: "AGENT_MODEL_STALLED", idleTimeoutMs: 50 });
+      expect(error).not.toBe(ackError);
+      expect(modelPeer?.closed).toBe(true);
+      expect(events).toEqual([
+        { event: "interrupt-request", closed: false },
+        { event: `interrupt-ack-${ack}`, closed: false },
+        { event: "peer-close", closed: false },
+        { event: "caller-rejected", closed: true },
+      ]);
+      expect(fixture.requests.filter(request => request.method === "turn/interrupt")).toHaveLength(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      releaseAck.resolve(); host.abort();
+      await observed;
+      await fixture.close();
+      await fixture.drain();
+      console.info(`interrupt ACK ${ack} ordering: ${JSON.stringify(events)}`);
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

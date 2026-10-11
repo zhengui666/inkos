@@ -3,8 +3,10 @@ import { join, relative } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it as test, vi } from "vitest";
 import { DrainedTestScope } from "./fixtures/drained-test-scope.js";
+import { CodexRuntimeFixtureScope } from "./fixtures/codex-runtime-fixture.js";
 import * as runtimeState from "../state/runtime-state-store.js";
-vi.mock("../codex/client.js", () => ({ createCodexClient: () => { throw new Error("Unexpected model transport in goal fixture."); } }));
+const mocks = vi.hoisted(() => ({ createClient: vi.fn() }));
+vi.mock("../codex/client.js", () => ({ createCodexClient: mocks.createClient }));
 import { GoalStore } from "../goals/store.js";
 import { GoalExecutor } from "../goals/executor.js";
 import { chapterGoalInput, createChapterGoalAdapter } from "../goals/chapters.js";
@@ -29,28 +31,40 @@ import {
   loadRuntimeStateSnapshotAtChapter, saveRuntimeStateSnapshot,
 } from "../state/runtime-state-store.js";
 
-let scope: DrainedTestScope;
-beforeEach(({ signal }) => { scope = new DrainedTestScope(signal); });
+let scope: DrainedTestScope, fixtureScope: CodexRuntimeFixtureScope;
+beforeEach(({ signal }) => {
+  vi.stubEnv("INKOS_CODEX_HOME", undefined);
+  vi.stubEnv("INKOS_CODEX_STATE_ROOT", undefined);
+  scope = new DrainedTestScope(signal);
+  fixtureScope = new CodexRuntimeFixtureScope();
+  mocks.createClient.mockReset().mockImplementation(fixtureScope.createClient);
+});
 function it(name: string, body: () => Promise<void>, timeout?: number) {
   test(name, () => scope.run(body), timeout);
 }
 function runGoal(executor: GoalExecutor, signal?: AbortSignal) {
   scope.signal.throwIfAborted();
-  return executor.run("goal", signal ? AbortSignal.any([scope.signal, signal]) : scope.signal);
+  return fixtureScope.run(ownedSignal => executor.run("goal", AbortSignal.any([
+    scope.signal, ownedSignal, ...(signal ? [signal] : []),
+  ])));
 }
 
 const roots: string[] = [], stores: Array<GoalStore | PublishingStore | CreativeEpisodeStore> = [];
 afterEach(async () => {
   await scope.drain();
-  vi.restoreAllMocks();
-  for (const store of [...stores]) { store.close(); stores.splice(stores.indexOf(store), 1); }
-  await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
+  try { await fixtureScope.drain(); }
+  finally {
+    for (const store of [...stores]) { store.close(); stores.splice(stores.indexOf(store), 1); }
+    mocks.createClient.mockReset(); vi.restoreAllMocks(); vi.unstubAllEnvs();
+    await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
+  }
 });
 function open(root: string) { const store = new GoalStore(join(root, ".inkos", "harness.sqlite")); stores.push(store); return store; }
 function close(store: GoalStore) { store.close(); stores.splice(stores.indexOf(store), 1); }
 function start(store: GoalStore) { store.requestRun("goal", store.get("goal").version); }
 async function setup(endChapter = 2) {
   const root = await mkdtemp(join(tmpdir(), "inkos-chapter-goal-")); roots.push(root);
+  fixtureScope.registerProject(root);
   const state = new StateManager(root), bookDir = state.bookDir("novel"), now = new Date().toISOString();
   await saveWorkManifest(root, createWorkManifest({ id: "novel", title: "Departure", profileId: "longform-novel", language: "en" }));
   await state.saveBookConfig("novel", { id: "novel", title: "Departure", genre: "general", platform: "other", status: "active",
@@ -164,16 +178,26 @@ describe("chapter goals with native persistence", () => {
       return loadCheckpoint(input);
     });
     const running = runGoal(new GoalExecutor(f.store, [f.adapter], 0));
-    void running.then(() => { settled = true; });
+    const observed = running.then(
+      () => { settled = true; return { kind: "fulfilled" as const }; },
+      error => { settled = true; return { kind: "rejected" as const, error }; },
+    );
     try {
-      await vi.waitFor(() => expect(checkpoints).toContain(4));
+      const entry = await Promise.race([
+        vi.waitFor(() => expect(checkpoints).toContain(4)).then(() => ({ kind: "checkpoint" as const })),
+        observed.then(outcome => ({ kind: "settled" as const, outcome })),
+      ]);
+      if (entry.kind === "settled") {
+        if (entry.outcome.kind === "rejected") throw entry.outcome.error;
+        throw new Error("Goal run settled before the bounded checkpoint reads entered.");
+      }
       // Chapter 5 is read once for the current state; it must not enter the next batch.
       expect(checkpoints).toEqual([5, 1, 2, 3, 4]);
       expect(settled).toBe(false);
       expect(f.store.get("goal").owner).not.toBeNull();
       expect(() => f.store.close()).toThrow(/Drain owned work/);
       expect(await readFile(join(f.bookDir, ".write.lock"), "utf8")).toBeTruthy();
-    } finally { release(); await running; }
+    } finally { release(); await Promise.allSettled([running, observed]); }
     const result = await running;
     expect(result.status).toBe("reconciliation_required");
     expect(result.error?.code).toBe(earlierFails ? "FIXTURE_EARLIER_READ" : "FIXTURE_LATER_READ");

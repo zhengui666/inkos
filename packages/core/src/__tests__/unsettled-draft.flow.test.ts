@@ -19,17 +19,26 @@ import { loadUnsettledDraft } from "../pipeline/unsettled-draft.js";
 import type { BookConfig } from "../models/book.js";
 import type { LLMClient } from "../llm/provider.js";
 
-const mock = vi.hoisted(() => ({ tool: vi.fn(), text: vi.fn() }));
+const mock = vi.hoisted(() => ({ tool: vi.fn(), text: vi.fn(), createClient: vi.fn() }));
 vi.mock("../agent/worker-agent.js", () => ({ runWorkerAgentTool: mock.tool, runWorkerAgent: mock.text }));
+vi.mock("../codex/client.js", () => ({ createCodexClient: mock.createClient }));
+import { CodexRuntimeFixtureScope, type RegisteredCodexProject } from "./fixtures/codex-runtime-fixture.js";
 const client: LLMClient = { provider: "openai", apiFormat: "responses", stream: true,
   defaults: { temperature: 0, maxTokens: 16384, thinkingBudget: 0, extra: {} }, _codex: { projectRoot: "/fixture" } };
 const roots: string[] = [];
+let root: string, scope: CodexRuntimeFixtureScope, project: RegisteredCodexProject;
 const usage = { promptTokens: 10, completionTokens: 20, totalTokens: 30 };
 const prose = "Mara returns the sealed receipt to its owner. The witness closes the door.";
 let settleFailures = 0, draftCount = 0;
 let onDraft: (() => void | Promise<void>) | undefined;
 let onSettle: (() => void | Promise<void>) | undefined;
 let onValidate: (() => void | Promise<void>) | undefined;
+function stageGate() {
+  let reach!: () => void, release!: () => void;
+  const reached = new Promise<void>(resolve => { reach = resolve; });
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  return { reached, wait: async () => { reach(); await blocked; }, release: () => { reach(); release(); } };
+}
 
 // Shared with the fresh-process fixture below. The returned citations pass the
 // actual source resolver and contract validators; no review method is stubbed.
@@ -62,6 +71,12 @@ function sourcedRecoveryReview(toolName: string, messages: ReadonlyArray<{ role:
 
 beforeEach(() => {
   settleFailures = 0; draftCount = 0; onDraft = onSettle = onValidate = undefined;
+  vi.stubEnv("INKOS_CODEX_HOME", undefined); vi.stubEnv("INKOS_CODEX_STATE_ROOT", undefined);
+});
+beforeEach(async () => {
+  root = await mkdtemp(join(tmpdir(), "inkos-unsettled-")); roots.push(root);
+  scope = new CodexRuntimeFixtureScope(); project = scope.registerProject(root);
+  mock.createClient.mockReset().mockImplementation(scope.createClient);
   mock.tool.mockReset(); mock.text.mockReset();
   mock.tool.mockImplementation(async (_client, _model, _messages, tool, options) => {
     options.onUsage?.(usage);
@@ -79,10 +94,25 @@ beforeEach(() => {
     throw new Error(`Unexpected offline tool ${tool.name}`);
   });
 });
-afterEach(async () => { vi.restoreAllMocks(); await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
+afterEach(async () => {
+  try {
+    await scope.drain();
+    expect(project.fixture.pendingTaskCount).toBe(0);
+    expect(project.fixture.turns).toEqual([]);
+    expect(project.fixture.peers.every(peer => peer.closed && peer.closeCount === 1)).toBe(true);
+  } finally {
+    mock.tool.mockReset(); mock.text.mockReset(); mock.createClient.mockReset();
+    vi.restoreAllMocks(); vi.unstubAllEnvs();
+    await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
+  }
+});
+
+function runScoped<T>(runner: PipelineRunner, task: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  return scope.run(scopeSignal => runner.runWithAbortSignal(
+    signal ? AbortSignal.any([scopeSignal, signal]) : scopeSignal, task));
+}
 
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "inkos-unsettled-")); roots.push(root);
   const state = new StateManager(root), bookDir = state.bookDir("novel"), now = "2026-10-08T00:00:00.000Z";
   const book: BookConfig = { id: "novel", title: "Receipt", genre: "general", platform: "other", status: "active" as const,
     targetChapters: 2, chapterWordCount: 20, language: "en" as const, createdAt: now, updatedAt: now };
@@ -97,7 +127,10 @@ async function fixture() {
     intentMarkdown: "Return the receipt", plannerInputs: [], runtimePath: "unused" });
   const runner = () => new PipelineRunner({ projectRoot: root, client, model: "fixture" });
   const checkpointDir = join(root, ".inkos/unsettled-drafts/novel"), checkpointPath = join(checkpointDir, "chapter-0001.json");
-  const write = (instruction?: string) => runner().writeChapters(book.id, 1, { startChapterNumber: 1, externalContext: instruction });
+  const write = (instruction?: string) => {
+    const pipeline = runner();
+    return runScoped(pipeline, () => pipeline.writeChapters(book.id, 1, { startChapterNumber: 1, externalContext: instruction }));
+  };
   return { root, state, bookDir, book, runner, checkpointDir, checkpointPath, write };
 }
 const calls = (name: string) => mock.tool.mock.calls.filter(call => call[3].name === name);
@@ -167,10 +200,13 @@ describe("generated but unsettled draft recovery", () => {
   });
 
   it("retains a completed body on cancellation without settlement, then resumes only on a new call", async () => {
-    const f = await fixture(), controller = new AbortController();
-    onDraft = () => controller.abort(new Error("Author cancelled"));
-    const runner = f.runner();
-    await expect(runner.runWithAbortSignal(controller.signal, () => runner.writeChapters("novel", 1, { startChapterNumber: 1 }))).rejects.toThrow("Author cancelled");
+    const f = await fixture(), controller = new AbortController(), gate = stageGate(), runner = f.runner();
+    onDraft = gate.wait;
+    const running = runScoped(runner, () => runner.writeChapters("novel", 1, { startChapterNumber: 1 }), controller.signal);
+    const cancelled = expect(running).rejects.toThrow("Author cancelled");
+    void running.then(gate.release, gate.release);
+    try { await gate.reached; controller.abort(new Error("Author cancelled")); } finally { gate.release(); }
+    await cancelled;
     expect(JSON.parse(await readFile(f.checkpointPath, "utf8")).draft.content).toBe(prose);
     expect(calls("submit_runtime_state_delta")).toHaveLength(0); await noAcceptedChapter(f);
     onDraft = undefined; await f.write(); expect(draftCount).toBe(1);
@@ -185,10 +221,13 @@ describe("generated but unsettled draft recovery", () => {
   });
 
   it.each(["settlement", "validation"])("cancellation during %s never promotes the checkpoint", async stage => {
-    const f = await fixture(), controller = new AbortController(), runner = f.runner();
-    const cancel = () => controller.abort(new Error("Author cancelled"));
-    if (stage === "settlement") onSettle = cancel; else onValidate = cancel;
-    await expect(runner.runWithAbortSignal(controller.signal, () => runner.writeChapters("novel", 1, { startChapterNumber: 1 }))).rejects.toThrow("Author cancelled");
+    const f = await fixture(), controller = new AbortController(), gate = stageGate(), runner = f.runner();
+    if (stage === "settlement") onSettle = gate.wait; else onValidate = gate.wait;
+    const running = runScoped(runner, () => runner.writeChapters("novel", 1, { startChapterNumber: 1 }), controller.signal);
+    const cancelled = expect(running).rejects.toThrow("Author cancelled");
+    void running.then(gate.release, gate.release);
+    try { await gate.reached; controller.abort(new Error("Author cancelled")); } finally { gate.release(); }
+    await cancelled;
     await noAcceptedChapter(f);
     expect(JSON.parse(await readFile(f.checkpointPath, "utf8")).draft.content).toBe(prose);
     onSettle = onValidate = undefined; await f.write(); expect(draftCount).toBe(1);
@@ -196,7 +235,7 @@ describe("generated but unsettled draft recovery", () => {
 
   it("pre-aborted operations do not load, archive or start a draft", async () => {
     const f = await fixture(), controller = new AbortController(), runner = f.runner(); controller.abort(new Error("Already paused"));
-    await expect(runner.runWithAbortSignal(controller.signal, () => runner.writeChapters("novel", 1, { startChapterNumber: 1 }))).rejects.toThrow("Already paused");
+    await expect(runScoped(runner, () => runner.writeChapters("novel", 1, { startChapterNumber: 1 }), controller.signal)).rejects.toThrow("Already paused");
     await expect(readFile(f.checkpointPath)).rejects.toMatchObject({ code: "ENOENT" }); expect(mock.tool).not.toHaveBeenCalled();
   });
 
@@ -267,14 +306,20 @@ describe("generated but unsettled draft recovery", () => {
     const script = `
       import {registerHooks} from 'node:module';
       const sourceRoot = ${JSON.stringify(sourceRoot)}, workerUrl = ${JSON.stringify(workerUrl)};
+      const clientUrl = 'data:text/javascript,' + encodeURIComponent('export const createCodexClient = root => globalThis.__unsettledDraftScope.createClient(root);');
       registerHooks({resolve(specifier,context,next){
         if(context.parentURL?.startsWith(sourceRoot) && specifier.endsWith('/worker-agent.js'))return {url:workerUrl,shortCircuit:true};
+        if(context.parentURL?.startsWith(sourceRoot) && specifier.endsWith('/codex/client.js'))return {url:clientUrl,shortCircuit:true};
         return next(context.parentURL?.startsWith(sourceRoot) && specifier.startsWith('.') && specifier.endsWith('.js') ? specifier.slice(0,-3)+'.ts' : specifier,context);
       }});
+      const {CodexRuntimeFixtureScope} = await import(sourceRoot+'__tests__/fixtures/codex-runtime-fixture.ts');
+      const scope = new CodexRuntimeFixtureScope(); scope.registerProject(${JSON.stringify(f.root)});
+      globalThis.__unsettledDraftScope = scope;
       const {PipelineRunner} = await import(sourceRoot+'pipeline/runner.ts');
       const {calls} = await import(workerUrl);
       const runner = new PipelineRunner({projectRoot:${JSON.stringify(f.root)},client:${JSON.stringify(client)},model:'fixture'});
-      await runner.writeChapters('novel',1,{startChapterNumber:1});
+      try { await scope.run(signal => runner.runWithAbortSignal(signal, () => runner.writeChapters('novel',1,{startChapterNumber:1}))); }
+      finally { await scope.drain(); }
       console.log('RECOVERY_CALLS='+JSON.stringify(calls));
     `;
     const { stdout } = await promisify(execFile)(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", script]);
@@ -334,8 +379,8 @@ describe("generated but unsettled draft recovery", () => {
     const f = await fixture(); settleFailures = 1;
     const writeWithMethod = (body: string) => {
       const runner = f.runner();
-      return runner.runWithAgentContext({ activatedSkills: [{ skill: { id: "fixture-method", name: "Fixture method", description: "Offline style guidance", source: "project", body }, resources: [] }] },
-        () => runner.writeChapters("novel", 1, { startChapterNumber: 1 }));
+      return runScoped(runner, () => runner.runWithAgentContext({ activatedSkills: [{ skill: { id: "fixture-method", name: "Fixture method", description: "Offline style guidance", source: "project", body }, resources: [] }] },
+        () => runner.writeChapters("novel", 1, { startChapterNumber: 1 })));
     };
     await expect(writeWithMethod("Use restrained narration.")).rejects.toThrow("interrupted settlement");
     await writeWithMethod("Use an energetic narrative voice."); expect(draftCount).toBe(2);
@@ -347,8 +392,8 @@ describe("generated but unsettled draft recovery", () => {
     const path = join(baseDir, "references/style.md"); await writeFile(path, "Use a restrained narrative voice.");
     const writeWithMethod = () => {
       const runner = f.runner();
-      return runner.runWithAgentContext({ activatedSkills: [{ skill: { id: "fixture-method", name: "Fixture method", description: "Offline style guidance", source: "project", body: "[Style](references/style.md)", baseDir }, resources: [] }] },
-        () => runner.writeChapters("novel", 1, { startChapterNumber: 1 }));
+      return runScoped(runner, () => runner.runWithAgentContext({ activatedSkills: [{ skill: { id: "fixture-method", name: "Fixture method", description: "Offline style guidance", source: "project", body: "[Style](references/style.md)", baseDir }, resources: [] }] },
+        () => runner.writeChapters("novel", 1, { startChapterNumber: 1 })));
     };
     await expect(writeWithMethod()).rejects.toThrow("interrupted settlement");
     await writeFile(path, "Use an energetic narrative voice.");

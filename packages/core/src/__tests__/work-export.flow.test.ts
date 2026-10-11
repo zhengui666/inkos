@@ -1,7 +1,7 @@
 import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { it, expect, vi } from "vitest";
+import { afterEach, beforeEach, it, expect, vi } from "vitest";
 import { createWorkManifest, saveWorkManifest, loadWorkManifest } from "../harness/work-store.js";
 import { syncWorkSourceArtifacts } from "../harness/source-sync.js";
 import { createExportWorkTool } from "../harness/tools/work-artifacts.js";
@@ -10,6 +10,28 @@ import {createContinuationImportTool,createImportChaptersTool} from '../agent/ag
 import {PipelineRunner} from '../pipeline/runner.js';
 import {StateManager} from '../state/manager.js';
 import {writeExportArtifact} from '../interaction/export-artifact.js';
+import { CodexRuntimeFixtureScope } from './fixtures/codex-runtime-fixture.js';
+
+const fixtureMocks = vi.hoisted(() => ({ createClient: vi.fn() }));
+vi.mock('../codex/client.js', () => ({ createCodexClient: fixtureMocks.createClient }));
+let runtimeScope: CodexRuntimeFixtureScope | undefined;
+beforeEach(() => {
+  vi.stubEnv('INKOS_CODEX_HOME', undefined);
+  vi.stubEnv('INKOS_CODEX_STATE_ROOT', undefined);
+  runtimeScope = new CodexRuntimeFixtureScope();
+  fixtureMocks.createClient.mockReset().mockImplementation(runtimeScope.createClient);
+});
+async function drainRuntimeFixture() {
+  const current = runtimeScope;
+  runtimeScope = undefined;
+  try { if (current) await current.drain(); }
+  finally {
+    fixtureMocks.createClient.mockReset();
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  }
+}
+afterEach(async () => { await drainRuntimeFixture(); });
 
 it('refuses an incomplete or ambiguous chapter export before replacing an existing delivery',async()=>{
   const root=await mkdtemp(join(tmpdir(),'inkos-export-sources-'));
@@ -36,7 +58,7 @@ it('refuses an incomplete or ambiguous chapter export before replacing an existi
     const complete=await writeExportArtifact(state,'gallery',{format:'md'});
     expect(complete).toMatchObject({chaptersExported:2,totalWords:6});
     expect(await readFile(complete.outputPath)).not.toEqual(prior);
-  }finally{await rm(root,{recursive:true,force:true});}
+  }finally{try{await drainRuntimeFixture();}finally{await rm(root,{recursive:true,force:true});}}
 });
 
 it("exports the accepted Markdown revision and preserves unrelated candidates", async () => {
@@ -70,11 +92,12 @@ it("exports the accepted Markdown revision and preserves unrelated candidates", 
     expect((await loadChapterSource(root,sourcePath)).chapters).toEqual([{title:'Script',content:'A later scene.'}]);
     const resumed=await loadChapterSource(root,sourcePath,undefined,imported.lineage);
     expect(resumed).toEqual(imported);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { try { await drainRuntimeFixture(); } finally { await rm(root, { recursive: true, force: true }); } }
 });
 
 it('resumes a failed continuation import from persisted progress and the pinned source revision',async()=>{
   const root=await mkdtemp(join(tmpdir(),'inkos-import-recovery-'));
+  const project=runtimeScope!.registerProject(root);
   try{
     await saveWorkManifest(root,createWorkManifest({id:'source',title:'Source',profileId:'script',language:'en'}));
     await mkdir(join(root,'works/source/source'),{recursive:true});
@@ -94,17 +117,19 @@ it('resumes a failed continuation import from persisted progress and the pinned 
       return{bookId:input.bookId,importedCount:1,totalWords:2,nextChapter:3};
     });
     const tool=createContinuationImportTool(pipeline,null,root);
-    const failure=await tool.execute('initial',{sourcePath,title:'Continuation',language:'en'}).catch(error=>error);
+    const failure=await runtimeScope!.run(signal=>tool.execute('initial',{sourcePath,title:'Continuation',language:'en'},signal)).catch(error=>error);
     if(failure.code!=='WORKER_RESULT_INVALID')throw failure.cause??failure;
     expect(failure).toMatchObject({code:'WORKER_RESULT_INVALID',resultTool:'submit_selected_sources',recovery:{action:'adaptation__continuation_import',completedChapterCount:1,sourceChapterCount:2,parameters:{resumeFrom:2}}});
     const workId=failure.recovery.workId;
     const before=await loadWorkManifest(root,workId);
     await syncWorkSourceArtifacts({projectRoot:root,workId:'source',accept:true,writes:[{relativePath:sourcePath,content:'# Chapter 1: Changed\n\nA new manuscript.\n'}]});
     const pinned=before.lineage[0]!;
-    await createImportChaptersTool(pipeline,workId,root).execute('resume',{resumeFrom:2,source:{workId:pinned.sourceWorkId,artifactId:pinned.sourceArtifactId!}});
+    await runtimeScope!.run(signal=>createImportChaptersTool(pipeline,workId,root).execute('resume',{resumeFrom:2,source:{workId:pinned.sourceWorkId,artifactId:pinned.sourceArtifactId!}},signal));
+    expect(project.fixture.requests.some(({method})=>method==='account/read')).toBe(true);
+    expect(project.fixture.turns).toHaveLength(0);
     expect(imported.mock.calls[1]![0]).toMatchObject({resumeFrom:2,chapters:[{title:'Arrival',content:'Mira arrived.'},{title:'Departure',content:'Mira left.'}]});
     expect((await state.loadChapterIndex(workId)).map(c=>c.number)).toEqual([1,2]);
     expect((await loadWorkManifest(root,workId)).lineage).toEqual(before.lineage);
     expect(await readFile(join(state.bookDir(workId),'chapters/0001_Arrival.md'),'utf8')).toBe('# Chapter 1: Arrival\n\nMira arrived.\n');
-  }finally{await rm(root,{recursive:true,force:true});}
+  }finally{try{await drainRuntimeFixture();}finally{await rm(root,{recursive:true,force:true});}}
 });

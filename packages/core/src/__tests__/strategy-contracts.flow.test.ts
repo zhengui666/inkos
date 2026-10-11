@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { commitAtomicFileSet } from "../utils/atomic-file-set.js";
 import { createInitialWorkManifestWrite } from "../harness/source-sync.js";
 import { loadWorkManifest } from "../harness/work-store.js";
@@ -25,9 +25,33 @@ import { createLLMClient } from "../llm/provider.js";
 import { withExecutionEvidence } from "../harness/execution-evidence.js";
 import { buildShortFictionChapterBatches, validateShortReviewSources } from "../agents/short-fiction.js";
 import{createReadTool,createLsTool}from'../agent/agent-tools.js';
+import { CodexRuntimeFixtureScope } from "./fixtures/codex-runtime-fixture.js";
+
+const fixtureMocks = vi.hoisted(() => ({ createClient: vi.fn() }));
+vi.mock("../codex/client.js", () => ({ createCodexClient: fixtureMocks.createClient }));
+let runtimeScope: CodexRuntimeFixtureScope | undefined;
+beforeEach(() => {
+  vi.stubEnv("INKOS_CODEX_HOME", undefined);
+  vi.stubEnv("INKOS_CODEX_STATE_ROOT", undefined);
+  runtimeScope = new CodexRuntimeFixtureScope();
+  fixtureMocks.createClient.mockReset().mockImplementation(runtimeScope.createClient);
+});
+async function drainRuntimeFixture() {
+  const current = runtimeScope;
+  runtimeScope = undefined;
+  if (current) await current.drain();
+}
 
 const roots: string[] = [];
-afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
+afterEach(async () => {
+  try { await drainRuntimeFixture(); }
+  finally {
+    fixtureMocks.createClient.mockReset();
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
+  }
+});
 const draft = { storyTitle: "Fixture", rawContent: "", chapters: [1, 2].map(number => ({ number, title: `Part ${number}`, content: "one two three", charCount: 3 })) };
 
 it('assigns the same artifact roles at creation and later registration using storage namespaces',async()=>{
@@ -132,6 +156,7 @@ it("snapshots committed SQLite state while its WAL connection remains open", asy
 
 it("composes a new Profile, creates its Work and resumes an independent outline stage", async () => {
   const { root } = await fixture();
+  const project = runtimeScope!.registerProject(root);
   const builtIn = createBuiltInWorkProfileRegistry().require("short-fiction");
   const custom = {...builtIn,id:"mini-fiction",title:"Mini fiction",artifactSchemas:{...builtIn.artifactSchemas,'source/metadata.json':'translation-glossary' as const}};
   await mkdir(join(root,'.inkos/profiles'),{recursive:true});
@@ -145,8 +170,10 @@ it("composes a new Profile, creates its Work and resumes an independent outline 
   await mkdir(join(root,'works/composed/source/outline'),{recursive:true});
   await writeFile(join(root,'works/composed/source/outline/v001.md'),'Existing outline fixture');
   const stage = createShortProductionStageTools(pipeline,root,'composed')[0]!;
-  const result = await executeExplicitCapabilityTool({projectRoot:root,workId:'composed',tool:stage,binding:{capabilityId:'short-fiction',actionId:stage.name,profileId:custom.id,risk:'recoverable-write'},
-    parameters:{workId:'composed',direction:'Fixture direction',chapters:2,charsPerChapter:10}});
+  const result = await runtimeScope!.run(signal => executeExplicitCapabilityTool({projectRoot:root,workId:'composed',tool:stage,binding:{capabilityId:'short-fiction',actionId:stage.name,profileId:custom.id,risk:'recoverable-write'},
+    parameters:{workId:'composed',direction:'Fixture direction',chapters:2,charsPerChapter:10},signal}));
+  expect(project.fixture.requests.some(({method})=>method==='account/read')).toBe(true);
+  expect(project.fixture.turns).toHaveLength(0);
   expect(result.status).toBe('success');
   const work = await loadWorkManifest(root,'composed');
   expect({profile:work.profileId,title:work.title,language:work.language}).toEqual({profile:custom.id,title:'Author title',language:'en'});

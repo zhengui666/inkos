@@ -3,7 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Type } from "@sinclair/typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+const mocks = vi.hoisted(() => ({ createClient: vi.fn() }));
+vi.mock('../codex/client.js', () => ({ createCodexClient: mocks.createClient }));
+import { CodexRuntimeFixtureScope, type RegisteredCodexProject } from "./fixtures/codex-runtime-fixture.js";
+import { ArchitectAgent } from "../agents/architect.js";
 import {
   ActionConfirmationRequiredError,
   ActionResultSchema,
@@ -32,9 +36,29 @@ import { syncWorkSourceArtifacts } from "../harness/source-sync.js";
 
 describe("creative harness mini-flows", () => {
   const roots: string[] = [];
+  const projects = new Map<string, RegisteredCodexProject>();
+  const closeAfterDrain: Array<() => void> = [];
+  let scope: CodexRuntimeFixtureScope;
+
+  beforeEach(() => {
+    vi.stubEnv("INKOS_CODEX_HOME", undefined);
+    vi.stubEnv("INKOS_CODEX_STATE_ROOT", undefined);
+    scope = new CodexRuntimeFixtureScope();
+    mocks.createClient.mockReset().mockImplementation(scope.createClient);
+  });
 
   afterEach(async () => {
-    await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+    try { await scope.drain(); }
+    finally {
+      try { for (const close of closeAfterDrain.splice(0)) close(); }
+      finally {
+        mocks.createClient.mockReset();
+        vi.restoreAllMocks();
+        vi.unstubAllEnvs();
+        projects.clear();
+        await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+      }
+    }
   });
 
   it("creates, runs, exports, and traces one translation Work", async () => {
@@ -291,13 +315,18 @@ describe("creative harness mini-flows", () => {
 
   it("preserves a draft Work when foundation generation cannot start", async () => {
     const root = await tempProject("draft-recovery");
+    const project = projects.get(root)!;
     const pipeline = new PipelineRunner({
       client: {} as never,
       model: "unavailable",
       projectRoot: root,
     });
+    const generate = vi.spyOn(ArchitectAgent.prototype, "generateFoundation").mockImplementationOnce(async () => {
+      expect(project.fixture.requests.some(request => request.method === "account/read")).toBe(true);
+      throw Object.assign(new Error("Foundation unavailable in offline fixture."), { code: "FIXTURE_FOUNDATION_UNAVAILABLE" });
+    });
     const now = new Date().toISOString();
-    await expect(executeExplicitCapabilityTool({projectRoot:root,tool:createBookFoundationTool(pipeline),
+    const operation = scope.run(signal => executeExplicitCapabilityTool({projectRoot:root,signal,tool:createBookFoundationTool(pipeline),
       binding:{capabilityId:'longform',actionId:'create_book',profileId:'longform-novel',risk:'recoverable-write'},parameters:{
       bookId: "recoverable-book",
       instruction: "Create fixture foundation",
@@ -310,19 +339,21 @@ describe("creative harness mini-flows", () => {
       language: "en",
       createdAt: now,
       updatedAt: now,
-    }})).rejects.toThrow();
+    }}));
+    await expect(operation).rejects.toThrow("Foundation unavailable in offline fixture.");
+    expect(generate).toHaveBeenCalledOnce();
+    expect(project.fixture.requests.some(request => request.method === "account/read")).toBe(true);
+    expect(project.fixture.turns).toHaveLength(0);
 
     const manifest = await loadWorkManifest(root, "recoverable-book");
     const episodes = new CreativeEpisodeStore(join(root,'.inkos/harness.sqlite'));
-    try {
-      expect(episodes.listEpisodes({workId:'recoverable-book'})[0]?.status).toBe('failed');
-      episodes.create({version:2,id:'legacy-attempt',workId:null,profileId:'longform-novel',status:'running',startedAt:now,completedAt:null});
-      episodes.append({episodeId:'legacy-attempt',workId:null,type:'action-started',payload:{parameters:{projectId:'recoverable-book'}}});
-      episodes.finish('legacy-attempt','failed');
-      expect(episodes.listEpisodes({workId:'recoverable-book'}).map(episode=>episode.id)).toContain('legacy-attempt');
-      expect(episodes.listEpisodes({workId:'unrelated-work'})).toEqual([]);
-    }
-    finally { episodes.close(); }
+    closeAfterDrain.push(() => episodes.close());
+    expect(episodes.listEpisodes({workId:'recoverable-book'})[0]?.status).toBe('failed');
+    episodes.create({version:2,id:'legacy-attempt',workId:null,profileId:'longform-novel',status:'running',startedAt:now,completedAt:null});
+    episodes.append({episodeId:'legacy-attempt',workId:null,type:'action-started',payload:{parameters:{projectId:'recoverable-book'}}});
+    episodes.finish('legacy-attempt','failed');
+    expect(episodes.listEpisodes({workId:'recoverable-book'}).map(episode=>episode.id)).toContain('legacy-attempt');
+    expect(episodes.listEpisodes({workId:'unrelated-work'})).toEqual([]);
     expect({
       status: manifest.status,
       sourceConfig: JSON.parse(await readFile(join(root, "works", "recoverable-book", "source", "book.json"), "utf-8")).id,
@@ -330,11 +361,14 @@ describe("creative harness mini-flows", () => {
       status: "draft",
       sourceConfig: "recoverable-book",
     });
+    expect(await readFile(join(root, "works", "recoverable-book", "source", "story", "brief.md"), "utf-8"))
+      .toContain("Create fixture foundation");
   });
 
   async function tempProject(name: string): Promise<string> {
     const root = await mkdtemp(join(tmpdir(), `inkos-${name}-flow-`));
     roots.push(root);
+    projects.set(root, scope.registerProject(root));
     await writeFile(join(root, "inkos.json"), JSON.stringify({ language: "en" }));
     return root;
   }

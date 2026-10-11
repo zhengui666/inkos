@@ -5,17 +5,31 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CodexFixture } from "./codex-fixture.js";
+import { CodexRuntimeFixtureScope, type RegisteredCodexProject } from "./fixtures/codex-runtime-fixture.js";
+import type { FixtureTurn } from "./codex-fixture.js";
 import { StateManager } from "../state/manager.js";
 import { createInitialRuntimeState, loadRuntimeStateSnapshot } from "../state/runtime-state-store.js";
 import { prepareStateReplay } from "../state/state-replay.js";
 import { WriterAgent } from "../agents/writer.js";
 import { StateValidatorAgent } from "../agents/state-validator.js";
 import { createLLMClient } from "../llm/provider.js";
+
+let scope: CodexRuntimeFixtureScope | undefined;
+let fixtureProject: RegisteredCodexProject | undefined;
 const roots: string[] = [];
-afterEach(async () => { codex.create.mockReset(); await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
+
+afterEach(async () => {
+  try { await scope?.drain(); }
+  finally {
+    codex.create.mockReset(); vi.restoreAllMocks(); vi.unstubAllEnvs();
+    await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
+    scope = undefined; fixtureProject = undefined;
+  }
+});
 
 it.each(["valid", "unsupported", "blank-authority"])("real replay workers review candidate summaries with the existing authority contract (%s)", async mode => {
+  vi.stubEnv("INKOS_CODEX_HOME", undefined);
+  vi.stubEnv("INKOS_CODEX_STATE_ROOT", undefined);
   const unsupported = mode === "unsupported";
   const marker = "UNSUPPORTED_SUMMARY_Lin_burns_archive";
   const root = await mkdtemp(join(tmpdir(), "inkos-replay-runtime-")); roots.push(root);
@@ -33,7 +47,7 @@ it.each(["valid", "unsupported", "blank-authority"])("real replay workers review
   await mkdir(join(root, ".inkos"));
   const settings = JSON.stringify({ model: "fixture", reasoningEffort: "medium", serviceTier: "default" });
   await writeFile(join(root, ".inkos/codex-config.json"), settings);
-  const peer = new CodexFixture(view => {
+  const reply = (view: FixtureTurn) => {
     const name = view.tools[0].function.name;
     if (name === "submit_runtime_state_delta") return { calls: [{ name, args: {
       postSettlement: "Entered archive", factOps: { upsert: [{ subject: "Lin", predicate: "location", object: "archive" }], expire: [] },
@@ -48,23 +62,51 @@ it.each(["valid", "unsupported", "blank-authority"])("real replay workers review
     expect(beforeCandidate).not.toContain(marker);
     return { calls: [{ name, args: { reconciliationRequired: unsupported,
       reportMarkdown: unsupported ? "Candidate summary claims Lin burns the archive, but the prose only enters it and finds a letter." : "" } }] };
-  });
-  codex.create.mockImplementation(async runtimeRoot => { expect(runtimeRoot).toBe(root); return peer.createClient(runtimeRoot); });
+  };
+  scope = new CodexRuntimeFixtureScope(); fixtureProject = scope.registerProject(root, { reply });
+  codex.create.mockReset().mockImplementation(scope.createClient);
   const client = createLLMClient({ service: "custom", provider: "openai", configSource: "studio", model: "fixture", apiKey: "fixture",
     baseUrl: "https://fixture.invalid/v1", apiFormat: "chat", stream: true, temperature: 0, thinkingBudget: 0 }, root);
   const originalProse = await readFile(prosePath);
-  const pending = prepareStateReplay({ projectRoot: root, bookId, baselineChapter: 0, createWorkers: isolatedRoot => {
+  const pending = scope.run(signal => prepareStateReplay({ projectRoot: root, bookId, baselineChapter: 0, signal, createWorkers: isolatedRoot => {
     expect(isolatedRoot).not.toBe(root);
     mkdirSync(join(isolatedRoot, ".inkos"));
     writeFileSync(join(isolatedRoot, ".inkos/codex-config.json"), "invalid settings must not be used");
     const context = { client, model: "fixture", bookId, projectRoot: isolatedRoot, runtimeProjectRoot: root };
     return { writer: new WriterAgent(context), validator: new StateValidatorAgent(context) };
-  } });
+  } }));
   if (unsupported) await expect(pending).rejects.toMatchObject({ code: "STATE_REPLAY_VALIDATION_FAILED" });
   else expect((await pending).chapters[0].delta.hookOps.upsert).toHaveLength(1);
-  expect(codex.create).toHaveBeenCalledTimes(2);
-  expect(peer.requests.filter(r => r.method === "thread/start").map(r => r.params.model)).toEqual(["fixture", "fixture"]);
   expect((await loadRuntimeStateSnapshot(bookDir)).manifest.lastAppliedChapter).toBe(0);
   expect(await readFile(prosePath)).toEqual(originalProse);
   expect(await readFile(join(root, ".inkos/codex-config.json"), "utf8")).toBe(settings);
+
+  const fixture = fixtureProject.fixture;
+  await fixture.drain();
+  expect(fixture.peers).toHaveLength(4);
+  expect(fixture.pendingTaskCount).toBe(0);
+  expect(fixture.peers.every(peer => peer.closed && peer.closeCount === 1)).toBe(true);
+  const threadStarts = fixture.requests.filter(request => request.method === "thread/start");
+  const turnStarts = fixture.requests.filter(request => request.method === "turn/start");
+  expect(threadStarts).toHaveLength(2);
+  expect(turnStarts).toHaveLength(2);
+  expect(threadStarts.map(request => request.params.model)).toEqual(["fixture", "fixture"]);
+  expect(turnStarts.map(request => request.params.model)).toEqual(["fixture", "fixture"]);
+  const threadPeerIds = new Set(threadStarts.map(request => request.peerId));
+  const turnPeerIds = new Set(turnStarts.map(request => request.peerId));
+  expect(threadPeerIds.size).toBe(2);
+  expect([...turnPeerIds].sort()).toEqual([...threadPeerIds].sort());
+  for (const peerId of threadPeerIds) {
+    expect(threadStarts.filter(request => request.peerId === peerId)).toHaveLength(1);
+    expect(turnStarts.filter(request => request.peerId === peerId)).toHaveLength(1);
+  }
+  expect(new Set(turnStarts.map(request => request.params.threadId)).size).toBe(2);
+  const authOnlyPeers = fixture.peers.filter(peer => !threadPeerIds.has(peer.id));
+  expect(authOnlyPeers).toHaveLength(2);
+  for (const peer of authOnlyPeers) {
+    expect(peer.requests.length).toBeGreaterThan(0);
+    expect(peer.requests.every(request => request.method === "account/read")).toBe(true);
+  }
+  expect(codex.create).toHaveBeenCalledTimes(4);
+  expect(codex.create.mock.calls.map(([runtimeRoot]) => runtimeRoot)).toEqual([root, root, root, root]);
 }, 15000);

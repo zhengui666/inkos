@@ -1,18 +1,33 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveEffectiveLLMConfig, type LLMConsumer } from "../utils/effective-llm-config.js";
 import { loadProjectConfig } from "../utils/config-loader.js";
 import { createLLMClient, chatCompletion } from "../llm/provider.js";
 import { resolveCoverGenerationRequest } from "../pipeline/short-fiction-runner.js";
+import { withRuntimeExecution } from "../runtime/execution.js";
 
 const roots: string[] = [];
-afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
+const codexClient = vi.hoisted(() => vi.fn(async () => { throw new Error("Codex fallback forbidden"); }));
+vi.mock("../codex/client.js", () => ({ createCodexClient: codexClient }));
+vi.mock("../runtime/auth/pi-native-store-compat.js", async () => {
+  const { createRequire } = await import("node:module");
+  return createRequire(import.meta.url)("../runtime/auth/pi-native-store-compat.ts");
+});
+afterEach(async () => {
+  vi.unstubAllGlobals(); vi.unstubAllEnvs();
+  await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
+});
 async function project(extra: Record<string, unknown> = {}) {
   const root = await mkdtemp(join(tmpdir(), "inkos-codex-config-")); roots.push(root);
   await writeFile(join(root, "inkos.json"), JSON.stringify({ name: "Codex only", version: "0.1.0", language: "en", ...extra }));
   return root;
+}
+async function emptyPiAgentDir() {
+  const dir = await mkdtemp(join(tmpdir(), "inkos-pi-empty-agent-")); roots.push(dir);
+  return dir;
 }
 const envLayers = { global: {}, project: {}, process: {} };
 
@@ -84,15 +99,67 @@ it('projects a saved native model as unknown metadata without writing defaults o
   expect(await readdir(join(root, '.inkos'))).toEqual(['codex-config.json']);
 });
 
-it('keeps an unassembled Pi desire intact and reports its disconnected execution path without falling back', async () => {
+it("projects a saved Pi intention without authenticating or persisting defaults", async () => {
   const root = await project();
-  await mkdir(join(root, '.inkos'));
-  const bytes = JSON.stringify({ schemaVersion: 1, revision: 9, selectedHarnessId: 'pi', modelConnectionRef: null,
-    harnessPreferences: { codex: { model: 'gpt-6.1-sol', effort: 'ultra', speed: 'priority' }, pi: { model: null, effort: null, speed: null } } });
-  await writeFile(join(root, '.inkos', 'agent-config.json'), bytes);
-  await expect(resolveEffectiveLLMConfig({ consumer: 'studio', projectRoot: root, envLayers, purpose: 'codex' }))
-    .rejects.toMatchObject({ code: 'RUNTIME_HARNESS_NOT_CONNECTED' });
-  expect(await readFile(join(root, '.inkos', 'agent-config.json'), 'utf8')).toBe(bytes);
-  const { readdir } = await import('node:fs/promises');
-  expect(await readdir(join(root, '.inkos'))).toEqual(['agent-config.json']);
+  const projectConfigBytes = await readFile(join(root, "inkos.json"), "utf8");
+  const agentDir = await emptyPiAgentDir();
+  vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+  expect(getAgentDir()).toBe(agentDir);
+  await mkdir(join(root, ".inkos"));
+  const bytes = JSON.stringify({ schemaVersion: 1, revision: 9, selectedHarnessId: "pi", modelConnectionRef: null,
+    harnessPreferences: { codex: { model: "gpt-6.1-sol", effort: "ultra", speed: "priority" }, pi: { model: null, effort: null, speed: null } } });
+  await writeFile(join(root, ".inkos", "agent-config.json"), bytes);
+  const projectEntries = await readdir(root);
+  const settingsEntries = await readdir(join(root, ".inkos"));
+  const result = await resolveEffectiveLLMConfig({ consumer: "studio", projectRoot: root, envLayers, purpose: "codex" });
+  expect(result.llm).toMatchObject({ service: "pi", model: "pi-default", apiKey: "" });
+  expect(result.diagnostics).toMatchObject({ configMode: "pi", modelSource: "agent-settings" });
+  const runtimeResult = await resolveEffectiveLLMConfig({ consumer: "studio", projectRoot: root, envLayers, purpose: "runtime" });
+  expect(runtimeResult.llm).toEqual(result.llm);
+  const client = createLLMClient(result.llm, root);
+  expect(client._runtime).toEqual({ projectRoot: root, harnessId: "pi" });
+  expect(client._codex).toBeUndefined();
+  expect(client._piModel).toBeUndefined();
+  expect(client._apiKey).toBeUndefined();
+  await expect(chatCompletion(client, result.llm.model, [{ role: "user", content: "Do not send" }]))
+    .rejects.toThrow("explicit provider configuration");
+  expect(await readFile(join(root, ".inkos", "agent-config.json"), "utf8")).toBe(bytes);
+  expect(await readFile(join(root, "inkos.json"), "utf8")).toBe(projectConfigBytes);
+  expect(await readdir(root)).toEqual(projectEntries);
+  expect(await readdir(join(root, ".inkos"))).toEqual(settingsEntries);
+  expect(await readdir(agentDir)).toEqual([]);
+});
+
+it("rejects a real unauthenticated Pi run before work or Codex/network fallback", async () => {
+  const root = await project();
+  const projectConfigBytes = await readFile(join(root, "inkos.json"), "utf8");
+  const agentDir = await emptyPiAgentDir();
+  vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+  expect(getAgentDir()).toBe(agentDir);
+  await mkdir(join(root, ".inkos"));
+  const bytes = JSON.stringify({ schemaVersion: 1, revision: 9, selectedHarnessId: "pi", modelConnectionRef: null,
+    harnessPreferences: { codex: { model: "gpt-6.1-sol", effort: "ultra", speed: "priority" }, pi: { model: null, effort: null, speed: null } } });
+  const settingsPath = join(root, ".inkos", "agent-config.json");
+  await writeFile(settingsPath, bytes);
+  const projectEntries = await readdir(root);
+  const settingsEntries = await readdir(join(root, ".inkos"));
+  const agentEntries = await readdir(agentDir);
+  const fetchSentinel = vi.fn(() => { throw new Error("Network forbidden"); });
+  vi.stubGlobal("fetch", fetchSentinel);
+  codexClient.mockClear();
+  const bodySpy = vi.fn(async () => undefined);
+
+  await expect(withRuntimeExecution(root, bodySpy)).rejects.toMatchObject({
+    code: "RUNTIME_AUTH_REVOKED", message: "Pi requires an existing ChatGPT OAuth credential",
+  });
+  expect(bodySpy).not.toHaveBeenCalled();
+  expect(codexClient).not.toHaveBeenCalled();
+  expect(fetchSentinel).not.toHaveBeenCalled();
+  expect(await readFile(settingsPath, "utf8")).toBe(bytes);
+  expect(await readFile(join(root, "inkos.json"), "utf8")).toBe(projectConfigBytes);
+  expect(await readdir(root)).toEqual(projectEntries);
+  expect(await readdir(join(root, ".inkos"))).toEqual(settingsEntries);
+  expect(await readdir(agentDir)).toEqual(agentEntries);
+  expect(agentEntries).not.toContain("inkos-connection.json");
+  expect(agentEntries).not.toContain("auth.json");
 });

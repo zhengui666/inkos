@@ -467,6 +467,10 @@ export class Agent {
       unsubscribeNotification();
       unsubscribeRequest();
       unsubscribeClose();
+      if (this.interruptPromise) {
+        try { await this.interruptPromise; }
+        catch { /* Retain the turn failure; closing the peer below still stops it. */ }
+      }
       try { await this.client?.close(); }
       catch (cleanupError) {
         // Includes failed turn/completed, which returns a failed assistant

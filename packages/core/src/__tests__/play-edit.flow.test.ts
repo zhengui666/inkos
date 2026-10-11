@@ -1,5 +1,6 @@
 import{mkdtemp,rm,writeFile}from'node:fs/promises';import{tmpdir}from'node:os';import{join}from'node:path';
-import{it,expect}from'vitest';
+import{afterEach,beforeEach,it,expect,vi}from'vitest';
+import{CodexRuntimeFixtureScope}from'./fixtures/codex-runtime-fixture.js';
 import{PlayStore}from'../play/play-store.js';import{createPlayDB}from'../play/play-db-factory.js';
 import{createPlayEditTool,createPlayReviseTool}from'../agent/agent-tools.js';
 import{PipelineRunner}from'../pipeline/runner.js';import{createLLMClient}from'../llm/provider.js';
@@ -11,8 +12,23 @@ import{syncWorkSourceArtifacts}from'../harness/source-sync.js';
 import{loadWorkManifest}from'../harness/work-store.js';
 import{readArtifactRevision}from'../harness/artifact-reader.js';
 
+const fixtureMocks=vi.hoisted(()=>({createClient:vi.fn()}));
+vi.mock('../codex/client.js',()=>({createCodexClient:fixtureMocks.createClient}));
+let runtimeScope:CodexRuntimeFixtureScope|undefined;
+beforeEach(()=>{
+ vi.stubEnv('INKOS_CODEX_HOME',undefined);vi.stubEnv('INKOS_CODEX_STATE_ROOT',undefined);
+ runtimeScope=new CodexRuntimeFixtureScope();fixtureMocks.createClient.mockReset().mockImplementation(runtimeScope.createClient);
+});
+async function drainRuntimeFixture(){
+ const current=runtimeScope;runtimeScope=undefined;
+ try{if(current)await current.drain();}
+ finally{fixtureMocks.createClient.mockReset();vi.restoreAllMocks();vi.unstubAllEnvs();}
+}
+afterEach(async()=>{await drainRuntimeFixture();});
+
 it('inspects exact world identities, rejects a guessed ID before any mutation and edits the original entities without advancing time',async()=>{
  const root=await mkdtemp(join(tmpdir(),'inkos-play-edit-'));
+ const project=runtimeScope!.registerProject(root);
  try{
   const store=new PlayStore(root);
   await store.createWorld({id:'world',title:'Fixture',premise:'Original premise',worldContract:'One action per turn',visualContract:'',mode:'guided',language:'en'});
@@ -82,8 +98,11 @@ it('inspects exact world identities, rejects a guessed ID before any mutation an
     },
   }});
   const client=createLLMClient({service:'custom',provider:'openai',configSource:'studio',model:'fixture',apiKey:'fixture',baseUrl:'http://127.0.0.1:1/v1',apiFormat:'chat',stream:true,temperature:0,thinkingBudget:0});
-  const proseTool=createPlayReviseTool(new PipelineRunner({client,model:'fixture',projectRoot:root}),root,'world',{runnerFactory:()=>rerender});
-  const proseResult=await proseTool.execute('rewrite',{action:'rewrite_scene',instruction:'Rephrase only'});
+  const pipeline=new PipelineRunner({client,model:'fixture',projectRoot:root});
+  const proseTool=createPlayReviseTool(pipeline,root,'world',{runnerFactory:()=>rerender});
+  const proseResult=await runtimeScope!.run(signal=>proseTool.execute('rewrite',{action:'rewrite_scene',instruction:'Rephrase only'},signal));
+  expect(project.fixture.requests.some(({method})=>method==='account/read')).toBe(true);
+  expect(project.fixture.turns).toHaveLength(0);
   expect(proseResult.details).toMatchObject({suggestedActions:choices});
   const afterReplayDB=createPlayDB(store.runDir('world','main'));
   const afterReplay=await store.captureRunSnapshot('world','main',{id:'after-rewrite',turn:2,graph:afterReplayDB.snapshot()});
@@ -126,5 +145,5 @@ it('inspects exact world identities, rejects a guessed ID before any mutation an
   };}}}});
   try{await expect(invalid.step('Wait')).rejects.toMatchObject({code:'PLAY_CHOICE_COUNT_MISMATCH',expected:2,actual:3});}finally{invalid.close();}
   expect((await store.readEvents('world','main')).length).toBe(2);
- }finally{await rm(root,{recursive:true,force:true});}
+ }finally{try{await drainRuntimeFixture();}finally{await rm(root,{recursive:true,force:true});}}
 });

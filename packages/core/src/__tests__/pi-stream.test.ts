@@ -711,7 +711,9 @@ describe("guardedPiNonStreaming", () => {
     expect(fetchWithProxyMock).toHaveBeenCalledTimes(2);
     expect(result.storyTitle).toBe("Story");
     expect(result.rawContent).toBe(`Story premise and ending\n\n## Chapter 1\n\n${chapterOne}\n\n## Chapter 2\n\n${chapterTwo}`);
-    expect(codex.requests.find(request=>request.method==='turn/start')?.params).toMatchObject({ effort: 'ultra', serviceTier: 'priority' });
+    const turn=codex.requests.find(request=>request.method==='turn/start')?.params;
+    expect(turn).toMatchObject({ effort: 'ultra', serviceTierForTurn: 'priority' });
+    expect(turn).not.toHaveProperty('serviceTier');
   });
 
   it("adapts a non-streaming tool call back into Pi events", async () => {

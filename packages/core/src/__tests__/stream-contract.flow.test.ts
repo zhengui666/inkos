@@ -198,7 +198,9 @@ it('carries the required result schema through Codex dynamic tools and preserves
   expect(progress.at(-1)?.totalChars).toBeGreaterThan(0);
   const thread=codex.requests.find(request=>request.method==='thread/start')!.params;
   expect(thread).toMatchObject({model:'gpt-6.1-sol',serviceTier:'priority',ephemeral:true,approvalPolicy:'never',sandbox:'read-only'});
-  expect(codex.requests.find(request=>request.method==='turn/start')?.params).toMatchObject({effort:'ultra',serviceTier:'priority'});
+  const turn=codex.requests.find(request=>request.method==='turn/start')?.params;
+  expect(turn).toMatchObject({effort:'ultra',serviceTierForTurn:'priority'});
+  expect(turn).not.toHaveProperty('serviceTier');
   expect(thread.dynamicTools).toHaveLength(1);
   expect(thread.dynamicTools[0]).toMatchObject({name:'submit_value',inputSchema:{required:['value','flags']}});
   expect(thread.baseInstructions).toContain('native outputSchema envelope');
