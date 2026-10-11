@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { openHarnessDatabase } from '../harness/sqlite.js';
 import { goalInputValue } from '../goals/contracts.js';
-import { CreationRequestSchema, CreationPlanSchema, creationError, canResumeCreationTask, type CreationTask, type CreationRequest, type CreationPlan } from './contracts.js';
+import { CreationRequestSchema, CreationPlanSchema, effectiveCreationDeliveryMode, creationError, canResumeCreationTask, type CreationTask, type CreationRequest, type CreationPlan } from './contracts.js';
 
 /** Intake and user controls share the existing ledger, never an in-memory job queue. */
 export class CreationTaskStore {
@@ -28,12 +28,17 @@ export class CreationTaskStore {
       const row = this.db.prepare('SELECT data_json FROM creation_tasks WHERE id=?').get(request.id);
       if (row) {
         const prior: CreationTask = JSON.parse(String(row.data_json));
-        if (goalInputValue(prior.request) !== goalInputValue(request)) throw creationError('CREATION_ID_CONFLICT', 'This request ID already belongs to another brief.');
+        if (goalInputValue({ ...prior.request, deliveryMode: effectiveCreationDeliveryMode(prior.request) })
+          !== goalInputValue({ ...request, deliveryMode: effectiveCreationDeliveryMode(request) })) {
+          throw creationError('CREATION_ID_CONFLICT', 'This request ID already belongs to another brief or delivery mode.');
+        }
         return prior;
       }
       const task: CreationTask = { id: request.id, workId: `creation-${request.id}`, request,
         plan: CreationPlanSchema.parse(plan), planStatus: 'provisional', version: 0, desiredState: 'run', phase: plan.platform ? 'queued' : 'blocked',
-        ...(plan.platform ? {} : { error: { code: 'CREATION_PLATFORM_REQUIRED', message: 'Choose the publishing platform in this task’s plan. No destination was guessed.' } }),
+        ...(plan.platform ? {} : { error: { code: 'CREATION_PLATFORM_REQUIRED', message: effectiveCreationDeliveryMode(request) === 'manuscript'
+          ? 'Choose a creative target platform in this task’s plan. No platform was guessed.'
+          : 'Choose the publishing platform in this task’s plan. No destination was guessed.' } }),
         foundation: 'pending', foundationAttempts: 0, foundationFailures: 0, nextAttemptAt: now, createdAt: now, updatedAt: now };
       this.db.prepare('INSERT INTO creation_tasks(id,work_id,data_json) VALUES(?,?,?)').run(task.id, task.workId, JSON.stringify(task));
       return task;
@@ -44,7 +49,8 @@ export class CreationTaskStore {
     return this.transaction(() => {
       const current = this.get(id);
       if (version !== undefined && current.version !== version) throw creationError('CREATION_VERSION_CONFLICT', 'Task changed. Refresh before retrying this action.');
-      const next = { ...change(current), id: current.id, workId: current.workId, request: current.request,
+      const request = structuredClone(current.request);
+      const next = { ...change(current), id: current.id, workId: current.workId, request,
         version: current.version + 1, updatedAt: Date.now() };
       this.db.prepare('UPDATE creation_tasks SET data_json=? WHERE id=?').run(JSON.stringify(next), id);
       return next;

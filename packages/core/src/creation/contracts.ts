@@ -2,12 +2,18 @@ import { z } from 'zod';
 import type { BookConfig } from '../models/book.js';
 import type { ProjectConfig } from '../models/project.js';
 
+export const CreationDeliveryModeSchema = z.enum(['manuscript', 'publish']);
+export type CreationDeliveryMode = z.infer<typeof CreationDeliveryModeSchema>;
 export const CreationRequestSchema = z.object({
   id: z.string().uuid(),
   kind: z.enum(['long', 'short']),
   brief: z.string().trim().min(5).max(4000),
+  deliveryMode: CreationDeliveryModeSchema.optional(),
 }).strict();
 export type CreationRequest = z.infer<typeof CreationRequestSchema>;
+export function effectiveCreationDeliveryMode(request: CreationRequest): CreationDeliveryMode {
+  return request.deliveryMode === undefined ? 'publish' : CreationDeliveryModeSchema.parse(request.deliveryMode);
+}
 export const CreationPlanSchema = z.object({
   title: z.string().trim().min(1).max(120),
   genre: z.string().trim().min(1).max(100),
@@ -48,7 +54,9 @@ export function inferCreationPlan(request: CreationRequest, config: Pick<Project
   });
 }
 export function creationBook(task: CreationTask): BookConfig {
-  if (!task.plan.platform) throw creationError('CREATION_PLATFORM_REQUIRED', 'Choose a publishing platform in this task’s plan. No destination was guessed.');
+  if (!task.plan.platform) throw creationError('CREATION_PLATFORM_REQUIRED', effectiveCreationDeliveryMode(task.request) === 'manuscript'
+    ? 'Choose a creative target platform in this task’s plan. No platform was guessed.'
+    : 'Choose a publishing platform in this task’s plan. No destination was guessed.');
   const {blurb: _blurb, ...bookPlan} = task.plan;
   return { ...bookPlan, platform: task.plan.platform, id: task.workId, status: 'outlining',
     createdAt: new Date(task.createdAt).toISOString(), updatedAt: new Date(task.updatedAt).toISOString() };
