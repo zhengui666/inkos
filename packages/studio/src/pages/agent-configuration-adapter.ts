@@ -1,6 +1,6 @@
-import type { ConfigurationView, SelectionView, TargetView, TextView } from "../components/agent-configuration-ui/view-model";
+import type { ConfigurationView, PiAuthenticationView, SelectionView, TargetView, TextView } from "../components/agent-configuration-ui/view-model";
 import { isExecutionReady } from "../components/agent-configuration-ui/display-state";
-import { catalogMatchesState, samePreferences, sameScope, validScope, type HarnessPreferences, type HarnessState } from "../shared/agent-configuration";
+import { catalogMatchesState, samePreferences, sameScope, validScope, type HarnessPreferences, type HarnessState, type PiAuthenticationCapabilities, type StudioPiLoginAttempt, type StudioPiCloseResult } from "../shared/agent-configuration";
 
 export const toSelection = (value: HarnessPreferences): SelectionView => ({ modelKey: value.model, reasoningKey: value.effort, speedKey: value.speed });
 export const toPreferences = (value: SelectionView): HarnessPreferences => ({ model: value.modelKey, effort: value.reasoningKey, speed: value.speedKey });
@@ -15,6 +15,12 @@ export interface ConfigurationAdapterInput {
   readonly savePhase: ConfigurationView["save"]["phase"];
   readonly saveDetail?: TextView;
   readonly submitted?: HarnessPreferences;
+  readonly piLoginAttempt?: StudioPiLoginAttempt | null;
+  readonly piCapabilities?: PiAuthenticationCapabilities | null;
+  readonly piAuthBusy?: PiAuthenticationView["busy"];
+  readonly piCanClose?: boolean;
+  readonly piCloseResult?: StudioPiCloseResult;
+  readonly piAuthDetail?: TextView;
 }
 /** Pure mapping of actual owner observations. No doctor, save, descriptor or resolver implies execution. */
 export function adaptAgentConfiguration(input: ConfigurationAdapterInput): ConfigurationView {
@@ -33,12 +39,24 @@ export function adaptAgentConfiguration(input: ConfigurationAdapterInput): Confi
   const connectionObserved = state?.account?.type === "chatgpt";
   const localPhase = target.harness === "pi" && state?.localAuthentication
     ? state.localAuthentication === "oauth-present" ? "oauth-present" : state.localAuthentication === "missing" ? "signed-out" : "unverified" : undefined;
-  const connectionPhase = localPhase ?? (state?.connection?.phase === "signing-in" ? "signing-in" : connectionObserved ? "signed-in"
+  const piAttempt = target.harness === "pi" && input.piLoginAttempt?.harnessId === "pi" ? input.piLoginAttempt : null;
+  const piSaved = piAttempt?.status === "saved";
+  const piPending = piAttempt && ["reserved", "starting", "awaiting-user", "exchanging", "closing"].includes(piAttempt.status);
+  const connectionPhase = piSaved ? "oauth-present" : piPending ? "signing-in" : localPhase ?? (state?.connection?.phase === "signing-in" ? "signing-in" : connectionObserved ? "signed-in"
     : state?.connection && state.connection.phase !== "signed-in" ? state.connection.phase : "unverified");
   const ready = execution?.phase === "ready" && connectionObserved && state?.installation === "installed" && catalog !== null && nativeValid
     && catalog.value.supportsChatGptOauth && catalog.value.supportsTools && catalog.value.supportsStreaming;
   const view: ConfigurationView = {
     target, selection: toSelection(draft),
+    ...(target.harness === "pi" ? { piAuthentication: {
+      target, phase: piAttempt?.status ?? "idle", capabilities: input.piCapabilities ?? { canStartLogin: false, canCloseAttempt: false, canReply: false, canLogout: false },
+      busy: input.piAuthBusy ?? null, canClose: input.piCanClose ?? false, catalogConfirmed: !!catalog && nativeValid,
+      ...(piAttempt ? { handle: piAttempt.handle } : {}),
+      ...(piAttempt?.canReply && piAttempt.prompt?.kind === "callback-url" ? { promptId: piAttempt.prompt.promptId } : {}),
+      ...(piAttempt?.challenge?.kind === "open-url" ? { authorizationUrl: piAttempt.challenge.url } : {}),
+      ...(input.piCloseResult && piAttempt && input.piCloseResult.attempt.handle === piAttempt.handle ? { closeOutcome: input.piCloseResult.outcome } : {}),
+      ...(input.piAuthDetail ? { detail: input.piAuthDetail } : {}),
+    } } : {}),
     installation: { target, phase: installation === "installed" ? "installed" : installation === "missing" ? "missing" : "unverified" },
     connection: { target, phase: connectionPhase,
       ...(state?.connection?.phase === "signing-in" && state.connection.login?.status === "pending" ? { attemptKey: state.connection.login.loginId } : {}),

@@ -2,10 +2,18 @@ import { ApiResponseError, fetchJson } from "./use-api";
 import type { SaveIntent, SelectionIntent, TargetView, TextView, ConnectionIntent } from "../components/agent-configuration-ui/view-model";
 import { sameTarget } from "../components/agent-configuration-ui/view-model";
 import { toPreferences } from "../pages/agent-configuration-adapter";
-import { samePreferences, validScope, type AgentSettings, type HarnessId, type HarnessPreferences, type HarnessState, type SettingsUpdate, type DeviceLoginAttemptReservation, type DeviceLoginAttemptCloseResult } from "../shared/agent-configuration";
+import { samePreferences, validScope, type AgentSettings, type HarnessId, type HarnessPreferences, type HarnessState, type SettingsUpdate, type DeviceLoginAttemptReservation, type DeviceLoginAttemptCloseResult, type StudioPiLoginAttempt, type StudioPiCloseResult, type PiAuthenticationCapabilities, type StudioPiAccountErrorCode } from "../shared/agent-configuration";
 import type { StudioCodexLogin } from "../shared/codex";
 
+export interface PiAuthenticationTransport {
+  reserveLogin(signal: AbortSignal): Promise<StudioPiLoginAttempt>;
+  startLogin(attemptHandle: string, signal: AbortSignal): Promise<StudioPiLoginAttempt>;
+  readLogin(attemptHandle: string, signal: AbortSignal): Promise<StudioPiLoginAttempt>;
+  replyLogin(attemptHandle: string, promptId: string, callbackUrl: string, signal: AbortSignal): Promise<StudioPiLoginAttempt>;
+  closeLogin(attemptHandle: string, signal: AbortSignal): Promise<StudioPiCloseResult>;
+}
 export interface AgentConfigurationTransport {
+  readonly pi?: PiAuthenticationTransport;
   readSettings(signal: AbortSignal): Promise<AgentSettings>;
   saveSettings(request: SettingsUpdate, signal: AbortSignal): Promise<AgentSettings>;
   readHarnessState(harness: HarnessId, signal: AbortSignal): Promise<HarnessState>;
@@ -19,7 +27,17 @@ export function createAgentConfigurationTransport(fetchImpl?: typeof fetch): Age
   const post = <T>(action: string, body: unknown, signal: AbortSignal, keepalive = false) => fetchJson<T>(`/agent-configuration/harnesses/codex/${action}`, {
     method: "POST", signal, keepalive, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   }, { fetchImpl });
+  const piPost = <T>(action: string, body: unknown, signal: AbortSignal, keepalive = false) => fetchJson<T>(`/agent-configuration/harnesses/pi/login/${action}`, {
+    method: "POST", signal, keepalive, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  }, { fetchImpl });
   return {
+    pi: {
+      reserveLogin: async signal => (await piPost<{ attempt: StudioPiLoginAttempt }>("reserve", {}, signal)).attempt,
+      startLogin: async (attemptHandle, signal) => (await piPost<{ attempt: StudioPiLoginAttempt }>("start", { attemptHandle }, signal)).attempt,
+      readLogin: async (attemptHandle, signal) => (await fetchJson<{ attempt: StudioPiLoginAttempt }>(`/agent-configuration/harnesses/pi/login/attempts/${encodeURIComponent(attemptHandle)}?wait=1`, { signal }, { fetchImpl })).attempt,
+      replyLogin: async (attemptHandle, promptId, callbackUrl, signal) => (await piPost<{ attempt: StudioPiLoginAttempt }>("reply", { attemptHandle, promptId, callbackUrl }, signal)).attempt,
+      closeLogin: async (attemptHandle, signal) => (await piPost<{ result: StudioPiCloseResult }>("close", { attemptHandle }, signal, true)).result,
+    },
     readSettings: async signal => (await fetchJson<{ settings: AgentSettings }>("/agent-configuration/settings", { signal }, { fetchImpl })).settings,
     saveSettings: async (request, signal) => (await fetchJson<{ settings: AgentSettings }>("/agent-configuration/settings", {
       method: "PUT", signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(request),
@@ -65,6 +83,13 @@ export interface AgentConfigurationSnapshot {
   readonly authCloseResult?: DeviceLoginAttemptCloseResult;
   readonly authCloseScope?: "connection" | "attempt";
   readonly canCloseConnection: boolean;
+  readonly piLoginAttempt: StudioPiLoginAttempt | null;
+  readonly piAuthBusy: "reserve" | "start" | "reply" | "close" | null;
+  readonly piCapabilities: PiAuthenticationCapabilities | null;
+  /** Also permits recording Close while this local reservation is still pending. */
+  readonly piCanClose: boolean;
+  readonly piAuthDetail?: TextView;
+  readonly piCloseResult?: StudioPiCloseResult;
 }
 class RequestTimeout extends Error {}
 const key = (target: TargetView) => JSON.stringify([target.harness, target.contextKey]);
@@ -100,6 +125,72 @@ interface LoginAttempt {
 // In-memory correlation only. Returning to this transport can settle a known attempt;
 // no observed login ID is promoted into authority and nothing is persisted in the browser.
 const knownAttempts = new WeakMap<AgentConfigurationTransport, Map<string, LoginAttempt>>();
+interface PiAttemptRecord {
+  readonly target: TargetView;
+  dto?: StudioPiLoginAttempt;
+  detached: boolean;
+  closeRequested: boolean;
+  closePromise?: Promise<void>;
+  closeResult?: StudioPiCloseResult;
+  closeUncertain?: boolean;
+  closeDetail?: TextView;
+}
+// Pi handles are local correlation for one transport/context, never credentials.
+// Detaching browser work does not close the service-owned attempt or replay start.
+const knownPiAttempts = new WeakMap<AgentConfigurationTransport, Map<string, PiAttemptRecord>>();
+const piTerminal = (value: StudioPiLoginAttempt) => ["saved", "closed", "failed", "unknown"].includes(value.status);
+function freezePiAttempt(value: StudioPiLoginAttempt, handle?: string): StudioPiLoginAttempt {
+  if (value.harnessId !== "pi" || !value.handle || (handle !== undefined && value.handle !== handle)) throw new Error("Pi returned a different attempt");
+  return Object.freeze({ harnessId: value.harnessId, handle: value.handle, status: value.status, expiresAt: value.expiresAt,
+    canReply: value.canReply, challenge: value.challenge ? Object.freeze({ ...value.challenge }) : null,
+    prompt: value.prompt ? Object.freeze({ ...value.prompt }) : null, error: value.error });
+}
+const piUncertain = { zh: "原 Pi 登录尝试的操作结果不确定；请核对同一标识。不会自动重播登录或回调，当前在线账号与执行尚未验证。", en: "The original Pi attempt's outcome is uncertain. Check the same handle; login and callback will not be replayed automatically. The current online account and execution remain unverified." };
+const piErrorCopy: Record<StudioPiAccountErrorCode, TextView> = {
+  "unknown-handle": { zh: "原 Pi 尝试标识未知；不会启动新的登录。", en: "The original Pi attempt handle is unknown; a new sign-in will not be started." },
+  "attempt-expired": { zh: "原 Pi 登录预留已过期；不会自动重新预留。", en: "The original Pi reservation expired; it will not be reserved again automatically." },
+  "too-many-attempts": { zh: "Pi 登录尝试过多；请核对现有尝试。", en: "There are too many Pi attempts; check existing attempts." },
+  "scope-busy": { zh: "Pi 登录上下文忙碌；请核对现有尝试。", en: "The Pi login scope is busy; check the existing attempt." },
+  "owner-changed": { zh: "原 Pi 尝试的所有者已改变；当前连接观察独立。", en: "The original Pi attempt owner changed; the current connection observation is separate." },
+  "context-changed": { zh: "原 Pi 尝试上下文已改变；请核对当前入口。", en: "The original Pi attempt context changed; check the current entry." },
+  "prompt-not-current": { zh: "回调提示已不是当前提示；请读取本次尝试。", en: "The callback prompt is not current; read this attempt again." },
+  "service-stopped": { zh: "Pi 认证服务已停止；请核对服务状态。", en: "The Pi authentication service stopped; check the service." },
+  "sdk-unavailable": { zh: "Pi SDK 不可用；服务可能缓存加载失败。修复服务环境并重启服务后再显式尝试；点击重试不保证恢复。", en: "The Pi SDK is unavailable. The service may cache its load failure; fix the service setup and restart it before a new explicit attempt. Retry is not guaranteed to restore it." },
+  "device-settings-invalid": { zh: "Pi 登录设备设置无效；请修复服务端设置。", en: "Pi login device settings are invalid; correct the server settings." },
+  "login-deployment-unavailable": { zh: "本次部署无法使用 Pi 登录；部署资格尚未验证，请核对服务端环境。", en: "Pi login is unavailable in this deployment. Deployment eligibility remains unverified; check the server environment." },
+  "login-failed": { zh: "本次 Pi 登录失败；不会自动重播登录或回调。", en: "This Pi sign-in failed; login and callback will not be replayed automatically." },
+  "storage-failed": { zh: "本次 Pi 本地 OAuth 存储失败；请核对存储。", en: "This Pi attempt failed to store local OAuth; check storage." },
+  "unsupported": { zh: "本次 Pi 认证操作不受支持。", en: "This Pi authentication operation is unsupported." },
+};
+function piCodeDescription(code: StudioPiAccountErrorCode): TextView {
+  const copy = piErrorCopy[code];
+  return { zh: `${copy.zh}（${code}）在线账号与执行尚未验证。`, en: `${copy.en} (${code}) The online account and execution remain unverified.` };
+}
+function piFailureDescription(error: unknown): TextView {
+  // Only the finite public error code is trusted for copy. SDK text, cause,
+  // callback contents and arbitrary HTTP messages never enter a snapshot.
+  if (error instanceof ApiResponseError && error.payload && typeof error.payload === "object" && "error" in error.payload) {
+    const value = (error.payload as { error?: { code?: unknown } }).error;
+    const code = value && typeof value === "object" ? value.code : undefined;
+    const native = typeof code === "string" && code.startsWith("PI_") ? code.slice(3).toLowerCase().replaceAll("_", "-") : "";
+    if (Object.hasOwn(piErrorCopy, native)) return piCodeDescription(native as StudioPiAccountErrorCode);
+    if (code === "PI_INVALID_REQUEST" || code === "PI_INVALID_ATTEMPT" || code === "PI_SERVICE_UNAVAILABLE" || code === "PI_LOGOUT_UNSUPPORTED")
+      return { zh: `Pi 认证请求被拒绝或服务不可用（${code}）；在线账号与执行尚未验证。`, en: `Pi authentication was rejected or unavailable (${code}); the online account and execution remain unverified.` };
+  }
+  return piUncertain;
+}
+function piAttemptDescription(value: StudioPiLoginAttempt): TextView {
+  if (value.error) return piCodeDescription(value.error);
+  if (value.status === "saved") return { zh: "本次 Pi 本地 OAuth 已保存；在线账号、模型权限与执行尚未验证。", en: "This Pi attempt saved local OAuth. The online account, model access and execution remain unverified." };
+  if (value.status === "closed") return { zh: "原 Pi 登录尝试已关闭；这不会退出已有账号。当前连接与执行观察独立。", en: "The original Pi attempt is closed. This does not sign out an existing account; current connection and execution observations are separate." };
+  if (value.status === "unknown") return piUncertain;
+  return { zh: "Pi 登录尝试已观察；请使用本次链接和当前回调提示。在线账号与执行尚未验证。", en: "Pi sign-in attempt observed. Use this attempt's link and current callback prompt; the online account and execution remain unverified." };
+}
+function piCloseDescription(result: StudioPiCloseResult): TextView {
+  if (result.outcome === "unknown") return result.attempt.error ? { zh: `${piUncertain.zh}${piCodeDescription(result.attempt.error).zh}`, en: `${piUncertain.en} ${piCodeDescription(result.attempt.error).en}` } : piUncertain;
+  if (result.outcome === "already-committed") return { zh: "原 Pi 尝试已提交本地 OAuth，无法撤销；Close 不会退出账号。当前在线账号与执行尚未验证。", en: "The original Pi attempt already committed local OAuth and cannot be undone. Close does not sign out; the current online account and execution remain unverified." };
+  return piAttemptDescription(result.attempt);
+}
 function closeDescription(result: DeviceLoginAttemptCloseResult): TextView {
   if (result.state === "already-terminal") return { zh: "本次登录已完成结算，可能已登录；Close 不会退出账号。请核对连接状态。执行尚未验证。", en: "This sign-in is already terminal and may be signed in. Close does not sign out. Check connection status; execution remains unverified." };
   if (result.state === "unknown-or-expired") return { zh: "本次尝试标识未知或已过期；无法确认取消结果。执行尚未验证。", en: "This attempt is unknown or expired; cancellation cannot be confirmed. Execution remains unverified." };
@@ -133,6 +224,16 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   let entryEdits = 0;
   let authDetail: TextView | undefined;
   let authCloseResult: DeviceLoginAttemptCloseResult | undefined;
+  let piAuthDetail: TextView | undefined;
+  let piCloseResult: StudioPiCloseResult | undefined;
+  let piView: PiAttemptRecord | null = null;
+  type PiOperation = { action: "reserve" | "start" | "reply"; token: ReturnType<typeof capture>; attempt: PiAttemptRecord };
+  type PiCloseObservation = { attempt: PiAttemptRecord; token: ReturnType<typeof capture>; promise: Promise<void> };
+  let piOperation: PiOperation | null = null;
+  let piClosing: PiCloseObservation | null = null;
+  let piReadEpoch = 0;
+  const piAttempts = knownPiAttempts.get(transport) ?? new Map<string, PiAttemptRecord>();
+  knownPiAttempts.set(transport, piAttempts);
   type AuthenticationOperation = { action: "login" | "logout" | "bind"; token: ReturnType<typeof capture>; closeRequested: boolean; attempt?: LoginAttempt };
   type CloseObservation = { attempt: LoginAttempt; token: ReturnType<typeof capture>; promise: Promise<void>; completion?: Promise<void> };
   let closing: CloseObservation | null = null;
@@ -164,6 +265,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   const drafts = new Map<string, Draft>();
   const listeners = new Set<() => void>();
   const requests = new Set<AbortController>();
+  const piRequests = new Set<AbortController>();
   const draft = (): Draft => drafts.get(key(target)) ?? { preferences: baseline?.harnessPreferences[target.harness] ?? empty(), baselineRevision: baseline?.revision ?? null, edits: 0, dirty: false };
   let snapshot: AgentConfigurationSnapshot;
   function publish() {
@@ -182,13 +284,33 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     const hasChanges = baseline !== null && (baseline.selectedHarnessId !== target.harness || !samePreferences(currentDraft.preferences, baseline.harnessPreferences[target.harness]));
     const closeAttempt = closeReceiptOwner?.attempt ?? (closing && current(closing.token) ? closing.attempt : undefined);
     snapshot = Object.freeze({ target, ownerGeneration, baseline, revision: currentDraft.baselineRevision, draft: currentDraft.preferences, retainedDrafts: currentDraft.retained ?? Object.freeze([]), state, submitted, loading, savePhase, detail, hasChanges, reviewable,
-      authBusy: closing && current(closing.token) ? "cancel" : authentication?.action ?? null, authBlocking: blockingAuthentication(), authDetail, authCloseResult,
+      authBusy: target.harness === "pi" ? piClosing && currentPi(piClosing.token) ? "cancel" : piOperation && currentPi(piOperation.token) ? "login" : null : closing && current(closing.token) ? "cancel" : authentication?.action ?? null,
+      authBlocking: target.harness === "pi" ? piOperation && currentPi(piOperation.token) ? "login" : null : blockingAuthentication(), authDetail, authCloseResult,
+      piLoginAttempt: target.harness === "pi" && piView ? piView.dto ?? null : null,
+      piAuthBusy: target.harness === "pi" ? piClosing && currentPi(piClosing.token) ? "close" : piOperation && currentPi(piOperation.token) ? piOperation.action : null : null,
+      piCapabilities: target.harness === "pi" ? { canStartLogin: !!transport.pi, canCloseAttempt: !!(piView?.dto && !contextInvalid && (!piView.closeResult || piView.closeUncertain || piView.closeResult.outcome === "unknown")),
+        canReply: !!(piView?.dto?.canReply && piView.dto.prompt && !piView.closeRequested && !piOperation && !contextInvalid), canLogout: false as const } : null,
+      piCanClose: target.harness === "pi" && !contextInvalid && !!(piView && (!piView.closeResult || piView.closeUncertain || piView.closeResult.outcome === "unknown")),
+      piAuthDetail: target.harness === "pi" ? piAuthDetail : undefined, piCloseResult: target.harness === "pi" ? piCloseResult : undefined,
       authCloseScope: closeAttempt ? projectsConnection(closeAttempt) ? "connection" : "attempt" : undefined, canCloseConnection: canCloseAttempt(knownAttempt()),
       canSave: baseline !== null && currentDraft.baselineRevision !== null && !["saving", "conflict", "uncertain"].includes(savePhase) });
     for (const listener of listeners) listener();
   }
+  function detachPiWork() {
+    const records = new Set([piAttempts.get(key(target)), piOperation?.attempt]);
+    for (const attempt of records) if (attempt) {
+      attempt.detached = true;
+      if (attempt.dto) {
+        attempt.dto = Object.freeze({ ...attempt.dto, canReply: false, challenge: null, prompt: null });
+        if (attempt.closeResult) attempt.closeResult = Object.freeze({ ...attempt.closeResult, attempt: attempt.dto });
+      }
+    }
+    for (const request of piRequests) request.abort();
+    piReadEpoch++; piOperation = null; piClosing = null; piView = null; piAuthDetail = undefined; piCloseResult = undefined;
+  }
   function invalidate() {
     if (authentication?.attempt) authentication.attempt.detached = true;
+    detachPiWork();
     lifetime++; readEpoch++; stateEpoch++; saveEpoch++;
     for (const request of requests) request.abort();
     if (savePhase === "saving") { savePhase = "uncertain"; detail = uncertain; reviewable = false; }
@@ -201,15 +323,23 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   function current(token: ReturnType<typeof capture>) {
     return !disposed && token.lifetime === lifetime && sameTarget(token.target, target) && token.ownerGeneration === ownerGeneration;
   }
-  async function request<T>(run: (signal: AbortSignal) => Promise<T>, independent = false): Promise<T> {
+  function currentPi(token: ReturnType<typeof capture>) {
+    // The Pi service binds the public handle/prompt. Normal reserve/start/save
+    // advances owner generation; its numeric observation is not handle authority.
+    return !disposed && token.lifetime === lifetime && sameTarget(token.target, target);
+  }
+  function currentObservation(token: ReturnType<typeof capture>) {
+    return token.target.harness === "pi" ? currentPi(token) : current(token);
+  }
+  async function request<T>(run: (signal: AbortSignal) => Promise<T>, independent = false, pi = false): Promise<T> {
     const controller = new AbortController();
-    if (!independent) requests.add(controller);
+    if (!independent) { requests.add(controller); if (pi) piRequests.add(controller); }
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([Promise.resolve().then(() => run(controller.signal)), new Promise<never>((_, reject) => {
         timer = setTimeout(() => { controller.abort(); reject(new RequestTimeout()); }, timeoutMs);
       })]);
-    } finally { clearTimeout(timer); requests.delete(controller); }
+    } finally { clearTimeout(timer); requests.delete(controller); piRequests.delete(controller); }
   }
   function receiveSettings(value: AgentSettings, reconcile = false) {
     if (baseline && value.revision < baseline.revision) return;
@@ -227,23 +357,23 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     loading = true; publish();
     try {
       const value = await request(signal => transport.readSettings(signal));
-      if (!current(token) || epoch !== readEpoch) return;
+      if (!currentObservation(token) || epoch !== readEpoch) return;
       receiveSettings(value, reconcile);
       if (["conflict", "uncertain"].includes(savePhase) || reconcile) reviewable = true;
       if (savePhase === "unverified") savePhase = "unsaved";
-      if (!current(token)) { loading = false; publish(); }
+      if (!currentObservation(token)) { loading = false; publish(); }
       return capture();
     } catch {
-      if (current(token) && epoch === readEpoch) detail = unavailable;
+      if (currentObservation(token) && epoch === readEpoch) detail = unavailable;
     } finally {
-      if (current(token) && epoch === readEpoch) { loading = false; publish(); }
+      if (currentObservation(token) && epoch === readEpoch) { loading = false; publish(); }
     }
   }
   async function refreshState() {
     const token = capture(); const epoch = ++stateEpoch;
     try {
       const value = await request(signal => transport.readHarnessState(token.target.harness, signal));
-      if (!current(token) || epoch !== stateEpoch) return;
+      if (!currentObservation(token) || epoch !== stateEpoch) return;
       if (value.harnessId !== target.harness || (value.scope && (!validScope(value.scope) || value.scope.harnessId !== target.harness
         || (target.contextKey !== "unobserved" && value.scope.authContextRef !== target.contextKey)))) {
         invalidate(); state = null; ownerGeneration = null; observedScope = undefined; contextInvalid = true;
@@ -275,16 +405,17 @@ export function createAgentConfigurationController(transport: AgentConfiguration
           attempt.generation = { source: "matching-login", value: value.scope.ownerGeneration };
         }
         observedScope = { target, generation: value.scope.ownerGeneration };
-        if (ownerGeneration !== value.scope.ownerGeneration || !sameTarget(token.target, target)) invalidate();
+        if (!sameTarget(token.target, target)) invalidate();
+        else if (target.harness === "codex" && ownerGeneration !== value.scope.ownerGeneration) invalidate();
         ownerGeneration = value.scope.ownerGeneration;
       }
-      state = value; restoreCloseObservation(); publish();
-    } catch { if (current(token) && epoch === stateEpoch) { state = null; detail = unavailable; publish(); } }
+      state = value; restoreCloseObservation(); restorePiObservation(); publish();
+    } catch { if (currentObservation(token) && epoch === stateEpoch) { state = null; detail = unavailable; publish(); } }
   }
   async function refresh() {
     // Read settings before adopting the real owner context; neither read starts authentication.
     const token = await refreshSettings();
-    if (token && current(token)) await refreshState();
+    if (token && currentObservation(token)) { await refreshState(); await refreshPiLogin(); }
   }
   function selectTarget(next: TargetView) {
     followSavedHarness = false;
@@ -307,6 +438,9 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     if (!["saving", "conflict", "uncertain"].includes(savePhase)) savePhase = "unsaved";
     publish();
   }
+  function currentSave(token: ReturnType<typeof capture>) {
+    return token.target.harness === "pi" ? currentPi(token) : current(token);
+  }
   async function save(intent: SaveIntent) {
     if (!sameTarget(intent.target, target) || !snapshot.canSave || !snapshot.hasChanges || !samePreferences(toPreferences(intent.selection), draft().preferences)) return;
     const token = capture(); const epoch = ++saveEpoch;
@@ -317,7 +451,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
     try {
       const result = await request(signal => transport.saveSettings({ expectedRevision: sent.expectedRevision,
         patch: { selectedHarnessId: sent.target.harness, harnessPreferences: { [sent.target.harness]: { ...sent.preferences } } } }, signal));
-      if (!current(token) || epoch !== saveEpoch) return;
+      if (!currentSave(token) || epoch !== saveEpoch) return;
       if (baseline && result.revision < baseline.revision) {
         savePhase = "conflict"; detail = unavailable; publish(); return;
       }
@@ -327,7 +461,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
       else drafts.set(key(target), { ...latest, baselineRevision: result.revision, dirty: !samePreferences(latest.preferences, result.harnessPreferences[target.harness]) });
       savePhase = "saved"; publish();
     } catch (error) {
-      if (!current(token) || epoch !== saveEpoch) return;
+      if (!currentSave(token) || epoch !== saveEpoch) return;
       saveEpoch++; // A transport that ignores abort cannot apply a late result after reconciliation.
       if (error instanceof ApiResponseError && error.status === 409) {
         savePhase = "conflict"; reviewable = false;
@@ -337,7 +471,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
         savePhase = "failed"; detail = unavailable; publish();
       } else {
         savePhase = "uncertain"; reviewable = false; detail = uncertain; publish(); await refreshSettings(true);
-        if (current(token)) {
+        if (currentSave(token)) {
           if (baseline && samePreferences(baseline.harnessPreferences[sent.target.harness], sent.preferences) && baseline.selectedHarnessId === sent.target.harness) {
             detail = { zh: "当前存储值与提交一致；仍不能确认本次保存是否成功。", en: "Current stored values match the submission; this save's outcome is still uncertain." };
           }
@@ -459,6 +593,131 @@ export function createAgentConfigurationController(transport: AgentConfiguration
       }
     } finally { if (attempt) attempt.detached = true; if (authentication === operation) authentication = null; publish(); }
   }
+  function matchesPiAttempt(attempt: PiAttemptRecord | undefined): attempt is PiAttemptRecord {
+    return !!attempt && !contextInvalid && target.harness === "pi" && sameTarget(attempt.target, target)
+      && piAttempts.get(key(target)) === attempt;
+  }
+  function restorePiObservation() {
+    if (target.harness !== "pi" || contextInvalid) { piView = null; piClosing = null; piCloseResult = undefined; return; }
+    const attempt = piAttempts.get(key(target));
+    if (!attempt) return;
+    piView = attempt;
+    if (attempt.closeRequested) void observePiClose(attempt);
+    else if (attempt.dto) piAuthDetail = piAttemptDescription(attempt.dto);
+  }
+  function showPiReceipt(attempt: PiAttemptRecord) {
+    piView = attempt;
+    piCloseResult = attempt.closeUncertain ? undefined : attempt.closeResult;
+    piAuthDetail = attempt.closeUncertain ? attempt.closeDetail ?? piUncertain : attempt.closeResult ? piCloseDescription(attempt.closeResult) : undefined;
+  }
+  function observePiClose(attempt: PiAttemptRecord, token = capture()) {
+    if (!currentPi(token) || !matchesPiAttempt(attempt)) return;
+    piView = attempt;
+    const promise = attempt.closePromise;
+    if (!promise) { showPiReceipt(attempt); return; }
+    if (piClosing?.attempt === attempt && piClosing.promise === promise && currentPi(piClosing.token)) return;
+    const observer: PiCloseObservation = { attempt, token, promise };
+    piClosing = observer; piCloseResult = undefined;
+    piAuthDetail = { zh: "正在结算原 Pi 尝试的关闭请求；当前账号与执行观察独立…", en: "Settling Close for the original Pi attempt. Current account and execution observations are separate…" };
+    void promise.then(async () => {
+      if (piClosing !== observer || !currentPi(observer.token) || !matchesPiAttempt(attempt)) return;
+      showPiReceipt(attempt); publish();
+      // A receipt is evidence for this attempt only. The public state read is
+      // independent and cannot be inferred from saved/closed DTO statuses.
+      if (!attempt.closeUncertain) await refreshState();
+    }).finally(() => { if (piClosing === observer) { piClosing = null; publish(); } });
+  }
+  function settlePiClose(attempt: PiAttemptRecord) {
+    if (!attempt.closePromise && attempt.dto && transport.pi) {
+      const handle = attempt.dto.handle;
+      // This shared promise owns its own deadline/signal. Navigation and a
+      // newer local intent detach observers without cancelling this request.
+      attempt.closePromise = request(signal => transport.pi!.closeLogin(handle, signal), true).then(result => {
+        const dto = freezePiAttempt(result.attempt, handle);
+        attempt.dto = dto; attempt.closeResult = Object.freeze({ outcome: result.outcome, attempt: dto });
+        attempt.closeUncertain = false; attempt.closeDetail = undefined;
+      }).catch(error => { attempt.closeUncertain = true; attempt.closeDetail = piFailureDescription(error); }).finally(() => { attempt.closePromise = undefined; });
+    }
+    observePiClose(attempt); publish();
+    return attempt.closePromise;
+  }
+  async function connectPiLogin() {
+    if (disposed || target.harness !== "pi" || contextInvalid || (piOperation && !piOperation.attempt.closeRequested)) return;
+    if (!transport.pi) { piAuthDetail = { zh: "Pi 认证入口不可用；部署与执行尚未验证。", en: "The Pi authentication entry is unavailable; deployment and execution remain unverified." }; publish(); return; }
+    detachPiWork(); stateEpoch++;
+    const attempt: PiAttemptRecord = { target, detached: false, closeRequested: false };
+    piAttempts.set(key(target), attempt); piView = attempt;
+    const operation: PiOperation = { action: "reserve", token: capture(), attempt };
+    piOperation = operation; piAuthDetail = undefined; piCloseResult = undefined; publish();
+    try {
+      const reservation = await request(signal => {
+        const pending = transport.pi!.reserveLogin(signal);
+        // Cache a delivered reservation even if the browser detached. A lost
+        // response is never retried automatically; late explicit Close only
+        // settles this returned handle and can never initiate start.
+        void pending.then(value => {
+          attempt.dto = freezePiAttempt(value);
+          if (attempt.closeRequested) void settlePiClose(attempt);
+        }, () => undefined).catch(() => undefined);
+        return pending;
+      }, false, true);
+      attempt.dto = freezePiAttempt(reservation);
+      if (attempt.closeRequested) { await settlePiClose(attempt); return; }
+      if (attempt.detached || !currentPi(operation.token) || piOperation !== operation || !matchesPiAttempt(attempt)) return;
+      operation.action = "start"; publish();
+      const started = await request(signal => transport.pi!.startLogin(attempt.dto!.handle, signal), false, true);
+      if (attempt.closeRequested || !currentPi(operation.token) || piOperation !== operation || !matchesPiAttempt(attempt)) return;
+      attempt.dto = freezePiAttempt(started, attempt.dto.handle); piView = attempt; piAuthDetail = piAttemptDescription(attempt.dto); publish();
+      // Observe local OAuth/catalog independently; a successful start is not
+      // model access or execution validation.
+      await refreshState();
+    } catch (error) {
+      if (currentPi(operation.token) && piOperation === operation && !attempt.closeRequested) { piAuthDetail = piFailureDescription(error); publish(); }
+    } finally { attempt.detached = true; if (piOperation === operation) piOperation = null; publish(); }
+  }
+  async function refreshPiLogin() {
+    if (disposed || target.harness !== "pi" || contextInvalid || !transport.pi || piOperation) return;
+    const attempt = piAttempts.get(key(target));
+    if (!matchesPiAttempt(attempt) || !attempt.dto) return;
+    const token = capture(), epoch = ++piReadEpoch;
+    restorePiObservation(); publish();
+    // Cached Close receipts are read-only recovery; querying a terminal DTO
+    // must not erase delivery uncertainty or turn a Close into a new login.
+    if (attempt.closeRequested && (attempt.closePromise || attempt.closeResult || attempt.closeUncertain)) return;
+    try {
+      const dto = await request(signal => transport.pi!.readLogin(attempt.dto!.handle, signal), false, true);
+      if (!currentPi(token) || epoch !== piReadEpoch || !matchesPiAttempt(attempt) || piOperation || attempt.closeRequested) return;
+      attempt.dto = freezePiAttempt(dto, attempt.dto.handle); piView = attempt; piAuthDetail = piAttemptDescription(attempt.dto); publish();
+      if (piTerminal(attempt.dto) && attempt.dto.status === "saved") await refreshState();
+    } catch (error) { if (currentPi(token) && epoch === piReadEpoch && matchesPiAttempt(attempt)) { piAuthDetail = piFailureDescription(error); publish(); } }
+  }
+  async function replyPiLogin(intent: { readonly target: TargetView; readonly attemptHandle: string; readonly promptId: string }, callbackArg: string) {
+    const attempt = piAttempts.get(key(target));
+    if (disposed || !sameTarget(intent.target, target) || !transport.pi || piOperation || !matchesPiAttempt(attempt) || attempt.closeRequested
+      || !attempt.dto?.canReply || attempt.dto.handle !== intent.attemptHandle || attempt.dto.prompt?.promptId !== intent.promptId) return;
+    // The callback is a call-local argument only. It never enters a snapshot,
+    // intent record, shared cache, stored preference or recovery workflow.
+    piReadEpoch++;
+    const operation: PiOperation = { action: "reply", token: capture(), attempt };
+    piOperation = operation; piAuthDetail = undefined; publish();
+    try {
+      const dto = await request(signal => transport.pi!.replyLogin(intent.attemptHandle, intent.promptId, callbackArg, signal), false, true);
+      if (!currentPi(operation.token) || piOperation !== operation || !matchesPiAttempt(attempt) || attempt.closeRequested) return;
+      attempt.dto = freezePiAttempt(dto, intent.attemptHandle); piView = attempt; piAuthDetail = piAttemptDescription(attempt.dto); publish();
+      if (attempt.dto.status === "saved") await refreshState();
+    } catch (error) { if (currentPi(operation.token) && piOperation === operation && matchesPiAttempt(attempt) && !attempt.closeRequested) { piAuthDetail = piFailureDescription(error); publish(); } }
+    finally { if (piOperation === operation) piOperation = null; publish(); }
+  }
+  function closePiLogin(intentTarget: TargetView, handle?: string) {
+    const attempt = piAttempts.get(key(target));
+    if (disposed || !sameTarget(intentTarget, target) || !matchesPiAttempt(attempt) || (handle !== undefined && attempt.dto?.handle !== handle)) return;
+    if (attempt.closeResult && !attempt.closeUncertain && attempt.closeResult.outcome !== "unknown") { observePiClose(attempt); publish(); return; }
+    attempt.closeRequested = true; piReadEpoch++; piView = attempt;
+    if (!attempt.dto) {
+      piAuthDetail = { zh: "原 Pi 尝试的关闭意图已记录；本次标识返回后仅关闭，不启动登录。", en: "Close recorded for the original Pi attempt. A returned handle will only be closed; sign-in will not start." }; publish(); return;
+    }
+    void settlePiClose(attempt);
+  }
   async function bindConnection() {
     if (disposed || authentication || target.harness !== "codex" || !transport.bindConnection || !snapshot.canSave || !baseline
       || baseline.selectedHarnessId !== "codex" || !state?.account || state.scope?.authContextRef !== target.contextKey) return;
@@ -487,13 +746,19 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   }
   function connectionIntent(intent: ConnectionIntent) {
     if (disposed || !sameTarget(target, intent.target)) return;
-    if (intent.action === "refresh-connection") { void refreshState(); return; }
+    if (intent.action === "refresh-connection") { void (async () => { await refreshState(); await refreshPiLogin(); })(); return; }
+    if (target.harness === "pi") {
+      if (intent.action === "connect") void connectPiLogin();
+      if (intent.action === "cancel-sign-in") closePiLogin(intent.target, intent.attemptKey);
+      return;
+    }
     if (target.harness !== "codex") return;
     if (intent.action === "connect" && ["signed-out", "failed"].includes(state?.connection?.phase ?? "")) void accountAction("login");
     if (intent.action === "sign-out" && state?.account?.type === "chatgpt") void accountAction("logout");
     if (intent.action === "cancel-sign-in" && state?.connection?.login?.status === "pending" && state.connection.login.loginId === intent.attemptKey) closeConnection();
   }
   function closeConnection() {
+    if (target.harness === "pi") { closePiLogin(target); return; }
     if (disposed || target.harness !== "codex") return;
     const attempt = knownAttempt();
     if (attempt && matchesAttempt(attempt) && attempt.closeResult && !attempt.closeUncertain && attempt.closeResult.cleanup !== "unconfirmed") {
@@ -517,7 +782,7 @@ export function createAgentConfigurationController(transport: AgentConfiguration
   return {
     getSnapshot: () => snapshot,
     subscribe: (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
-    refresh, refreshSettings, refreshState, selectTarget, edit, save, reviewLatest, connectionIntent, closeConnection, bindConnection,
+    refresh, refreshSettings, refreshState, selectTarget, edit, save, reviewLatest, connectionIntent, closeConnection, bindConnection, replyPiLogin, closePiLogin, refreshPiLogin,
     cancel: () => { if (!disposed) { invalidate(); publish(); } },
     dispose: () => { invalidate(); disposed = true; listeners.clear(); },
   };

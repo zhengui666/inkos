@@ -13,6 +13,8 @@ import type { ChatAttachmentPayload, StudioCompletionStatus } from "../shared/se
 import {
   StateManager,
   createCodexAccountService,
+  PiAccountService,
+  PiAccountError,
   inspectCodexReadiness,
   CodexConfigurationError,
   type CodexAccountService,
@@ -2488,14 +2490,45 @@ async function probeServiceCapabilities(args: {
 
 const studioShutdowns = new WeakMap<Hono, () => Promise<void>>();
 
-export async function shutdownStudioServer(app: Hono): Promise<void> {
-  await studioShutdowns.get(app)?.();
+const noStudioShutdown = Promise.resolve();
+export function shutdownStudioServer(app: Hono): Promise<void> {
+  return studioShutdowns.get(app)?.() ?? noStudioShutdown;
+}
+export interface StudioServerOverrides {
+  readonly nodeImageGenerator?: NodeImageDeps;
+  readonly hostname?: string;
+  readonly allowedOrigins?: readonly string[];
+  readonly codexAccountService?: CodexAccountService;
+  readonly piAccountService?: PiAccountService | Promise<PiAccountService>;
+  readonly piAccountServiceFactory?: (root: string) => Promise<PiAccountService>;
 }
 
-export function createStudioServer(initialConfig: ProjectConfig, root: string, overrides: { readonly nodeImageGenerator?: NodeImageDeps; readonly hostname?: string; readonly allowedOrigins?: readonly string[]; readonly codexAccountService?: CodexAccountService } = {}) {
+export function createStudioServer(initialConfig: ProjectConfig, root: string, overrides: StudioServerOverrides = {}) {
   const app = new Hono();
   const closeEventStreams = new Set<() => Promise<void>>();
   let studioClosing = false;
+  let piService: PiAccountService | undefined;
+  let piDisposal: Promise<void> | undefined;
+  const disposePi = (service: PiAccountService) => piDisposal ??= service.dispose();
+  const ownPi = async (service: PiAccountService) => {
+    piService = service;
+    if (studioClosing) await disposePi(service);
+    return service;
+  };
+  // An explicitly injected service belongs to this app even before its first route.
+  let piCreation: Promise<PiAccountService> | undefined = overrides.piAccountService
+    ? Promise.resolve(overrides.piAccountService).then(ownPi) : undefined;
+  // A supplied promise can fail before the first request or shutdown observes it.
+  void piCreation?.catch(() => undefined);
+  if (overrides.piAccountService instanceof PiAccountService) piService = overrides.piAccountService;
+  const getPiAccountService = async (): Promise<PiAccountService> => {
+    if (studioClosing) throw new PiAccountError("service-stopped");
+    // A failed loader is deliberately cached; a new click cannot prove a fresh SDK cache.
+    piCreation ??= Promise.resolve().then(() => (overrides.piAccountServiceFactory ?? PiAccountService.create)(root)).then(ownPi);
+    const service = await piCreation;
+    if (studioClosing) throw new PiAccountError("service-stopped");
+    return service;
+  };
   const state = new StateManager(root);
   const recoveryStore = new CreativeEpisodeStore(join(root, ".inkos", "harness.sqlite"));
   try {
@@ -2633,6 +2666,12 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     if (error instanceof LLMConfigurationError) {
       return c.json({ error: { code: "LLM_CONFIG_ERROR", message: error.message } }, 400);
     }
+    // Even a malicious unmatched login pathname must not put callback data into logs.
+    if (new URL(c.req.url).pathname.startsWith("/api/v1/agent-configuration/harnesses/pi/")) {
+      console.error("[studio] Pi account route failed", { method: c.req.method,
+        path: "/api/v1/agent-configuration/harnesses/pi/*", code: "PI_SERVICE_UNAVAILABLE", aborted: c.req.raw.signal.aborted });
+      return c.json({ error: { code: "PI_SERVICE_UNAVAILABLE", message: "Pi account service is unavailable." } }, 503);
+    }
     console.error("[studio] Unexpected server error", { method: c.req.method, path: new URL(c.req.url).pathname, aborted: c.req.raw.signal.aborted }, error);
     return c.json(
       { error: { code: "INTERNAL_ERROR", message: "Unexpected server error." } },
@@ -2642,7 +2681,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 
   const codexAccountService = overrides.codexAccountService ?? createCodexAccountService({ projectDir: root });
   app.route("/api/v1/codex", createCodexRoutes(codexAccountService));
-  app.route("/api/v1/agent-configuration", createAgentConfigurationRoutes(root, createAgentConfigurationDependencies(root, codexAccountService)));
+  app.route("/api/v1/agent-configuration", createAgentConfigurationRoutes(root, createAgentConfigurationDependencies(root, codexAccountService, getPiAccountService)));
 
   // BookId validation middleware — blocks path traversal on all book routes
   app.use("/api/v1/books/:id/*", async (c, next) => {
@@ -4298,16 +4337,25 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
   });
   // Resume only durable explicitly created tasks; this does not start library books.
   setImmediate(() => { if (!studioClosing) void creationTasks.recover().catch(error => broadcast('daemon:error', { error: String(error) })); });
-  studioShutdowns.set(app, async () => {
+  let appShutdown: Promise<void> | undefined;
+  studioShutdowns.set(app, () => {
+    if (appShutdown) return appShutdown;
     studioClosing = true;
+    let done!: () => void, failed!: (error: unknown) => void;
+    // Cache before any notification can reenter shutdown.
+    appShutdown = new Promise<void>((resolve, reject) => { done = resolve; failed = reject; });
     daemonStopRevision++;
-    // No request may reopen its temporary stores while the runtime drains.
     creationTasks.close();
-    try { await daemon.shutdown(); }
-    finally {
-      try { await Promise.all([...closeEventStreams].map(close => close())); }
-      finally { await codexAccountService.dispose().catch(() => { throw new Error("Codex account connection did not close cleanly."); }); }
-    }
+    // Abort/latch owned OAuth synchronously, before waiting for HTTP or daemon work.
+    const piDrain = piService ? disposePi(piService)
+      : piCreation ? piCreation.then(service => disposePi(service), () => piDisposal ?? Promise.resolve()) : Promise.resolve();
+    const codexDrain = codexAccountService.dispose();
+    void Promise.allSettled([piDrain, codexDrain, daemon.shutdown(),
+      ...[...closeEventStreams].map(close => close())]).then(results => {
+      if (results.some(result => result.status === "rejected")) failed(new Error("Studio services did not close cleanly."));
+      else done();
+    });
+    return appShutdown;
   });
 
   app.get("/api/v1/daemon", (c) => c.json(daemon.status()));
@@ -6677,13 +6725,13 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 export async function startStudioServer(
   root: string,
   port = 4567,
-  options?: { readonly staticDir?: string; readonly hostname?: string; readonly allowedOrigins?: readonly string[] },
-): Promise<void> {
+  options?: StudioServerOverrides & { readonly staticDir?: string },
+) {
   await recoverAtomicFileSets(root, true);
   const config = await loadProjectConfig(root, { consumer: "studio", purpose: "codex" });
 
-  const codexAccountService = createCodexAccountService({ projectDir: root });
-  const app = createStudioServer(config, root, { hostname: options?.hostname, allowedOrigins: options?.allowedOrigins, codexAccountService });
+  const codexAccountService = options?.codexAccountService ?? createCodexAccountService({ projectDir: root });
+  const app = createStudioServer(config, root, { ...options, codexAccountService });
 
   // Serve frontend static files — single process for API + frontend
   if (options?.staticDir) {
@@ -6728,23 +6776,31 @@ export async function startStudioServer(
   console.log(`InkOS Studio running on http://${hostname}:${port}`);
   const server = serve({ fetch: app.fetch, port, hostname });
   let shutdown: Promise<void> | undefined;
-  const close = () => shutdown ??= (async () => {
+  let httpClosed = false;
+  const close = (): Promise<void> => {
+    if (shutdown) return shutdown;
+    let done!: () => void, failed!: (error: unknown) => void;
+    shutdown = new Promise<void>((resolve, reject) => { done = resolve; failed = reject; });
+    // This call stops admission and aborts owned OAuth before server.close waits.
     const draining = shutdownStudioServer(app);
-    const closed = new Promise<void>(resolve => server.close(() => resolve()));
-    try {
-      await draining;
-    } catch (error) {
-      console.error("[studio] Daemon drain failed:", String(error));
-      process.exitCode = 1;
-    } finally {
-      await closed;
-      process.removeListener("SIGTERM", close);
-      process.removeListener("SIGINT", close);
-    }
-  })();
-  process.on("SIGTERM", close);
-  process.on("SIGINT", close);
-  server.once("close", () => {
-    void close();
-  });
+    const closed = httpClosed ? Promise.resolve() : new Promise<void>((resolve, reject) => server.close(error => error && !httpClosed ? reject(new Error("Studio HTTP close failed.")) : resolve()));
+    void Promise.allSettled([draining, closed]).then(results => {
+      process.removeListener("SIGTERM", onSignal);
+      process.removeListener("SIGINT", onSignal);
+      if (results.some(result => result.status === "rejected")) failed(new Error("Studio shutdown did not complete cleanly."));
+      else done();
+    });
+    return shutdown;
+  };
+  const onSignal = (): Promise<void> => {
+    const pending = close();
+    void pending.catch(() => {
+      console.error("[studio] Shutdown did not complete cleanly."); process.exitCode = 1;
+    });
+    return pending;
+  };
+  process.on("SIGTERM", onSignal);
+  process.on("SIGINT", onSignal);
+  server.once("close", () => { httpClosed = true; void close().catch(() => undefined); });
+  return { app, server, shutdown: close };
 }

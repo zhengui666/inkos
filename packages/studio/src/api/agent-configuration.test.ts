@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
-import { AGENT_CONFIG_FILE, readAgentSettings, type CodexAccountService } from "@actalk/inkos-core";
+import { AGENT_CONFIG_FILE, readAgentSettings, PiAccountError, type PiAccountService, type PiLoginAttempt, type PiAccountErrorCode, type CodexAccountService } from "@actalk/inkos-core";
 import { createAgentConfigurationRoutes, type AgentConfigurationRouteDependencies } from "./agent-configuration.js";
 import type { HarnessState } from "../shared/agent-configuration.js";
 
@@ -95,13 +95,28 @@ describe("real configuration storage routes", () => {
     expect(response.status).toBe(422);
     expect((await readAgentSettings(root)).revision).toBe(0);
   });
-  it("keeps an absent observation dependency unavailable and leaves Pi authentication mutations unmounted", async () => {
+  it("keeps absent Pi observation unavailable and requires the trusted account getter for its separate attempt routes", async () => {
     const server = app();
     const state = (await (await server.request("/api/v1/agent-configuration/harnesses/pi/state")).json()).state;
     expect(state).toMatchObject({ harnessId: "pi", availability: "unavailable", scope: null, catalog: null, execution: null, account: null });
-    for (const action of ["bind", "login/reserve", "login", "login/close", "login/cancel", "logout"]) {
-      expect((await server.request(`/api/v1/agent-configuration/harnesses/pi/${action}`, { method: "POST", headers: { "Content-Type": "application/json" } })).status).toBe(404);
+    const post = (body: unknown) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    for (const [action, body] of [["login/reserve", {}], ["login/start", { attemptHandle: "offline-attempt" }],
+      ["login/reply", { attemptHandle: "offline-attempt", promptId: "offline-prompt", callbackUrl: "offline-input" }],
+      ["login/close", { attemptHandle: "offline-attempt" }]] as const) {
+      const response = await server.request(`/api/v1/agent-configuration/harnesses/pi/${action}`, post(body));
+      expect(response.status).toBe(503); expect((await response.json()).error.code).toBe("PI_SERVICE_UNAVAILABLE");
     }
+    expect((await server.request("/api/v1/agent-configuration/harnesses/pi/login/attempts/offline-attempt")).status).toBe(503);
+    for (const action of ["bind", "login", "login/cancel"]) expect((await server.request(`/api/v1/agent-configuration/harnesses/pi/${action}`, post({}))).status).toBe(404);
+  });
+  it("Pi2 logout remains explicitly unsupported without invoking Pi or Codex deletion/account actions", async () => {
+    const logout = vi.fn(), getter = vi.fn(async () => { throw new Error("The getter must not be invoked"); });
+    const server = app({ accountService: { logout } as unknown as CodexAccountService, piAccountService: getter });
+    const response = await server.request("/api/v1/agent-configuration/harnesses/pi/logout", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    expect(response.status).toBe(501); expect((await response.json()).error.code).toBe("PI_LOGOUT_UNSUPPORTED");
+    expect(logout).not.toHaveBeenCalled(); expect(getter).not.toHaveBeenCalled(); expect(await readdir(root)).toEqual([]);
   });
   it("projects only public observation fields and drops an unobserved account type", async () => {
     const internal = { ...observed, privateOwnerField: "must-not-leak", account: { type: "chatgpt" as const, label: "public", token: "must-not-leak" } };
@@ -196,5 +211,107 @@ describe("offline trusted sign-in attempt service contract routes (Core integrat
       expect((await response.json()).error.code).toBe("AGENT_CONFIGURATION_ATTEMPT_CONTRACT_UNAVAILABLE");
     }
     for (const fn of Object.values(legacy)) expect(fn).not.toHaveBeenCalled();
+  });
+});
+
+// Route-boundary unit fixtures only. The TCP flow suite separately uses the real
+// public service, official OAuth parser and native writer.
+describe("Pi account route boundaries", () => {
+  const path = "/api/v1/agent-configuration/harnesses/pi";
+  const handle = "pi-login-boundary-fixture";
+  const post = (value: unknown) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(value) });
+  const attempt = (changes: Partial<PiLoginAttempt> = {}): PiLoginAttempt => ({ harnessId: "pi", handle, status: "reserved",
+    expiresAt: Date.now() + 300_000, canReply: false, challenge: null, prompt: null, error: null, ...changes });
+  function fixture(value = attempt()) {
+    let current = value;
+    const expectation = Object.freeze({ harnessId: "pi", authContextRef: "server-context", connectionRef: "server-connection", authGeneration: 1 });
+    const service = {
+      readLoginExpectation: vi.fn(() => expectation), reserveLoginAttempt: vi.fn(() => current),
+      startLoginAttempt: vi.fn(() => current), readLoginAttempt: vi.fn(() => current),
+      replyLoginAttempt: vi.fn(() => current), closeLoginAttempt: vi.fn(async () => ({ outcome: "closed", attempt: current })),
+      subscribeLoginAttempt: vi.fn((_handle: string, _listener: (value: PiLoginAttempt) => void) => vi.fn()),
+    };
+    return { service, expectation, set: (next: PiLoginAttempt) => { current = next; },
+      server: app({ piAccountService: async () => service as unknown as PiAccountService }) };
+  }
+  it("captures server expectation once and projects no ticket, owner, credential or accidental fields", async () => {
+    const privateValue = { ...attempt(), ticket: "private-sentinel", credentials: "private-sentinel", owner: "private-sentinel" };
+    const f = fixture(privateValue);
+    const response = await f.server.request(`${path}/login/reserve`, post({}));
+    const value = (await response.json()).attempt;
+    expect(response.status).toBe(200); expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(Object.keys(value).sort()).toEqual(["canReply", "challenge", "error", "expiresAt", "handle", "harnessId", "prompt", "status"]);
+    expect(JSON.stringify(value).includes("private-sentinel")).toBe(false);
+    expect(f.service.readLoginExpectation).toHaveBeenCalledOnce(); expect(f.service.reserveLoginAttempt).toHaveBeenCalledWith(f.expectation);
+    expect(await readdir(root)).toEqual([]);
+  });
+  it.each(["unknown-handle", "attempt-expired", "scope-busy", "owner-changed", "context-changed", "prompt-not-current", "service-stopped",
+    "sdk-unavailable", "login-deployment-unavailable", "too-many-attempts"] as PiAccountErrorCode[])("maps finite %s without Error text/cause", async code => {
+    const f = fixture(); const error = new PiAccountError(code);
+    error.message = "synthetic-sensitive-error-sentinel";
+    Object.assign(error, { cause: { token: "synthetic-sensitive-error-sentinel" } });
+    f.service.startLoginAttempt.mockImplementation(() => { throw error; });
+    const response = await f.server.request(`${path}/login/start`, post({ attemptHandle: handle }));
+    const expected = code === "unknown-handle" ? 404 : code === "attempt-expired" ? 410
+      : ["scope-busy", "owner-changed", "context-changed", "prompt-not-current", "too-many-attempts"].includes(code) ? 409 : 503;
+    expect(response.status).toBe(expected); expect(response.headers.get("cache-control")).toBe("no-store");
+    const body = await response.json(); expect(body.error.code).toBe(`PI_${code.toUpperCase().replaceAll("-", "_")}`);
+    expect(JSON.stringify(body).includes("synthetic-sensitive-error-sentinel")).toBe(false);
+  });
+  it("sanitizes unexpected SDK errors without console, body, query or pathname echo", async () => {
+    const f = fixture(), log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      f.service.startLoginAttempt.mockImplementation(() => { throw new Error("synthetic-sdk-error-sentinel"); });
+      const response = await f.server.request(`${path}/login/start?callbackUrl=synthetic-sdk-error-sentinel`, post({ attemptHandle: handle }));
+      expect(response.status).toBe(503); expect((await response.text()).includes("synthetic-sdk-error-sentinel")).toBe(false);
+      expect(log).not.toHaveBeenCalled(); expect(await readdir(root)).toEqual([]);
+    } finally { log.mockRestore(); }
+  });
+  it.each(["http://auth.openai.com/api/accounts/authorize", "https://other.invalid/api/accounts/authorize",
+    "https://auth.openai.com/other", "https://user@auth.openai.com/api/accounts/authorize",
+    "https://auth.openai.com/api/accounts/authorize#unsafe"])("suppresses unsafe challenges %s", async url => {
+    const f = fixture(attempt({ status: "awaiting-user", challenge: { kind: "open-url", url } }));
+    const response = await f.server.request(`${path}/login/attempts/${handle}`);
+    expect((await response.json()).attempt.challenge).toBeNull();
+  });
+  it.each(["saved", "closed", "failed", "unknown", "closing"] as const)("clears transient challenge/prompt for %s", async status => {
+    const f = fixture(attempt({ status, canReply: true, prompt: { kind: "callback-url", promptId: "old-prompt" },
+      challenge: { kind: "open-url", url: "https://auth.openai.com/api/accounts/authorize?state=synthetic-state" } }));
+    const value = (await (await f.server.request(`${path}/login/attempts/${handle}`)).json()).attempt;
+    expect({ challenge: value.challenge, prompt: value.prompt, canReply: value.canReply }).toEqual({ challenge: null, prompt: null, canReply: false });
+    expect(f.service.subscribeLoginAttempt).not.toHaveBeenCalled();
+  });
+  it("bounds multibyte stream bytes before JSON parsing regardless of Content-Length", async () => {
+    const f = fixture(), encoded = new TextEncoder().encode(JSON.stringify({ attemptHandle: handle, promptId: "prompt", callbackUrl: "界".repeat(9000) }));
+    let cancelled = 0;
+    const body = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(encoded); }, cancel() { cancelled++; } });
+    const request = new Request(`http://localhost${path}/login/reply`, {
+      method: "POST", headers: { "Content-Type": "application/json", "Content-Length": "1" }, body, duplex: "half",
+    } as RequestInit);
+    const response = await f.server.request(request);
+    expect(response.status).toBe(400); expect(cancelled).toBe(1); expect(f.service.replyLoginAttempt).not.toHaveBeenCalled();
+  });
+  it.each([
+    { attemptHandle: handle, promptId: "prompt", callbackUrl: "x".repeat(16385) },
+    { attemptHandle: handle, promptId: "prompt", callbackUrl: "input", authContextRef: "browser-authority" },
+    { attemptHandle: handle, promptId: "prompt", callbackUrl: "input", ticket: "browser-authority" },
+  ])("rejects excessive callback text or browser authority before any service action", async value => {
+    const f = fixture(), response = await f.server.request(`${path}/login/reply`, post(value));
+    expect(response.status).toBe(400); expect(f.service.replyLoginAttempt).not.toHaveBeenCalled(); expect(await readdir(root)).toEqual([]);
+  });
+  it("subscribes and rereads across an update, then unsubscribes once", async () => {
+    const f = fixture(), unsubscribe = vi.fn();
+    f.service.subscribeLoginAttempt.mockImplementation(() => { f.set(attempt({ status: "saved" })); return unsubscribe; });
+    const response = await f.server.request(`${path}/login/attempts/${handle}?wait=1`);
+    expect((await response.json()).attempt.status).toBe("saved");
+    expect(f.service.readLoginAttempt).toHaveBeenCalledTimes(3); expect(unsubscribe).toHaveBeenCalledOnce();
+    expect(f.service.closeLoginAttempt).not.toHaveBeenCalled();
+  });
+  it("request abort only detaches the bounded reader and does not close the attempt", async () => {
+    const f = fixture(), abort = new AbortController(), unsubscribe = vi.fn();
+    f.service.subscribeLoginAttempt.mockImplementation(() => { queueMicrotask(() => abort.abort()); return unsubscribe; });
+    const response = await f.server.request(new Request(`http://localhost${path}/login/attempts/${handle}?wait=1`, { signal: abort.signal }));
+    expect((await response.json()).attempt.status).toBe("reserved"); expect(unsubscribe).toHaveBeenCalledOnce();
+    expect(f.service.closeLoginAttempt).not.toHaveBeenCalled();
   });
 });

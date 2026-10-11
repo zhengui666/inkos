@@ -46,6 +46,19 @@ export interface SaveView extends ScopedView {
   readonly phase: "unverified" | "unsaved" | "saving" | "saved" | "conflict" | "partial-failure" | "failed" | "uncertain";
   readonly selection: SelectionView;
 }
+export interface PiAuthenticationView {
+  readonly target: TargetView;
+  readonly phase: "idle" | "reserved" | "starting" | "awaiting-user" | "exchanging" | "closing" | "saved" | "closed" | "failed" | "unknown";
+  readonly capabilities: { readonly canStartLogin: boolean; readonly canCloseAttempt: boolean; readonly canReply: boolean; readonly canLogout: false };
+  readonly handle?: string;
+  readonly promptId?: string;
+  readonly authorizationUrl?: string;
+  readonly busy: "reserve" | "start" | "reply" | "close" | "logout" | null;
+  readonly canClose: boolean;
+  readonly catalogConfirmed: boolean;
+  readonly closeOutcome?: "closed" | "already-committed" | "unknown";
+  readonly detail?: TextView;
+}
 export interface ConfigurationView {
   readonly target: TargetView;
   readonly selection: SelectionView;
@@ -54,6 +67,7 @@ export interface ConfigurationView {
   readonly catalog: CatalogView;
   readonly execution: ExecutionView;
   readonly save: SaveView;
+  readonly piAuthentication?: PiAuthenticationView;
 }
 export type ConnectionIntent =
   | { readonly action: "connect" | "sign-out" | "refresh-connection"; readonly target: TargetView }

@@ -16,5 +16,20 @@ export function useAgentConfiguration(transport?: AgentConfigurationTransport) {
     // Navigation detaches browser work. Returning reads the same service-owned attempt, never restarts login.
     return () => { active = false; clearTimeout(timer); };
   }, [controller, snapshot.target.harness, snapshot.target.contextKey, login?.loginId, login?.status, snapshot.authBlocking]);
+  const piAttempt = snapshot.piLoginAttempt;
+  useEffect(() => {
+    if (snapshot.target.harness !== "pi" || !piAttempt || ["saved", "closed", "failed", "unknown"].includes(piAttempt.status) || snapshot.piAuthBusy) return;
+    let active = true; let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      await controller.refreshPiLogin();
+      const current = controller.getSnapshot();
+      if (active && current.target.harness === "pi" && current.piLoginAttempt?.handle === piAttempt.handle
+        && !["saved", "closed", "failed", "unknown"].includes(current.piLoginAttempt.status) && !current.piAuthBusy)
+        timer = setTimeout(() => { void poll(); }, 2000);
+    };
+    timer = setTimeout(() => { void poll(); }, 2000);
+    // Cleanup detaches browser reads; it never closes or replays the service-owned login.
+    return () => { active = false; clearTimeout(timer); };
+  }, [controller, snapshot.target.harness, snapshot.target.contextKey, piAttempt?.handle, piAttempt?.status, piAttempt?.prompt?.promptId, snapshot.piAuthBusy]);
   return { controller, snapshot };
 }

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { unavailableHarnessState, type AgentSettings, type DeviceLoginAttemptCloseResult, type HarnessState } from "../shared/agent-configuration";
+import { unavailableHarnessState, type AgentSettings, type DeviceLoginAttemptCloseResult, type HarnessState, type StudioPiLoginAttempt, type StudioPiCloseResult } from "../shared/agent-configuration";
 import type { AgentConfigurationSnapshot } from "./agent-configuration-controller";
 
 type HookValue = ReturnType<typeof import("./use-agent-configuration")["useAgentConfiguration"]>;
@@ -48,7 +48,7 @@ const initial: AgentSettings = { schemaVersion: 1, revision: 0, selectedHarnessI
 const context = "offline-service-context", handle = "offline-reserved-handle";
 const login = { loginId: "offline-provider-id", status: "pending" as const, verificationUrl: "https://auth.openai.com/codex/device", userCode: "OFFLINE-CODE" };
 const closed: DeviceLoginAttemptCloseResult = { attemptHandle: handle, state: "closed", cleanup: "cancel-acknowledged" };
-type Action = "reserve" | "start" | "close";
+type Action = "reserve" | "start" | "close" | "reply" | "attempt-read";
 interface HttpCall {
   readonly url: string; readonly method: string; readonly body: unknown; readonly signal: AbortSignal;
   readonly keepalive: boolean | undefined; readonly action?: Action;
@@ -70,12 +70,25 @@ afterEach(async () => {
   await flush(); vi.unstubAllGlobals(); vi.useRealTimers();
 });
 
-async function setup() {
-  let state = observed();
+const piContext = "offline-pi-service-context", piHandle = "offline-pi-reserved-handle";
+function publicPiAttempt(status: StudioPiLoginAttempt["status"] = "awaiting-user", handle = piHandle): StudioPiLoginAttempt {
+  return { harnessId: "pi", handle, status, expiresAt: Date.now() + 120_000, canReply: status === "awaiting-user",
+    challenge: status === "awaiting-user" ? { kind: "open-url", url: "https://auth.openai.com/api/accounts/authorize?state=offline" } : null,
+    prompt: status === "awaiting-user" ? { kind: "callback-url", promptId: "offline-pi-prompt" } : null, error: null };
+}
+function observedPi(generation: number | null = null): HarnessState {
+  return { ...unavailableHarnessState("pi"), availability: "available", installation: "installed", localAuthentication: "missing",
+    scope: { harnessId: "pi", authContextRef: piContext, ownerGeneration: generation, adapterVersion: "offline", catalogVersion: "offline" } };
+}
+async function setup(pi = false) {
+  let state = pi ? observedPi() : observed();
+  let piAttempt = publicPiAttempt();
   const held = new Set<Action>(), calls: HttpCall[] = [];
   const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
     const url = String(input), method = init?.method ?? "GET", signal = init?.signal as AbortSignal;
-    const action: Action | undefined = url.endsWith("/login/reserve") ? "reserve" : url.endsWith("/login/close") ? "close" : url.endsWith("/login") ? "start" : undefined;
+    const action: Action | undefined = url.endsWith("/login/reserve") ? "reserve" : url.endsWith("/login/close") ? "close"
+      : url.endsWith("/login/start") || url.endsWith("/login") ? "start" : url.endsWith("/login/reply") ? "reply"
+        : url.includes("/login/attempts/") ? "attempt-read" : undefined;
     let resolve!: (response: Response) => void, reject!: (error: unknown) => void;
     const pending = new Promise<Response>((yes, no) => { resolve = yes; reject = no; });
     const call: HttpCall = { url, method, signal, action, body: init?.body ? JSON.parse(String(init.body)) : undefined,
@@ -84,10 +97,15 @@ async function setup() {
       reject: error => { call.rejection = error; signal.removeEventListener("abort", abort); reject(error); } };
     const abort = () => { call.aborted = true; call.reject(new DOMException("The offline fetch was aborted", "AbortError")); };
     signal.addEventListener("abort", abort, { once: true }); calls.push(call);
-    const automatic = url.endsWith("/settings") ? { settings: initial }
-      : url.endsWith("/state") ? { state: url.includes("/pi/") ? unavailableHarnessState("pi") : state }
-        : action === "reserve" ? { reservation: { attemptHandle: handle, expiresAt: Date.now() + 120_000 } }
-          : action === "start" ? { login } : action === "close" ? { result: closed } : undefined;
+    const piRequest = url.includes("/harnesses/pi/");
+    const automatic = url.endsWith("/settings") ? { settings: pi ? { ...initial, selectedHarnessId: "pi" } : initial }
+      : url.endsWith("/state") ? { state: piRequest === pi ? state : unavailableHarnessState(piRequest ? "pi" : "codex") }
+        : piRequest ? action === "reserve" ? { attempt: publicPiAttempt("reserved") }
+          : action === "start" || action === "attempt-read" ? { attempt: piAttempt }
+            : action === "reply" ? { attempt: publicPiAttempt("exchanging") }
+              : action === "close" ? { result: { outcome: "closed", attempt: publicPiAttempt("closed") } } : undefined
+          : action === "reserve" ? { reservation: { attemptHandle: handle, expiresAt: Date.now() + 120_000 } }
+            : action === "start" ? { login } : action === "close" ? { result: closed } : undefined;
     if (!automatic) throw new Error(`Unexpected offline HTTP request: ${method} ${url}`);
     releaseFetches.push(() => call.reply(automatic));
     if (signal.aborted) abort(); else if (!action || !held.has(action)) call.reply(automatic);
@@ -113,7 +131,7 @@ async function setup() {
       unmount: () => { if (!frame.mounted) return; frame.mounted = false; for (const slot of [...frame.slots].reverse()) slot.cleanup?.(); } };
     mounts.push(result); render(); return result;
   };
-  return { mount, calls, held, fetchImpl, state: (next: HarnessState) => { state = next; },
+  return { mount, calls, held, fetchImpl, state: (next: HarnessState) => { state = next; }, piAttempt: (next: StudioPiLoginAttempt) => { piAttempt = next; },
     action: (action: Action) => calls.filter(call => call.action === action),
     mutations: () => calls.filter(call => call.method !== "GET"),
     stateReads: () => calls.filter(call => call.url.endsWith("/state")),
@@ -310,5 +328,73 @@ describe("offline default hook preserves numeric origin evidence without correla
     expect(returned.snapshot().authCloseResult).toEqual(closed); expect(returned.snapshot().authCloseScope).toBe("attempt");
     expect(returned.snapshot().ownerGeneration).toBe(4); expect(returned.snapshot().state).toEqual(current);
     expect(fixture.action("reserve")).toHaveLength(1); expect(fixture.action("start")).toHaveLength(1); expect(fixture.mutations()).toHaveLength(4);
+  });
+});
+
+
+describe("offline Pi default hook uses public attempts and detach-only HTTP recovery", () => {
+  it("mount/refresh/remount without a known Pi handle performs only public GET observations", async () => {
+    const fixture = await setup(true), first = fixture.mount(); await flush();
+    expect(first.snapshot().target).toEqual({ harness: "pi", contextKey: piContext });
+    expect(first.snapshot().piCapabilities).toEqual({ canStartLogin: true, canCloseAttempt: false, canReply: false, canLogout: false });
+    await first.controller().refresh(); first.unmount(); const returned = fixture.mount(); await flush();
+    expect(fixture.calls.every(call => call.method === "GET")).toBe(true); expect(fixture.action("attempt-read")).toHaveLength(0);
+    expect(returned.snapshot().state?.account).toBeNull(); expect(returned.snapshot().state?.execution).toBeNull();
+  });
+
+  it("AbortError start cleanup recovers the same handle through GET and a captured reply is never replayed on remount", async () => {
+    const fixture = await setup(true); fixture.held.add("start"); const first = fixture.mount(); await flush(); fixture.connect(first); await flush();
+    const start = fixture.action("start")[0]!; expect(start.body).toEqual({ attemptHandle: piHandle }); first.unmount(); await flush();
+    expect(start.signal.aborted).toBe(true); expect(start.rejection).toBeInstanceOf(DOMException); expect((start.rejection as DOMException).name).toBe("AbortError");
+    const returned = fixture.mount(); await flush(); expect(returned.snapshot().piLoginAttempt?.handle).toBe(piHandle);
+    expect(returned.snapshot().piLoginAttempt?.prompt?.promptId).toBe("offline-pi-prompt"); expect(fixture.action("attempt-read")).toHaveLength(1);
+    const mutations = fixture.mutations().length; await vi.advanceTimersByTimeAsync(2_001); await flush();
+    expect(fixture.action("attempt-read").length).toBeGreaterThan(1); expect(fixture.mutations()).toHaveLength(mutations);
+    const intent = { target: returned.snapshot().target, attemptHandle: piHandle, promptId: "offline-pi-prompt" };
+    await returned.controller().replyPiLogin(intent, "synthetic-local-callback"); await flush();
+    expect(fixture.action("reply")[0]!.body).toEqual({ attemptHandle: piHandle, promptId: "offline-pi-prompt", callbackUrl: "synthetic-local-callback" });
+    expect(JSON.stringify(returned.snapshot())).not.toContain("synthetic-local-callback"); fixture.piAttempt(publicPiAttempt("exchanging")); returned.unmount();
+    const third = fixture.mount(); await flush(); expect(third.snapshot().piLoginAttempt?.status).toBe("exchanging");
+    expect(fixture.action("reserve")).toHaveLength(1); expect(fixture.action("start")).toHaveLength(1); expect(fixture.action("reply")).toHaveLength(1); expect(fixture.action("close")).toHaveLength(0);
+    expect(fixture.calls.some(call => /codex\/(login|bind|logout)/.test(call.url))).toBe(false);
+  });
+
+  it("Close stays alive across AbortError cleanup/remount and restores its receipt without changing current generation or dirty draft", async () => {
+    const fixture = await setup(true); fixture.held.add("start"); fixture.held.add("close"); const first = fixture.mount(); await flush(); fixture.connect(first); await flush();
+    first.controller().closePiLogin(first.snapshot().target, piHandle); first.controller().closePiLogin(first.snapshot().target, piHandle); await flush();
+    const close = fixture.action("close")[0]!, start = fixture.action("start")[0]!; expect(close.keepalive).toBe(true); expect(close.signal).not.toBe(start.signal);
+    first.unmount(); await flush(); expect(start.signal.aborted).toBe(true); expect(close.signal.aborted).toBe(false);
+    fixture.state({ ...observedPi(4), localAuthentication: "oauth-present" }); const returned = fixture.mount(); await flush();
+    returned.controller().edit({ action: "choose-option", target: returned.snapshot().target, field: "model", choiceKey: "retained-pi-model" }); await flush();
+    expect(returned.snapshot().piAuthBusy).toBe("close"); expect(returned.snapshot().ownerGeneration).toBe(4); const draft = returned.snapshot().draft;
+    const result: StudioPiCloseResult = { outcome: "already-committed", attempt: publicPiAttempt("saved") }; close.reply({ result }); await flush();
+    expect(returned.snapshot().piCloseResult).toEqual(result); expect(returned.snapshot().piAuthBusy).toBeNull();
+    expect(returned.snapshot().ownerGeneration).toBe(4); expect(returned.snapshot().draft).toEqual(draft); expect(returned.snapshot().revision).toBe(0);
+    expect(returned.snapshot().state?.localAuthentication).toBe("oauth-present"); expect(returned.snapshot().state?.execution).toBeNull();
+    returned.controller().closePiLogin(returned.snapshot().target, piHandle); await flush(); expect(fixture.action("close")).toHaveLength(1);
+    expect(fixture.action("reserve")).toHaveLength(1); expect(fixture.action("start")).toHaveLength(1); expect(fixture.action("reply")).toHaveLength(0);
+  });
+
+  it.each(["lost", "timeout"] as const)("%s Close is uncertain after remount, never automatically replayed, and an explicit exact-handle check is deduplicated", async outcome => {
+    const fixture = await setup(true); fixture.held.add("close"); const first = fixture.mount(); await flush(); fixture.connect(first); await flush();
+    first.controller().closePiLogin(first.snapshot().target, piHandle); await flush(); const close = fixture.action("close")[0]!; first.unmount(); await flush();
+    if (outcome === "lost") close.reject(new TypeError("offline response lost")); else await vi.advanceTimersByTimeAsync(15_001); await flush();
+    if (outcome === "timeout") { expect(close.signal.aborted).toBe(true); expect((close.rejection as DOMException).name).toBe("AbortError"); }
+    const returned = fixture.mount(); await flush(); await returned.controller().refresh(); await flush();
+    expect(returned.snapshot().piAuthDetail?.en).toMatch(/uncertain/i); expect(returned.snapshot().piCanClose).toBe(true); expect(fixture.action("close")).toHaveLength(1);
+    returned.controller().closePiLogin(returned.snapshot().target, "other-pi-handle"); await flush(); expect(fixture.action("close")).toHaveLength(1);
+    returned.controller().closePiLogin(returned.snapshot().target, piHandle); returned.controller().closePiLogin(returned.snapshot().target, piHandle); await flush();
+    expect(fixture.action("close")).toHaveLength(2); expect(fixture.action("close")[1]!.body).toEqual({ attemptHandle: piHandle });
+    fixture.action("close")[1]!.reply({ result: { outcome: "closed", attempt: publicPiAttempt("closed") } }); await flush();
+    expect(returned.snapshot().piCloseResult?.outcome).toBe("closed"); expect(fixture.action("reserve")).toHaveLength(1); expect(fixture.action("start")).toHaveLength(1);
+  });
+
+  it("a detached held attempt read gets AbortError and cannot expose an old prompt after a different context is selected", async () => {
+    const fixture = await setup(true), first = fixture.mount(); await flush(); fixture.connect(first); await flush(); fixture.held.add("attempt-read");
+    const reading = first.controller().refreshPiLogin(); await flush(); const read = fixture.action("attempt-read")[0]!;
+    first.controller().selectTarget({ harness: "pi", contextKey: "different-pi-context" }); await reading; await flush();
+    expect(read.signal.aborted).toBe(true); expect((read.rejection as DOMException).name).toBe("AbortError");
+    expect(first.snapshot().piLoginAttempt).toBeNull(); expect(first.snapshot().piCloseResult).toBeUndefined(); expect(fixture.action("close")).toHaveLength(0);
+    expect(fixture.action("reserve")).toHaveLength(1); expect(fixture.action("start")).toHaveLength(1);
   });
 });

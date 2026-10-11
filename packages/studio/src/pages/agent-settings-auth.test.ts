@@ -1,7 +1,8 @@
-import { Children, isValidElement, type ReactElement, type ReactNode } from "react";
+import { Children, cloneElement, isValidElement, type ReactElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { unavailableHarnessState, type AgentSettings as Settings, type DeviceLoginAttemptCloseResult, type HarnessState } from "../shared/agent-configuration";
+import { unavailableHarnessState, type AgentSettings as Settings, type DeviceLoginAttemptCloseResult, type HarnessState, type StudioPiLoginAttempt } from "../shared/agent-configuration";
 import type { AgentConfigurationSnapshot } from "../hooks/agent-configuration-controller";
+import type { PiAuthenticationView, TargetView } from "../components/agent-configuration-ui/view-model";
 
 interface Slot { dependencies?: readonly unknown[]; value?: unknown; cleanup?: () => void; subscribe?: unknown }
 interface PageFrame { cursor: number; slots: Slot[]; effects: (() => void)[]; mounted: boolean; schedule(): void; snapshot?: () => AgentConfigurationSnapshot }
@@ -18,6 +19,21 @@ vi.mock("react", async () => {
   const same = (a: readonly unknown[] | undefined, b: readonly unknown[] | undefined) =>
     !!a && !!b && a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
   return { ...actual,
+    useState: <T>(initial: T | (() => T)) => {
+      const frame = boundary.current(), index = frame.cursor++;
+      const slot = frame.slots[index] ?? (frame.slots[index] = { value: typeof initial === "function" ? (initial as () => T)() : initial });
+      return [slot.value as T, (value: T | ((previous: T) => T)) => {
+        if (!frame.mounted) return;
+        const next = typeof value === "function" ? (value as (previous: T) => T)(slot.value as T) : value;
+        if (Object.is(slot.value, next)) return;
+        slot.value = next;
+        frame.schedule();
+      }] as const;
+    },
+    useRef: <T>(initial: T) => {
+      const frame = boundary.current(), index = frame.cursor++;
+      return (frame.slots[index] ?? (frame.slots[index] = { value: { current: initial } })).value as { current: T };
+    },
     useMemo: <T>(create: () => T, dependencies?: readonly unknown[]): T => {
       const frame = boundary.current(), index = frame.cursor++, old = frame.slots[index];
       if (!old || !same(old.dependencies, dependencies)) frame.slots[index] = { dependencies, value: create() };
@@ -39,6 +55,13 @@ vi.mock("react", async () => {
 });
 
 type Element = ReactElement<Record<string, unknown>>;
+function expand(node: ReactNode): ReactNode {
+  return Children.map(node, child => {
+    if (!isValidElement<Record<string, unknown>>(child)) return child;
+    if (typeof child.type === "function") return expand((child.type as (props: Record<string, unknown>) => ReactNode)(child.props));
+    return cloneElement(child, {}, expand(child.props.children as ReactNode));
+  });
+}
 function native(node: ReactNode, tag: string): Element[] {
   const result: Element[] = [];
   Children.forEach(node, child => {
@@ -156,6 +179,245 @@ async function setup(initialState = observed()) {
     action: (name: Action) => calls.filter(call => call.action === name), mutations: () => calls.filter(call => call.method !== "GET"),
     stateReads: () => calls.filter(call => call.url.endsWith("/state")) };
 }
+
+// Controlled presentation fixtures are synthetic. Only React scheduling is simulated;
+// these cases do not establish real login, browser focus, inference or deployment.
+async function controlledPi(isZh = false) {
+  const { AgentConfigurationPanel } = await import("../components/agent-configuration-ui/AgentConfigurationPanel");
+  const { offlinePiSaved } = await import("../components/agent-configuration-ui/fixtures");
+  const actions = { intent: vi.fn(), reply: vi.fn(), close: vi.fn(), save: vi.fn(), select: vi.fn() };
+  let target: TargetView = { harness: "pi", contextKey: "pi-controlled-context" };
+  let auth: PiAuthenticationView = { target, phase: "awaiting-user", capabilities: { canStartLogin: true, canCloseAttempt: true, canReply: true, canLogout: false },
+    handle: "pi-controlled-handle", promptId: "pi-controlled-prompt", authorizationUrl: "https://auth.openai.com/api/accounts/authorize?state=OFFLINE", busy: null,
+    canClose: true, catalogConfirmed: false };
+  let tree: ReactNode;
+  const frame: PageFrame = { cursor: 0, slots: [], effects: [], mounted: true, schedule: () => { if (frame.mounted) render(); } };
+  function render() {
+    frame.cursor = 0; boundary.enter(frame);
+    try {
+      tree = expand(AgentConfigurationPanel({ id: "pi-controlled", view: { ...offlinePiSaved, target,
+        connection: { target, phase: "signing-in" }, piAuthentication: auth }, isZh, canSave: true, hasChanges: true,
+        onConnectionIntent: actions.intent, onPiReply: actions.reply, onPiClose: actions.close,
+        onSaveIntent: actions.save, onSelectionIntent: actions.select, onHarnessChange: vi.fn() }));
+    } finally { boundary.leave(); }
+    for (const slot of frame.slots.splice(frame.cursor)) slot.cleanup?.();
+    for (const effect of frame.effects.splice(0)) effect();
+  }
+  const controls = (tag: string) => native(tree, tag);
+  const button = (label: string) => controls("button").find(element => contents(element.props.children as ReactNode) === label)!;
+  const page = { actions, controls, button, text: () => contents(tree),
+    set: (patch: Partial<PiAuthenticationView>) => { auth = { ...auth, ...patch }; render(); },
+    target: () => target,
+    switchTarget: (value: TargetView) => { target = value; render(); },
+    input: () => controls("input").find(element => element.props["aria-label"] === (isZh ? "Pi · 登录回调网址" : "Pi · Sign-in callback URL"))!,
+    type: (value: string) => { const input = page.input(); expect(input).toBeDefined(); (input.props.onChange as (event: { target: { value: string } }) => void)({ target: { value } }); },
+    submit: () => { const form = controls("form")[0]!; expect(form).toBeDefined(); (form.props.onSubmit as (event: { preventDefault(): void }) => void)({ preventDefault() {} }); },
+    unmount: () => { frame.mounted = false; for (const slot of [...frame.slots].reverse()) slot.cleanup?.(); } };
+  mounts.push(page); render(); return page;
+}
+
+describe("Pi-specific controlled callback and independent capabilities", () => {
+  it.each([false, true])("renders a disabled Pi logout with a reason and a safe manual official challenge (isZh=%s)", async isZh => {
+    const page = await controlledPi(isZh);
+    const logout = page.button(isZh ? "退出 ChatGPT" : "Sign out of ChatGPT");
+    expect(logout).toBeDefined(); expect(logout.props.disabled).toBe(true);
+    expect(page.text()).toMatch(isZh ? /Pi.*暂不支持.*退出/ : /Pi.*sign-out.*unavailable/i);
+    const link = page.controls("a")[0]!;
+    expect(link.props.href).toBe("https://auth.openai.com/api/accounts/authorize?state=OFFLINE");
+    expect(link.props.target).toBe("_blank"); expect(link.props.rel).toBe("noopener noreferrer");
+    expect(page.input().props.autoComplete).toBe("off"); expect(page.input().props.spellCheck).toBe(false);
+    expect(page.text()).toMatch(isZh ? /127\.0\.0\.1.*服务器/ : /127\.0\.0\.1.*server/i);
+    expect(page.actions.intent).not.toHaveBeenCalled();
+  });
+  it("submits callback only to the target-bound dedicated reply and immediately clears component-local input", async () => {
+    const page = await controlledPi(); const callback = "http://127.0.0.1:1455/auth/callback?code=OFFLINE&state=OFFLINE";
+    page.type(callback); page.submit();
+    expect(page.actions.reply).toHaveBeenCalledExactlyOnceWith(page.target(), "pi-controlled-handle", "pi-controlled-prompt", callback);
+    expect(page.input().props.value).toBe(""); expect(page.actions.intent).not.toHaveBeenCalled(); expect(page.actions.save).not.toHaveBeenCalled();
+  });
+  it.each([
+    "https://evil.invalid/api/accounts/authorize", "http://auth.openai.com/api/accounts/authorize",
+    "https://auth.openai.com@evil.invalid/api/accounts/authorize", "https://auth.openai.com/api/accounts/authorize#callback",
+    "https://auth.openai.com/codex/device", "https://user@auth.openai.com/api/accounts/authorize",
+  ])("rejects an unverified challenge without exposing an active link or reply (%s)", async authorizationUrl => {
+    const page = await controlledPi(); page.set({ authorizationUrl });
+    expect(page.controls("a")).toHaveLength(0); expect(page.input().props.disabled).toBe(true);
+    expect(page.text()).toMatch(/sign-in URL is unverified/i);
+    page.type("OFFLINE-SENSITIVE"); page.submit(); expect(page.actions.reply).not.toHaveBeenCalled();
+  });
+  it("clears callback on explicit Close, context/prompt/harness changes and unmount without implicit Close", async () => {
+    const page = await controlledPi();
+    page.type("OFFLINE-BEFORE-CLOSE"); (page.button("Close this Pi sign-in").props.onClick as () => void)();
+    expect(page.actions.close).toHaveBeenCalledExactlyOnceWith(page.target(), "pi-controlled-handle");
+    expect(page.input().props.value).toBe(""); page.actions.close.mockClear();
+    page.type("OFFLINE-BEFORE-PROMPT"); page.set({ promptId: "pi-next-prompt" }); expect(page.input().props.value).toBe("");
+    page.type("OFFLINE-BEFORE-CONTEXT"); page.switchTarget({ harness: "pi", contextKey: "pi-next-context" });
+    expect(page.input()).toBeUndefined(); expect(page.actions.close).not.toHaveBeenCalled();
+    page.switchTarget({ harness: "pi", contextKey: "pi-controlled-context" });
+    page.type("OFFLINE-BEFORE-HARNESS"); const staleSubmit = page.controls("form")[0]!.props.onSubmit as (event: { preventDefault(): void }) => void;
+    page.switchTarget({ harness: "codex", contextKey: "codex-context" });
+    staleSubmit({ preventDefault() {} }); expect(page.actions.reply).not.toHaveBeenCalled(); expect(page.actions.close).not.toHaveBeenCalled();
+    page.switchTarget({ harness: "pi", contextKey: "pi-controlled-context" }); expect(page.input().props.value).toBe("");
+    page.type("OFFLINE-BEFORE-UNMOUNT"); const unmountedSubmit = page.controls("form")[0]!.props.onSubmit as typeof staleSubmit;
+    page.unmount(); unmountedSubmit({ preventDefault() {} }); expect(page.actions.reply).not.toHaveBeenCalled(); expect(page.actions.close).not.toHaveBeenCalled();
+  });
+  it("honors each Pi capability independently while save and harness selection remain available", async () => {
+    const page = await controlledPi();
+    page.set({ capabilities: { canStartLogin: false, canReply: false, canCloseAttempt: false, canLogout: false } });
+    expect(page.input().props.disabled).toBe(true); expect(page.button("Close this Pi sign-in").props.disabled).toBe(true);
+    expect(page.button("Save defaults · Pi").props.disabled).toBeFalsy();
+    expect(page.controls("input").filter(item => item.props.type === "radio").every(item => !item.props.disabled)).toBe(true);
+    page.set({ phase: "reserved", busy: "reserve", handle: undefined, promptId: undefined, canClose: true });
+    const close = page.button("Close this Pi sign-in"); expect(close.props.disabled).toBeFalsy();
+    (close.props.onClick as () => void)(); expect(page.actions.close).toHaveBeenCalledExactlyOnceWith(page.target(), undefined);
+    page.set({ phase: "idle", busy: null, canClose: false }); expect(page.button("Sign in with ChatGPT").props.disabled).toBe(true);
+    page.set({ capabilities: { canStartLogin: true, canReply: false, canCloseAttempt: false, canLogout: false } });
+    (page.button("Sign in with ChatGPT").props.onClick as () => void)();
+    expect(page.actions.intent).toHaveBeenCalledExactlyOnceWith({ action: "connect", target: page.target() }); expect(page.actions.save).not.toHaveBeenCalled();
+  });
+  it.each([false, true])("keeps local credentials, catalog, execution, Close uncertainty and save messages separate (isZh=%s)", async isZh => {
+    const page = await controlledPi(isZh); page.set({ phase: "saved", busy: null, catalogConfirmed: false, detail: { zh: "目录请求失败", en: "Catalog request failed" } });
+    expect(page.controls("a")).toHaveLength(0); expect(page.controls("form")).toHaveLength(0);
+    expect(page.text()).toMatch(isZh ? /本地凭证已保存，模型目录待确认/ : /Local credentials saved; model catalog unconfirmed/);
+    expect(page.text()).toMatch(isZh ? /执行尚未验证/ : /execution remain unverified/);
+    expect(page.text()).toMatch(isZh ? /目录请求失败/ : /Catalog request failed/);
+    page.set({ closeOutcome: "already-committed" }); expect(page.text()).toMatch(isZh ? /关闭不会退出/ : /Close does not sign out/);
+    page.set({ closeOutcome: "unknown" }); expect(page.text()).toMatch(isZh ? /关闭结果不确定/ : /Close outcome is unknown/);
+    expect(page.text()).not.toMatch(/cancel.acknowledged|取消已确认/i);
+    expect(page.button(isZh ? "保存默认配置 · Pi" : "Save defaults · Pi").props.disabled).toBeFalsy();
+  });
+  it.each([
+    ["awaiting-user", /Waiting for you/, /等待手动/], ["exchanging", /outcome unconfirmed/, /结果尚未确认/],
+    ["closing", /Close outcome unconfirmed/, /关闭结果尚未确认/], ["closed", /sign-in is closed/, /登录已关闭/],
+    ["unknown", /outcome is unknown/, /结果不确定/], ["failed", /did not complete/, /登录未完成/],
+  ] as const)("announces the independent Pi %s state in both languages", async (phase, en, zh) => {
+    for (const isZh of [false, true]) {
+      const page = await controlledPi(isZh); page.set({ phase });
+      expect(page.text()).toMatch(isZh ? zh : en);
+      expect(page.controls("p").some(item => item.props.role === "status" && item.props["aria-live"] === "polite")).toBe(true);
+      expect(page.actions.intent).not.toHaveBeenCalled(); expect(page.actions.save).not.toHaveBeenCalled();
+    }
+  });
+  it("maps saved Pi credentials with failed catalog observations without claiming account, execution or deployment evidence", async () => {
+    const { adaptAgentConfiguration } = await import("./agent-configuration-adapter");
+    const target: TargetView = { harness: "pi", contextKey: "pi-adapter-context" };
+    const savedAttempt: StudioPiLoginAttempt = { harnessId: "pi", handle: "pi-adapter-handle", status: "saved", expiresAt: 123,
+      canReply: false, challenge: null, prompt: null, error: null };
+    const input = { target, ownerGeneration: 3, state: null, draft: nativePreferences, saved: nativePreferences, savePhase: "saved" as const,
+      piCapabilities: { canStartLogin: true, canCloseAttempt: true, canReply: true, canLogout: false as const } };
+    const idle = adaptAgentConfiguration(input); expect(idle.piAuthentication?.phase).toBe("idle"); expect(idle.piAuthentication?.closeOutcome).toBeUndefined();
+    const view = adaptAgentConfiguration({ ...input, piLoginAttempt: savedAttempt, piAuthDetail: { zh: "目录失败", en: "Catalog failed" },
+      piCloseResult: { outcome: "already-committed", attempt: savedAttempt } });
+    expect(view.connection.phase).toBe("oauth-present"); expect(view.connection.accountLabel).toBeUndefined();
+    expect(view.catalog.phase).toBe("unavailable"); expect(view.execution).toMatchObject({ phase: "unverified", evidence: "unverified" });
+    expect(view.save.phase).toBe("saved"); expect(view.piAuthentication).toMatchObject({ phase: "saved", catalogConfirmed: false, closeOutcome: "already-committed" });
+    expect(view.piAuthentication).not.toHaveProperty("callbackUrl"); expect(view.piAuthentication).not.toHaveProperty("deploymentVerified");
+    const staleClose = adaptAgentConfiguration({ ...input, piLoginAttempt: savedAttempt,
+      piCloseResult: { outcome: "unknown", attempt: { ...savedAttempt, handle: "pi-other-attempt" } } });
+    expect(staleClose.piAuthentication?.closeOutcome).toBeUndefined();
+  });
+});
+
+async function setupPiPage(isZh = false) {
+  const scope = { harnessId: "pi" as const, authContextRef: "pi-real-page-context", ownerGeneration: 3, adapterVersion: "offline", catalogVersion: "offline" };
+  let catalogAvailable = true, localSaved = false;
+  let stored: Settings = { ...initial, selectedHarnessId: "pi", modelConnectionRef: "existing-codex-owned-ref" };
+  let attempt: StudioPiLoginAttempt = { harnessId: "pi", handle: "pi-real-page-handle", status: "reserved", expiresAt: 123_000,
+    canReply: false, challenge: null, prompt: null, error: null };
+  const held = new Set<string>();
+  const calls: { url: string; method: string; body: Record<string, unknown> | undefined; signal: AbortSignal; reply(value: unknown): void }[] = [];
+  vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+    const url = String(input), method = init?.method ?? "GET", body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
+    let resolve!: (value: Response) => void; const pending = new Promise<Response>(yes => { resolve = yes; });
+    const call = { url, method, body, signal: init?.signal as AbortSignal, reply: (value: unknown) => resolve(Response.json(value)) }; calls.push(call);
+    let automatic: unknown; const action = method === "PUT" ? "save" : url.split("/").at(-1)!;
+    if (method === "PUT") {
+      const request = body as unknown as { patch: { selectedHarnessId: "pi"; harnessPreferences: { pi: Settings["harnessPreferences"]["pi"] } } };
+      stored = { ...stored, revision: stored.revision + 1, selectedHarnessId: request.patch.selectedHarnessId,
+        harnessPreferences: { ...stored.harnessPreferences, pi: request.patch.harnessPreferences.pi } }; automatic = { settings: stored };
+    } else if (url.endsWith("/settings")) automatic = { settings: stored };
+    else if (url.endsWith("/pi/state")) {
+      const source = observed();
+      automatic = { state: { ...source, harnessId: "pi", scope, account: null, localAuthentication: localSaved ? "oauth-present" : "missing", execution: null,
+        connection: { phase: "signed-out", login: null, connectionRef: null },
+        catalog: catalogAvailable ? { ...source.catalog!, scope, value: { ...source.catalog!.value, harnessId: "pi" } } : null } };
+    } else if (url.endsWith("/codex/state")) automatic = { state: observed() };
+    else if (url.endsWith("/pi/login/reserve")) automatic = { attempt };
+    else if (url.endsWith("/pi/login/start")) {
+      attempt = { ...attempt, status: "awaiting-user", canReply: true, challenge: { kind: "open-url", url: "https://auth.openai.com/api/accounts/authorize?state=OFFLINE-PAGE" },
+        prompt: { kind: "callback-url", promptId: "pi-real-page-prompt" } }; automatic = { attempt };
+    } else if (url.endsWith("/pi/login/reply")) {
+      localSaved = true; attempt = { ...attempt, status: "saved", canReply: false, challenge: null, prompt: null }; automatic = { attempt };
+    } else if (url.endsWith("/pi/login/close")) {
+      attempt = { ...attempt, status: "closed", canReply: false, challenge: null, prompt: null }; automatic = { result: { outcome: "closed", attempt } };
+    } else if (url.includes("/pi/login/attempts/")) automatic = { attempt };
+    else throw new Error(`Unexpected offline Pi Page request ${method} ${url}`);
+    releases.push(() => call.reply(automatic)); if (!held.has(action)) call.reply(automatic); return pending;
+  }));
+  const { AgentSettings } = await import("./AgentSettings"); let tree: ReactNode, scheduled = false;
+  const frame: PageFrame = { cursor: 0, slots: [], effects: [], mounted: true, schedule: () => {
+    if (!frame.mounted || scheduled) return; scheduled = true;
+    void Promise.resolve().then(() => { scheduled = false; if (frame.mounted) render(); });
+  } };
+  function render() {
+    frame.cursor = 0; boundary.enter(frame);
+    try { tree = expand(AgentSettings({ isZh })); } finally { boundary.leave(); }
+    for (const slot of frame.slots.splice(frame.cursor)) slot.cleanup?.();
+    for (const effect of frame.effects.splice(0)) effect();
+  }
+  const controls = (tag: string) => native(tree, tag);
+  const button = (label: string) => { const result = controls("button").find(item => contents(item.props.children as ReactNode) === label); expect(result).toBeDefined(); return result!; };
+  const page = { calls, held, snapshot: () => frame.snapshot!(), controls, button, text: () => contents(tree),
+    catalog: (available: boolean) => { catalogAvailable = available; },
+    click: (label: string) => { const item = button(label); expect(item.props.disabled).toBeFalsy(); (item.props.onClick as () => void)(); },
+    model: (value: string) => { const select = controls("select").find(item => item.props["aria-label"] === (isZh ? "模型" : "Model"))!;
+      expect(select.props.disabled).toBeFalsy(); (select.props.onChange as (event: { target: { value: string } }) => void)({ target: { value } }); },
+    submit: (callback: string) => { const input = controls("input").find(item => item.props["aria-label"] === (isZh ? "Pi · 登录回调网址" : "Pi · Sign-in callback URL"))!;
+      expect(input.props.disabled).toBeFalsy(); (input.props.onChange as (event: { target: { value: string } }) => void)({ target: { value: callback } });
+      (controls("form")[0]!.props.onSubmit as (event: { preventDefault(): void }) => void)({ preventDefault() {} }); },
+    action: (value: string) => calls.filter(call => call.url.endsWith(`/pi/login/${value}`)),
+    unmount: () => { if (!frame.mounted) return; frame.mounted = false; for (const slot of [...frame.slots].reverse()) slot.cleanup?.(); } };
+  mounts.push(page); render(); await flush(); return page;
+}
+
+describe("real Pi AgentSettings with default hook and transport (offline React boundary)", () => {
+  it.each([false, true])("routes dedicated callback, preserves dirty preferences and saves independently of catalog failure (isZh=%s)", async isZh => {
+    const page = await setupPiPage(isZh); page.model("other"); page.click(isZh ? "使用 ChatGPT 登录" : "Sign in with ChatGPT"); await flush();
+    expect(page.snapshot().draft.model).toBe("other"); expect(page.snapshot().hasChanges).toBe(true);
+    expect(page.button(isZh ? "保存默认配置 · Pi" : "Save defaults · Pi").props.disabled).toBeFalsy();
+    const callback = "http://127.0.0.1:1455/auth/callback?code=OFFLINE-PAGE&state=OFFLINE-PAGE";
+    page.catalog(false); page.submit(callback); await flush();
+    expect(page.action("reply")[0]!.body).toEqual({ attemptHandle: "pi-real-page-handle", promptId: "pi-real-page-prompt", callbackUrl: callback });
+    expect(JSON.stringify(page.snapshot())).not.toContain(callback); expect(page.snapshot().draft.model).toBe("other");
+    expect(page.text()).toMatch(isZh ? /本地凭证已保存，模型目录待确认/ : /Local credentials saved; model catalog unconfirmed/);
+    page.click(isZh ? "保存默认配置 · Pi" : "Save defaults · Pi"); await flush();
+    expect(page.snapshot().savePhase).toBe("saved"); expect(page.snapshot().baseline?.modelConnectionRef).toBe("existing-codex-owned-ref");
+    expect(page.snapshot().baseline?.harnessPreferences.pi.model).toBe("other"); expect(page.snapshot().state?.execution).toBeNull();
+    expect(page.calls.filter(call => call.method !== "GET" && call.url.includes("/codex/"))).toHaveLength(0);
+    expect(page.calls.filter(call => /\/logout$|\/bind$/.test(call.url))).toHaveLength(0);
+  });
+  it("records target-bound Close during a pending reservation and never starts that attempt", async () => {
+    const page = await setupPiPage(); page.held.add("reserve"); page.click("Sign in with ChatGPT"); await flush();
+    page.model("other"); await flush(); expect(page.button("Save defaults · Pi").props.disabled).toBeFalsy();
+    page.click("Close this Pi sign-in"); await flush(); expect(page.action("close")).toHaveLength(0);
+    page.action("reserve")[0]!.reply({ attempt: { harnessId: "pi", handle: "pi-real-page-handle", status: "reserved", expiresAt: 123_000,
+      canReply: false, challenge: null, prompt: null, error: null } }); await flush();
+    expect(page.action("start")).toHaveLength(0); expect(page.action("close")[0]!.body).toEqual({ attemptHandle: "pi-real-page-handle" });
+    expect(page.snapshot().draft.model).toBe("other"); expect(page.text()).toMatch(/Pi sign-in is closed/);
+  });
+  it("clears callback when the actual harness radio switches and detaches without closing the Pi attempt", async () => {
+    const page = await setupPiPage(); page.click("Sign in with ChatGPT"); await flush();
+    const input = page.controls("input").find(item => item.props["aria-label"] === "Pi · Sign-in callback URL")!;
+    (input.props.onChange as (event: { target: { value: string } }) => void)({ target: { value: "OFFLINE-SWITCH-SECRET" } }); await flush();
+    const staleSubmit = page.controls("form")[0]!.props.onSubmit as (event: { preventDefault(): void }) => void;
+    const codex = page.controls("input").find(item => item.props.type === "radio" && item.props.value === "codex")!;
+    expect(codex.props.disabled).toBeFalsy(); (codex.props.onChange as () => void)(); await flush();
+    staleSubmit({ preventDefault() {} }); await flush();
+    expect(page.snapshot().target.harness).toBe("codex"); expect(page.action("reply")).toHaveLength(0); expect(page.action("close")).toHaveLength(0);
+    expect(page.controls("input").some(item => item.props["aria-label"] === "Pi · Sign-in callback URL")).toBe(false);
+    expect(JSON.stringify(page.snapshot())).not.toContain("OFFLINE-SWITCH-SECRET");
+  });
+});
 async function beginAttemptOnlyClose(isZh = false) {
   const fixture = await setup(); fixture.held.add("start"); fixture.held.add("close");
   const first = fixture.mount(isZh); await flush(); expect(first.snapshot().ownerGeneration).toBe(3); expect(fixture.mutations()).toHaveLength(0);

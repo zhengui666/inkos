@@ -1,6 +1,17 @@
 import type { AgentSettings, HarnessCapabilityCatalog, HarnessId, HarnessPreferences } from "@actalk/inkos-core";
 import type { StudioCodexLogin } from "./codex.js";
 
+// Separate public Pi contract; it never becomes a Codex device-login record.
+export type { PiLoginAttempt as StudioPiLoginAttempt, PiCloseResult as StudioPiCloseResult,
+  PiAccountErrorCode as StudioPiAccountErrorCode } from "@actalk/inkos-core";
+export interface PiAuthenticationCapabilities {
+  /** An available request entry point; the Core start gate still verifies deployment. */
+  readonly canStartLogin: boolean;
+  readonly canCloseAttempt: boolean;
+  readonly canReply: boolean;
+  readonly canLogout: false;
+}
+
 export type { AgentSettings, HarnessId, HarnessPreferences };
 export interface SettingsUpdate {
   readonly expectedRevision: number;
