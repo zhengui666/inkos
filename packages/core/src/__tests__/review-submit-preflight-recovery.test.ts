@@ -80,7 +80,7 @@ async function setup() {
   return { root, paths, bookDir, browser, snapshot, pipeline, store, job, capturePolicy,
     setClosure: (value: boolean) => { requireStoryClosure = value; },
     setLanguage: async (language: 'zh' | 'en') => { await state.saveBookConfig('book', { ...await state.loadBookConfig('book'), language }); },
-    publisher: () => publisher, latest: () => scheduler.latest('book')!,
+    publisher: () => publisher, scheduler: () => scheduler, latest: () => scheduler.latest('book')!,
     save: (job: ScheduledChapter) => scheduler.save(job, 'offline-fixture'),
     run: (job: ScheduledChapter) => runner.run(job, signal()), advance: () => { clock += 10000; },
     pause: () => { continuing = false; }, resume: () => { continuing = true; },
@@ -166,12 +166,26 @@ it.each(['styleGuide', 'language', 'closure'] as const)('returns to review after
   // Suspend publication after the new review, so recovery and final submission
   // are independently visible rather than hidden in one scheduler tick.
   f.pipeline.reviewChapter.mockImplementationOnce(async () => {
-    const reviewInputs = await f.capture(), reviewPolicy = await f.capturePolicy(); f.pause();
+    const reviewInputs = await f.capture(), reviewPolicy = await f.capturePolicy();
     return { chapterNumber: 1, summary: 'Offline review after blocked CDP preflight.',
       observations: reviewPolicy.requireStoryClosure ? [closureObservation] : [], reviewInputs, reviewPolicy };
   });
   await f.restart();
-  const resumed = await f.run(f.latest());
+  const scheduler = f.scheduler(), originalSave = scheduler.save.bind(scheduler);
+  let acceptedSaves = 0;
+  const save = vi.spyOn(scheduler, 'save').mockImplementation((job, event, now) => {
+    originalSave(job, event, now);
+    if (event === 'review-accepted') {
+      acceptedSaves += 1;
+      expect(f.latest().phase).toBe('publishing');
+      expect(f.latest().reviewReceipt).toEqual(job.reviewReceipt);
+      f.pause();
+    }
+  });
+  let resumed: ScheduledChapter;
+  try { resumed = await f.run(f.latest()); }
+  finally { save.mockRestore(); }
+  expect(acceptedSaves).toBe(1);
   expect(binding.submit).not.toHaveBeenCalled();
   expect(resumed.phase).toBe('publishing');
   expect(resumed.reviewReceipt?.inputs).toEqual(await f.capture());
@@ -206,4 +220,24 @@ it.each(['styleGuide', 'language', 'closure'] as const)('returns to review after
     durablePhase: durable.phase, packageId: durable.packageId, remoteChapterId: durable.remoteChapterId, revisionId: durable.revisionId,
     afterRestart: { phase: resumed.phase, reviewChecks: resumed.reviewChecks, receiptRetained: !!resumed.reviewReceipt },
     finalPhase: completed.phase, actualSubmissions: vi.mocked(binding.submit).mock.calls.length }));
+});
+
+it('does not accept a review when paused before the review callback returns', async () => {
+  const f = await setup();
+  f.save({ ...f.job, reviewChecks: 2 });
+  f.pipeline.reviewChapter.mockImplementationOnce(async () => {
+    const reviewInputs = await f.capture(), reviewPolicy = await f.capturePolicy();
+    f.pause();
+    return { chapterNumber: 1, summary: 'Offline review paused before acceptance.',
+      observations: [], reviewInputs, reviewPolicy };
+  });
+  const result = await f.run(f.latest());
+  expect(result.phase).toBe('reviewing');
+  expect(result.reviewReceipt).toBeUndefined();
+  expect(result.reviewChecks).toBe(3);
+  expect(f.latest()).toEqual(result);
+  expect(f.scheduler().events().filter(event => event.type === 'review-accepted')).toHaveLength(0);
+  expect(f.pipeline.reviewChapter).toHaveBeenCalledOnce();
+  expect(f.browser.createDraft).not.toHaveBeenCalled();
+  expect(f.browser.submit).not.toHaveBeenCalled();
 });
