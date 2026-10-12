@@ -1,252 +1,130 @@
-import { Command } from "commander";
-import { findProjectRoot, log, logError, GLOBAL_CONFIG_DIR } from "../utils.js";
 import { spawn } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { randomUUID } from "node:crypto";
+import { mkdir, open, readFile, unlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { Command } from "commander";
+import { RuntimeClient } from "../runtime.js";
 import { ensureProjectDirectoryInitialized } from "../project-bootstrap.js";
+import { integer, logError, output, projectRoot } from "../utils.js";
 
-export interface StudioLaunchSpec {
-  readonly studioEntry: string;
-  readonly command: string;
-  readonly args: string[];
-}
+export type StudioOptions = { port?: number; host?: string };
+type StudioEndpoint = { pid: number; rootDir: string; url: string; controlUrl: string; token: string };
+const endpointPath = (root: string) => join(root, ".inkos", "cli-studio.json");
+const publicEndpoint = ({ pid, rootDir, url }: StudioEndpoint) => ({ pid, rootDir, url });
 
-export interface BrowserLaunchSpec {
-  readonly command: string;
-  readonly args: string[];
-}
-
-export interface StudioCommandHooks {
-  readonly launchStudio?: (projectRoot: string, port: string) => Promise<void> | void;
-  readonly recentProjectPath?: string;
-}
-
-const DEFAULT_RECENT_STUDIO_PROJECT_PATH = join(GLOBAL_CONFIG_DIR, "studio-project.json");
-
-export async function resolveStudioProjectRoot(
-  requestedRoot: string,
-  options: { readonly explicitProject?: boolean; readonly recentProjectPath?: string } = {},
-): Promise<{ readonly root: string; readonly source: "requested" | "recent" | "new" }> {
-  const root = resolve(requestedRoot);
-  const recentProjectPath = options.recentProjectPath ?? DEFAULT_RECENT_STUDIO_PROJECT_PATH;
-  if (await isInkOSProject(root)) {
-    await saveRecentStudioProject(recentProjectPath, root);
-    return { root, source: "requested" };
-  }
-
-  if (!options.explicitProject) {
-    const recent = await loadRecentStudioProject(recentProjectPath);
-    if (recent && await isInkOSProject(recent)) {
-      return { root: recent, source: "recent" };
-    }
-  }
-
-  return { root, source: "new" };
-}
-
-async function prepareStudioRoot(
-  root: string,
-  options: { readonly explicitProject?: boolean; readonly recentProjectPath?: string } = {},
-): Promise<{ readonly root: string; readonly initialized: boolean; readonly source: "requested" | "recent" | "new" }> {
-  const resolved = await resolveStudioProjectRoot(root, options);
-  const initialized = await ensureProjectDirectoryInitialized(resolved.root, { language: "zh" });
-  await saveRecentStudioProject(options.recentProjectPath ?? DEFAULT_RECENT_STUDIO_PROJECT_PATH, resolved.root);
-  return { ...resolved, initialized };
-}
-
-async function isInkOSProject(root: string): Promise<boolean> {
+export async function findStudio(root: string): Promise<StudioEndpoint | undefined> {
+  let endpoint: StudioEndpoint;
+  try { endpoint = JSON.parse(await readFile(endpointPath(root), "utf8")); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  if (endpoint.rootDir !== root) return undefined;
   try {
-    await access(join(root, "inkos.json"));
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function loadRecentStudioProject(path: string): Promise<string | undefined> {
-  try {
-    const parsed = JSON.parse(await readFile(path, "utf-8")) as { projectRoot?: unknown };
-    return typeof parsed.projectRoot === "string" && parsed.projectRoot.trim()
-      ? resolve(parsed.projectRoot)
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-async function saveRecentStudioProject(path: string, projectRoot: string): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify({ projectRoot }, null, 2), "utf-8");
-}
-
-async function firstAccessiblePath(paths: readonly string[]): Promise<string | undefined> {
-  for (const path of paths) {
-    try {
-      await access(path);
-      return path;
-    } catch {
-      // continue
-    }
-  }
+    const response = await fetch(endpoint.controlUrl, { headers: { authorization: `Bearer ${endpoint.token}` }, signal: AbortSignal.timeout(1000) });
+    const active = await response.json() as { pid: number; rootDir: string };
+    if (response.ok && active.pid === endpoint.pid && active.rootDir === root) return endpoint;
+  } catch { /* The recorded CLI Studio is no longer serving. Never signal its old PID. */ }
   return undefined;
 }
 
-const cliPackageRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-
-export function toNodeImportSpecifier(path: string): string {
-  if (/^[A-Za-z]:[\\/]/.test(path)) {
-    return `file:///${path.replace(/\\/g, "/")}`;
+export async function stopStudio(root: string): Promise<boolean> {
+  const studio = await findStudio(root);
+  if (!studio) return false;
+  const response = await fetch(studio.controlUrl, { method: "POST", headers: { authorization: `Bearer ${studio.token}` } });
+  if (!response.ok) throw new Error("Could not stop the project's CLI Studio.");
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (!await findStudio(root)) return true;
+    await new Promise(resolve => setTimeout(resolve, 100));
   }
-  return path;
+  throw new Error("The project's Studio is still closing; its endpoint was retained.");
 }
 
-export function resolveBrowserLaunch(
-  platform: NodeJS.Platform,
-  url: string,
-): BrowserLaunchSpec {
-  if (platform === "darwin") {
-    return { command: "open", args: [url] };
+/** This control endpoint only closes the Studio started by this CLI, never a host service by PID. */
+export async function serveStudio(root: string, options: StudioOptions): Promise<void> {
+  const client = await RuntimeClient.connect(root);
+  root = client.endpoint.rootDir;
+  const existing = await findStudio(root);
+  if (existing) { output({ studio: publicEndpoint(existing) }); process.send?.({ studio: publicEndpoint(existing) }); return; }
+  const { startStudio } = await import("@actalk/inkos-studio");
+  const studio = await startStudio(root, options);
+  let endpoint: StudioEndpoint;
+  let closing = false;
+  const shutdown = async () => {
+    if (closing) return;
+    closing = true;
+    process.removeListener("SIGINT", onSignal);
+    process.removeListener("SIGTERM", onSignal);
+    await studio.close();
+    await new Promise<void>((resolve, reject) => control.close(error => error ? reject(error) : resolve()));
+    try {
+      const recorded = JSON.parse(await readFile(endpointPath(root), "utf8"));
+      if (recorded.token === endpoint.token) await unlink(endpointPath(root));
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  };
+  const onSignal = () => { void shutdown().catch(error => { logError(String(error)); process.exitCode = 1; }); };
+  const token = randomUUID();
+  const control = createServer((request, response) => {
+    if (request.headers.authorization !== `Bearer ${token}`) { response.writeHead(401).end(); return; }
+    response.setHeader("content-type", "application/json");
+    if (request.method === "GET") response.end(JSON.stringify(publicEndpoint(endpoint)));
+    else if (request.method === "POST") { response.end(JSON.stringify({ stopping: true })); onSignal(); }
+    else response.writeHead(405).end();
+  });
+  try {
+    await new Promise<void>((resolve, reject) => { control.once("error", reject); control.listen(0, "127.0.0.1", resolve); });
+    const address = control.address() as { port: number };
+    endpoint = { pid: process.pid, rootDir: root, url: studio.url, token, controlUrl: `http://127.0.0.1:${address.port}` };
+    await mkdir(join(root, ".inkos"), { recursive: true });
+    await writeFile(endpointPath(root), JSON.stringify(endpoint), { mode: 0o600 });
+    process.once("SIGINT", onSignal);
+    process.once("SIGTERM", onSignal);
+    output({ studio: publicEndpoint(endpoint) });
+    process.send?.({ studio: publicEndpoint(endpoint) });
+  } catch (error) {
+    control.close();
+    await studio.close();
+    throw error;
   }
-  if (platform === "win32") {
-    return { command: "cmd", args: ["/c", "start", "", url] };
-  }
-  return { command: "xdg-open", args: [url] };
 }
 
-export async function resolveStudioLaunch(root: string): Promise<StudioLaunchSpec | null> {
-  const sourceEntry = await firstAccessiblePath([
-    join(root, "packages", "studio", "src", "api", "index.ts"),
-    join(root, "..", "packages", "studio", "src", "api", "index.ts"),
-    join(root, "..", "studio", "src", "api", "index.ts"),
-  ]);
-  if (sourceEntry) {
-    const studioPackageRoot = dirname(dirname(dirname(sourceEntry)));
-    const localTsxLoader = await firstAccessiblePath([
-      join(studioPackageRoot, "node_modules", "tsx", "dist", "loader.mjs"),
-    ]);
-    if (localTsxLoader) {
-      return {
-        studioEntry: sourceEntry,
-        command: "node",
-        args: ["--import", toNodeImportSpecifier(localTsxLoader), sourceEntry, root],
+export async function startBackgroundStudio(root: string, options: StudioOptions): Promise<{ pid: number; rootDir: string; url: string }> {
+  const existing = await findStudio(root);
+  if (existing) return publicEndpoint(existing);
+  const logPath = join(root, ".inkos", "cli-studio.log");
+  const log = await open(logPath, "a", 0o600);
+  const args = [fileURLToPath(new URL("../index.js", import.meta.url)), "--project", root, "studio"];
+  if (options.port !== undefined) args.push("--port", String(options.port));
+  if (options.host !== undefined) args.push("--host", options.host);
+  let child;
+  try {
+    child = spawn(process.execPath, args, { cwd: root, detached: true, stdio: ["ignore", log.fd, log.fd, "ipc"], env: process.env });
+  } finally { await log.close(); }
+  try {
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { cleanup(); reject(new Error(`Studio did not start; see ${logPath}. Runtime remains running.`)); }, 20_000);
+      const cleanup = () => { clearTimeout(timer); child.removeListener("message", onMessage); child.removeListener("error", onError); child.removeListener("exit", onExit); };
+      const onMessage = (message: any) => {
+        if (message.studio) { cleanup(); resolve(message.studio); }
+        else if (message.error) { cleanup(); reject(new Error(message.error)); }
       };
-    }
-
-    const localTsx = await firstAccessiblePath([
-      join(studioPackageRoot, "node_modules", ".bin", "tsx"),
-    ]);
-    if (localTsx) {
-      return {
-        studioEntry: sourceEntry,
-        command: localTsx,
-        args: [sourceEntry, root],
-      };
-    }
-    return {
-      studioEntry: sourceEntry,
-      command: "npx",
-      args: ["tsx", sourceEntry, root],
-    };
-  }
-
-  const builtEntry = await firstAccessiblePath([
-    join(root, "node_modules", "@actalk", "inkos-studio", "dist", "api", "index.js"),
-    join(root, "node_modules", "@actalk", "inkos-studio", "server.cjs"),
-    join(cliPackageRoot, "node_modules", "@actalk", "inkos-studio", "dist", "api", "index.js"),
-    join(cliPackageRoot, "node_modules", "@actalk", "inkos-studio", "server.cjs"),
-    join(cliPackageRoot, "..", "inkos-studio", "dist", "api", "index.js"),
-    join(cliPackageRoot, "..", "inkos-studio", "server.cjs"),
-  ]);
-  if (builtEntry) {
-    return {
-      studioEntry: builtEntry,
-      command: "node",
-      args: [builtEntry, root],
-    };
-  }
-
-  return null;
+      const onError = (error: Error) => { cleanup(); reject(error); };
+      const onExit = (code: number | null) => { cleanup(); reject(new Error(`Studio exited (${code}); see ${logPath}. Runtime remains running.`)); };
+      child.on("message", onMessage); child.once("error", onError); child.once("exit", onExit);
+    });
+  } finally { if (child.connected) child.disconnect(); child.unref(); }
 }
 
-export async function launchStudioWorkbench(root: string, port: string, initialHash = ""): Promise<void> {
-  const url = `http://localhost:${port}${initialHash}`;
-  const launch = await resolveStudioLaunch(root);
-
-  if (!launch) {
-    logError(
-      "InkOS Studio not found. If you cloned the repo, run:\n" +
-      "  cd packages/studio && pnpm install && pnpm build\n" +
-      "Then run 'inkos studio' from the project root.",
-    );
-    process.exit(1);
-  }
-
-  log(`Starting InkOS Studio on ${url}`);
-
-  const child = spawn(launch.command, launch.args, {
-    cwd: root,
-    stdio: "inherit",
-    env: { ...process.env, INKOS_STUDIO_PORT: port },
-  });
-
-  child.on("error", (e) => {
-    logError(`Failed to start studio: ${e.message}`);
-    process.exit(1);
-  });
-
-  const browserLaunch = resolveBrowserLaunch(process.platform, url);
-  const browser = spawn(browserLaunch.command, browserLaunch.args, {
-    cwd: root,
-    stdio: "ignore",
-    detached: true,
-  });
-  browser.on("error", () => {
-    // Best effort only — server startup should not fail just because browser open failed.
-  });
-  if (typeof browser.unref === "function") {
-    browser.unref();
-  }
-
-  child.on("exit", (code) => {
-    process.exit(code ?? 0);
-  });
+export function studioOptions(command: Command): Command {
+  return command.option("--port <number>", "Studio port (0 chooses a free port)", integer, 4567)
+    .option("--host <host>", "Studio bind host", "127.0.0.1");
 }
 
-export async function launchStudioEntry(
-  root: string,
-  port: string,
-  hooks: StudioCommandHooks = {},
-  options: { readonly explicitProject?: boolean } = {},
-): Promise<void> {
-  const prepared = await prepareStudioRoot(root, {
-    explicitProject: options.explicitProject,
-    recentProjectPath: hooks.recentProjectPath,
-  });
-  if (prepared.initialized) {
-    log(`No inkos.json found in ${prepared.root}. Initialized a minimal InkOS project for Studio.`);
-  } else if (prepared.source === "recent") {
-    log(`No InkOS project found in ${resolve(root)}. Reopening recent project: ${prepared.root}`);
-  }
-
-  if (hooks.launchStudio) {
-    await hooks.launchStudio(prepared.root, port);
-    return;
-  }
-
-  await launchStudioWorkbench(prepared.root, port, prepared.initialized ? "#/services" : "");
+export function createStudioCommand(): Command {
+  return studioOptions(new Command("studio").description("Run Studio in the foreground, connected to the independent runtime"))
+    .action(async (options, command) => {
+      const root = projectRoot(command);
+      await ensureProjectDirectoryInitialized(root);
+      try { await serveStudio(root, options); }
+      catch (error) { process.send?.({ error: error instanceof Error ? error.message : String(error) }); throw error; }
+    });
 }
-
-export function createStudioCommand(hooks: StudioCommandHooks = {}): Command {
-  return new Command("studio")
-  .description("Start InkOS Studio web workbench")
-  .option("-p, --port <port>", "Server port", "4567")
-  .option("--project <path>", "Open or initialize a specific InkOS project directory")
-  .action(async (opts) => {
-    const root = opts.project ? resolve(opts.project) : findProjectRoot();
-    const port = opts.port;
-    await launchStudioEntry(root, port, hooks, { explicitProject: Boolean(opts.project) });
-  });
-}
-
-export const studioCommand = createStudioCommand();

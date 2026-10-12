@@ -1,2 +1,7 @@
 packages:
   - "packages/*"
+allowBuilds:
+  '@google/genai': false
+  esbuild: true
+  msw: false
+  protobufjs: false

@@ -43,7 +43,7 @@ function rewriteDependencyVersions(pkg, workspacePackageNames, version) {
     if (!deps) continue;
 
     for (const name of Object.keys(deps)) {
-      if (workspacePackageNames.has(name)) {
+      if (workspacePackageNames.has(name) && !deps[name].startsWith('workspace:')) {
         deps[name] = version;
       }
     }

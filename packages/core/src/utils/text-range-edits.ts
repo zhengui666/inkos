@@ -1,4 +1,4 @@
-import {Type} from '@sinclair/typebox';
+import {Type} from '@earendil-works/pi-ai';
 import {splitSourceLines} from './source-text.js';
 
 export const TextEditRangeSchema=Type.Object({startLine:Type.Integer({minimum:1}),endLine:Type.Integer({minimum:1})});

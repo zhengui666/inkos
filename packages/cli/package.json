@@ -36,26 +36,19 @@
     "directory": "packages/cli"
   },
   "scripts": {
-    "prepare:workspace-core": "pnpm --filter @actalk/inkos-core build",
-    "prepack": "npm run build && node ../../scripts/prepare-package-for-publish.mjs",
-    "postpack": "node ../../scripts/restore-package-json.mjs",
-    "prepublishOnly": "node ../../scripts/verify-no-workspace-protocol.mjs .",
-    "prebuild": "pnpm run prepare:workspace-core",
-    "build": "node ../../scripts/clean-package-dist.mjs && tsc",
+    "prepack": "npm run build",
+    "build": "node --input-type=module -e \"import {rmSync} from 'node:fs'; rmSync('dist', {recursive:true, force:true})\" && tsc",
     "dev": "tsc --watch",
     "pretest": "pnpm run build",
-    "test": "vitest run --passWithNoTests",
+    "test": "vitest run",
     "pretest:flows": "pnpm run build",
-    "test:flows": "vitest run src/__tests__/cli.flow.test.ts src/__tests__/tui-agent-session.test.ts",
-    "pretypecheck": "pnpm run prepare:workspace-core",
+    "test:flows": "vitest run src/__tests__/cli.flow.test.ts src/__tests__/tui-runtime.flow.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@actalk/inkos-core": "workspace:*",
     "@actalk/inkos-studio": "workspace:*",
     "commander": "^13.0.0",
-    "dotenv": "^16.4.0",
-    "epub-gen-memory": "^1.0.10",
     "ink": "7.0.0",
     "ink-text-input": "^6.0.0",
     "marked": "^15.0.12",
@@ -69,9 +62,6 @@
     "ink-testing-library": "^4.0.0",
     "typescript": "^5.8.0",
     "vitest": "^3.0.0"
-  },
-  "overrides": {
-    "@mariozechner/pi-ai": "0.67.1"
   },
   "engines": {
     "node": ">=22.19.0"

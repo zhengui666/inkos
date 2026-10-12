@@ -1,4 +1,4 @@
-import type { InteractionMessage } from "@actalk/inkos-core";
+type HistoryMessage = { role: string; content: string; timestamp?: number };
 
 export interface InputHistoryState {
   readonly cursor: number | null;
@@ -7,7 +7,7 @@ export interface InputHistoryState {
 
 export type InputHistoryDirection = "up" | "down";
 
-export function buildInputHistory(messages: ReadonlyArray<InteractionMessage>): string[] {
+export function buildInputHistory(messages: ReadonlyArray<HistoryMessage>): string[] {
   const result: string[] = [];
 
   for (const message of messages) {

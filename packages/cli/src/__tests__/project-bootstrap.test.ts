@@ -1,71 +1,34 @@
 import { beforeEach, afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { ensureProjectDirectoryInitialized, initializeProjectDirectory } from "../project-bootstrap.js";
+
+let root: string;
+beforeEach(async () => { root = await mkdtemp(join(process.env.PI_SCRATCH_DIR ?? tmpdir(), "inkos-bootstrap-")); });
+afterEach(async () => { await rm(root, { recursive: true, force: true }); });
 
 describe("project bootstrap", () => {
-  const originalHome = process.env.HOME;
-  let tempDir: string;
-
-  beforeEach(async () => {
-    tempDir = await mkdtemp(join(tmpdir(), "inkos-bootstrap-"));
-    process.env.HOME = tempDir;
+  it("creates a minimal project without a runtime, model config, or credential owner", async () => {
+    expect(await ensureProjectDirectoryInitialized(root, { language: "en" })).toBe(true);
+    const config = JSON.parse(await readFile(join(root, "inkos.json"), "utf8"));
+    expect(config).toEqual({ name: root.split("/").at(-1), version: "2.0.0", language: "en" });
+    expect(await readdir(join(root, ".inkos"))).toEqual([]);
+    expect(await readdir(join(root, "works"))).toEqual([]);
   });
-
-  afterEach(async () => {
-    process.env.HOME = originalHome;
-    await rm(tempDir, { recursive: true, force: true });
+  it("preserves existing support files and appends project-local runtime ignores", async () => {
+    await writeFile(join(root, ".env"), "EXISTING=1\n");
+    await writeFile(join(root, ".gitignore"), "dist/\n# keep me\n");
+    await initializeProjectDirectory(root);
+    expect(await readFile(join(root, ".env"), "utf8")).toBe("EXISTING=1\n");
+    const ignored = await readFile(join(root, ".gitignore"), "utf8");
+    expect(ignored).toContain("dist/\n# keep me\n");
+    for (const entry of [".env", "node_modules/", ".DS_Store", ".inkos/", ".inkos-runtime-start.log"]) expect(ignored).toContain(`${entry}\n`);
   });
-
-  it("creates a minimal Studio-first project when none exists", async () => {
-    const { ensureProjectDirectoryInitialized } = await import("../project-bootstrap.js");
-
-    const initialized = await ensureProjectDirectoryInitialized(tempDir, { language: "zh" });
-
-    expect(initialized).toBe(true);
-    const config = JSON.parse(await readFile(join(tempDir, "inkos.json"), "utf-8"));
-    expect(config.name).toMatch(/^inkos-bootstrap-/);
-    expect(config.version).toBe("0.1.0");
-    expect(config.llm.configSource).toBe("studio");
-    expect(config.llm.service).toBe("custom");
-    expect(config.llm.model).toBe("");
-    expect(config.llm.baseUrl).toBe("");
-    await expect(readFile(join(tempDir, ".nvmrc"), "utf-8")).resolves.toBe("22\n");
-    await expect(readFile(join(tempDir, ".node-version"), "utf-8")).resolves.toBe("22\n");
-  }, 20_000);
-
-  it("does not overwrite support files when auto-initializing", async () => {
-    await writeFile(join(tempDir, ".env"), "EXISTING=1\n", "utf-8");
-    await writeFile(join(tempDir, ".gitignore"), "CUSTOM\n", "utf-8");
-
-    const { ensureProjectDirectoryInitialized } = await import("../project-bootstrap.js");
-    await ensureProjectDirectoryInitialized(tempDir, { language: "zh" });
-
-    await expect(readFile(join(tempDir, ".env"), "utf-8")).resolves.toBe("EXISTING=1\n");
-    const gitignore = await readFile(join(tempDir, ".gitignore"), "utf-8");
-    expect(gitignore).toContain("CUSTOM\n");
-    expect(gitignore).toContain(".env\n");
-    expect(gitignore).toContain("node_modules/\n");
-    expect(gitignore).toContain(".DS_Store\n");
-  });
-
-  it("preserves an existing .gitignore when explicitly initializing", async () => {
-    await writeFile(join(tempDir, ".gitignore"), "dist/\n# keep me\n", "utf-8");
-
-    const { initializeProjectDirectory } = await import("../project-bootstrap.js");
-    await initializeProjectDirectory(tempDir, { language: "zh" });
-
-    const gitignore = await readFile(join(tempDir, ".gitignore"), "utf-8");
-    expect(gitignore).toContain("dist/\n# keep me\n");
-    expect(gitignore).toContain(".env\n");
-    expect(gitignore).toContain("node_modules/\n");
-    expect(gitignore).toContain(".DS_Store\n");
-  });
-
-  it("returns false when the directory is already an InkOS project", async () => {
-    await writeFile(join(tempDir, "inkos.json"), "{}\n", "utf-8");
-    const { ensureProjectDirectoryInitialized } = await import("../project-bootstrap.js");
-
-    await expect(ensureProjectDirectoryInitialized(tempDir, { language: "zh" })).resolves.toBe(false);
+  it("never overwrites an initialized project", async () => {
+    await writeFile(join(root, "inkos.json"), "{}\n");
+    expect(await ensureProjectDirectoryInitialized(root)).toBe(false);
+    await expect(initializeProjectDirectory(root)).rejects.toMatchObject({ code: "EEXIST" });
+    expect(await readFile(join(root, "inkos.json"), "utf8")).toBe("{}\n");
   });
 });

@@ -1,398 +1,64 @@
-import { CreationTaskBoard } from "./pages/CreationTaskBoard";
-import { useState, useEffect, lazy, Suspense } from "react";
-import { useHashRoute } from "./hooks/use-hash-route";
-import type { HashRoute } from "./hooks/use-hash-route";
-import { Sidebar } from "./components/Sidebar";
-import { Dashboard } from "./pages/Dashboard";
-import { WorkInspector } from "./pages/WorkInspector";
-import { ChatPage } from "./pages/ChatPage";
-import { BookDetail } from "./pages/BookDetail";
-import { ChapterReader } from "./pages/ChapterReader";
-import { Analytics } from "./pages/Analytics";
-import { ServiceListPage } from "./pages/ServiceListPage";
-import { ServiceDetailPage } from "./pages/ServiceDetailPage";
-import { ProjectSettings } from "./pages/ProjectSettings";
-import { TruthFiles } from "./pages/TruthFiles";
-import { DaemonControl } from "./pages/DaemonControl";
-import { LogViewer } from "./pages/LogViewer";
-import { StyleManager } from "./pages/StyleManager";
-import { TranslationManager } from "./pages/TranslationManager";
-import { ImportManager } from "./pages/ImportManager";
-import { RadarView } from "./pages/RadarView";
-import { DoctorView } from "./pages/DoctorView";
-import { StoryPlayer } from "./pages/StoryPlayer";
-import { StoryGraphTree } from "./pages/StoryGraphTree";
-const FlowView = lazy(() => import("./pages/FlowView"));
-const FilmWizard = lazy(() => import("./pages/FilmWizard"));
-import { LanguageSelector } from "./pages/LanguageSelector";
-import { BookSidebar, BookSidebarToggle } from "./components/chat/BookSidebar";
-import { useSSE } from "./hooks/use-sse";
-import { useSessionEvents } from "./hooks/use-session-events";
-import { useTheme } from "./hooks/use-theme";
-import { useI18n } from "./hooks/use-i18n";
-import { setAppLanguage, tr } from "./lib/app-language";
-import { postApi, putApi, useApi } from "./hooks/use-api";
-import { Sun, Moon } from "lucide-react";
-import { House } from "lucide-react";
+import { useEffect, useState } from 'react';
+import { BookOpen, GitBranch, MessageSquare, Radio, Inbox, KeyRound, Puzzle, Library, Moon, Sun, RefreshCw } from 'lucide-react';
+import { InkosLogo } from './components/InkosLogo';
+import { Action, Badge } from './components/workbench';
+import { useTheme } from './hooks/use-theme';
+import { Workspace, useActions, useRuntime } from './runtime/hooks';
+import { needsAttention, terminalTask } from './runtime/projection';
+import { Works } from './pages/Works';
+import { Tasks } from './pages/Tasks';
+import { Conversations } from './pages/Conversations';
+import { Publishing } from './pages/Publishing';
+import { Models } from './pages/Models';
+import { Plugins } from './pages/Plugins';
+import { Materials } from './pages/Materials';
 
-export type { HashRoute as Route } from "./hooks/use-hash-route";
-
-export function deriveActiveBookId(route: HashRoute): string | undefined {
-  if ("bookId" in route) return route.bookId;
-  return undefined;
+const pages = [
+  { id: 'works', label: 'Works & revisions', icon: BookOpen },
+  { id: 'tasks', label: 'Task tree', icon: GitBranch },
+  { id: 'conversations', label: 'Conversations', icon: MessageSquare },
+  { id: 'publishing', label: 'Publishing', icon: Radio },
+  { id: 'attention', label: 'User actions', icon: Inbox },
+  { id: 'materials', label: 'Materials', icon: Library },
+  { id: 'models', label: 'Models', icon: KeyRound },
+  { id: 'plugins', label: 'Extensions', icon: Puzzle },
+];
+function readRoute() {
+  const [page, id] = location.hash.slice(1).split('/');
+  return { page: pages.some(value => value.id === page) ? page : 'works', id: id ? decodeURIComponent(id) : undefined };
 }
-
-export function isBookCreateChatRoute(route: HashRoute): boolean {
-  return route.page === "book-create";
-}
-
-export function deriveStartupGate(input: {
-  readonly ready: boolean;
-  readonly projectError: string | null;
-}): "ready" | "loading" | "error" {
-  if (input.ready) return "ready";
-  return input.projectError ? "error" : "loading";
-}
-
 export function App() {
-  const { route, setRoute } = useHashRoute();
-  const sse = useSSE();
+  const [route, setRoute] = useState(readRoute);
+  const runtime = useRuntime(route.page === 'conversations' && route.id ? Number(route.id) : undefined);
+  const actions = useActions(runtime.invalidate);
   const { theme, setTheme } = useTheme();
-  const { t, lang: currentLang } = useI18n();
-  const { data: project, error: projectError, refetch: refetchProject } = useApi<{ language: string; languageExplicit: boolean }>("/project");
-  const [showLanguageSelector, setShowLanguageSelector] = useState(false);
-  const [ready, setReady] = useState(false);
-
-  const isDark = theme === "dark";
-
-  // 全局语言同步：app-language 是模块级单例，供用不了 hook 的代码（lib 纯函数、
-  // store slice）读取。这里在渲染期同步赋值，让子组件在同一次渲染里调用 tr() 时
-  // 就读到正确语言（只用 effect 的话，effect 要等本次渲染提交后才执行，本次渲染
-  // 里的 tr() 会读到旧语言）。赋值是幂等的模块变量写入，StrictMode 重复渲染无影
-  // 响；下面的 effect 在语言加载完成和切换时再设置一次，保证提交后的值也正确。
-  setAppLanguage(currentLang);
-  useEffect(() => {
-    setAppLanguage(currentLang);
-  }, [currentLang]);
-
-  useEffect(() => {
-    document.documentElement.classList.toggle("dark", isDark);
-  }, [isDark]);
-
-  useEffect(() => {
-    if (project) {
-      if (!project.languageExplicit) {
-        setShowLanguageSelector(true);
-      }
-      setReady(true);
-    }
-  }, [project]);
-
-  useSessionEvents(sse, route, setRoute);
-
-  const nav = {
-    toDashboard: () => setRoute({ page: "dashboard" }),
-    toChat: () => setRoute({ page: "chat" }),
-    toBook: (bookId: string) => setRoute({ page: "book", bookId }),
-    toBookSettings: (bookId: string) => setRoute({ page: "book-settings", bookId }),
-    toBookCreate: () => setRoute({ page: "book-create" }),
-    toWork: (workId: string) => setRoute({ page: "work", workId }),
-    toWorkChat: (workId: string, profileId: string) => setRoute({ page: "work-chat", workId, profileId }),
-    toChapter: (bookId: string, chapterNumber: number) =>
-      setRoute({ page: "chapter", bookId, chapterNumber }),
-    toAnalytics: (bookId: string) => setRoute({ page: "analytics", bookId }),
-    toServices: () => setRoute({ page: "services" }),
-    toProjectSettings: () => setRoute({ page: "project-settings" }),
-    toServiceDetail: (id: string) => setRoute({ page: "service-detail", serviceId: id }),
-    toTruth: (bookId: string) => setRoute({ page: "truth", bookId }),
-    toDaemon: () => setRoute({ page: "daemon" }),
-    toLogs: () => setRoute({ page: "logs" }),
-    toStyle: () => setRoute({ page: "style" }),
-    toTranslation: () => setRoute({ page: "translation" }),
-    toImport: (tab?: "chapters" | "canon" | "fanfic" | "spinoff" | "imitation") => setRoute({ page: "import", ...(tab ? { tab } : {}) }),
-    toRadar: () => setRoute({ page: "radar" }),
-    toDoctor: () => setRoute({ page: "doctor" }),
-    toPlay: (projectId: string) => setRoute({ page: "play", projectId }),
-    toFilm: (projectId: string) => setRoute({ page: "film", projectId }),
-    toFlow: (projectId: string) => setRoute({ page: "flow", projectId }),
-    toFilmAuthor: (projectId: string) => setRoute({ page: "film-author", projectId }),
-    toFilmStudio: (projectId: string) => setRoute({ page: "film-studio", projectId }),
-  };
-
-  const activeBookId = deriveActiveBookId(route);
-  const activePage =
-    activeBookId
-      ? `book:${activeBookId}`
-      : route.page === "service-detail"
-        ? "services"
-        : route.page;
-
-  const startupGate = deriveStartupGate({ ready, projectError });
-
-  if (startupGate === "error") {
-    return (
-      <div className="min-h-screen bg-background flex items-center justify-center p-6">
-        <div className="max-w-md w-full rounded-2xl border border-destructive/30 bg-destructive/5 p-6 space-y-4">
-          <div>
-            <h1 className="text-lg font-semibold text-destructive">无法加载项目配置 / Failed to load project config</h1>
-            <p className="mt-2 text-sm text-muted-foreground break-all">{projectError}</p>
-          </div>
-          {/* 项目配置没加载出来，语言未知，所以这屏中英双语并排展示。 */}
-          <p className="text-sm text-muted-foreground">
-            请检查项目根目录下的 inkos.json 是否存在且为合法 JSON，然后重试。
-            <br />
-            Check that inkos.json in the project root exists and is valid JSON, then retry.
-          </p>
-          <button
-            type="button"
-            onClick={() => refetchProject()}
-            className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground"
-          >
-            重试 / Retry
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  if (startupGate === "loading") {
-    return (
-      <div className="min-h-screen bg-background flex items-center justify-center">
-        <div className="w-12 h-12 border-4 border-primary/20 border-t-primary rounded-full animate-spin" />
-      </div>
-    );
-  }
-
-  if (showLanguageSelector) {
-    return (
-      <LanguageSelector
-        onSelect={async (lang) => {
-          await postApi("/project/language", { language: lang });
-          setShowLanguageSelector(false);
-          refetchProject();
-        }}
-      />
-    );
-  }
-
-  return (
-    <div className="h-screen bg-background text-foreground flex overflow-hidden font-sans">
-      {/* Left Sidebar */}
-      <Sidebar nav={nav} activePage={activePage} sse={sse} t={t} />
-
-      {/* Center Content */}
-      <div className="flex-1 flex flex-col min-w-0 bg-background/30 backdrop-blur-sm">
-        {/* Header Strip */}
-        <header className="h-14 shrink-0 flex items-center justify-between px-8 border-b border-border/40">
-          <div className="flex items-center gap-2">
-             <button
-               onClick={nav.toDashboard}
-               className="inline-flex items-center gap-2 rounded-lg border border-border/50 bg-card/70 px-3.5 py-2 text-[17px] font-semibold text-foreground hover:bg-secondary/50 transition-colors"
-             >
-               <House size={18} />
-               <span>{t("bread.home")}</span>
-               <span className="text-muted-foreground/70">/</span>
-               <span className="font-serif">InkOS Studio</span>
-             </button>
-          </div>
-
-          <div className="flex items-center gap-3">
-            <div className="flex gap-0.5 bg-muted/50 rounded-lg p-0.5">
-              <button
-                onClick={async () => {
-                  await putApi("/project", { language: "zh" });
-                  refetchProject();
-                }}
-                className={`px-2.5 py-1 text-[16px] font-medium rounded-md ${currentLang === "zh" ? "bg-primary text-primary-foreground" : "text-muted-foreground"}`}
-              >
-                中
-              </button>
-              <button
-                onClick={async () => {
-                  await putApi("/project", { language: "en" });
-                  refetchProject();
-                }}
-                className={`px-2.5 py-1 text-[16px] font-medium rounded-md ${currentLang === "en" ? "bg-primary text-primary-foreground" : "text-muted-foreground"}`}
-              >
-                EN
-              </button>
-            </div>
-
-            <button
-              onClick={() => setTheme(isDark ? "light" : "dark")}
-              className="text-muted-foreground hover:text-foreground transition-colors"
-            >
-              {isDark ? <Sun size={18} /> : <Moon size={18} />}
-            </button>
-          </div>
-        </header>
-
-        {/* Main Content Area */}
-        <main className="flex-1 relative overflow-y-auto scroll-smooth">
-          {route.page === "dashboard" && (
-            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <CreationTaskBoard onOpenWork={nav.toBook} />
-              <Dashboard nav={nav} sse={sse} theme={theme} t={t} />
-            </div>
-          )}
-          {route.page === "work" && (
-            <div className="mx-auto w-full max-w-5xl px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <WorkInspector workId={route.workId} onBack={nav.toDashboard} onChat={nav.toWorkChat} />
-            </div>
-          )}
-          {route.page === "work-chat" && (
-            <div className="absolute inset-0 flex min-w-0">
-              <ChatPage
-                activeWorkId={route.workId}
-                workProfileId={route.profileId}
-                mode="work"
-                nav={nav}
-                theme={theme}
-                t={t}
-                sse={sse}
-              />
-            </div>
-          )}
-          {isBookCreateChatRoute(route) && (
-            <div className="absolute inset-0 flex min-w-0">
-              <ChatPage
-                mode="book-create"
-                nav={nav}
-                theme={theme}
-                t={t}
-                sse={sse}
-              />
-            </div>
-          )}
-          {route.page === "chat" && (
-            <div className="absolute inset-0 flex min-w-0">
-              <ChatPage
-                mode="project-chat"
-                nav={nav}
-                theme={theme}
-                t={t}
-                sse={sse}
-              />
-            </div>
-          )}
-          {route.page === "book" && (
-            <div className="absolute inset-0 flex min-w-0">
-              <ChatPage
-                activeBookId={route.bookId}
-                mode="book"
-                nav={nav}
-                theme={theme}
-                t={t}
-                sse={sse}
-              />
-              <BookSidebar bookId={route.bookId} theme={theme} t={t} sse={sse} />
-              <BookSidebarToggle bookId={route.bookId} theme={theme} t={t} sse={sse} />
-            </div>
-          )}
-          {route.page === "book-settings" && (
-            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <BookDetail bookId={route.bookId} nav={nav} theme={theme} t={t} sse={sse} />
-            </div>
-          )}
-          {route.page === "chapter" && (
-            <div className="mx-auto w-full max-w-[1400px] px-4 py-12 sm:px-6 lg:px-10 lg:py-16 2xl:px-12 fade-in">
-              <ChapterReader bookId={route.bookId} chapterNumber={route.chapterNumber} nav={nav} theme={theme} t={t} />
-            </div>
-          )}
-          {route.page === "analytics" && (
-            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <Analytics bookId={route.bookId} nav={nav} theme={theme} t={t} />
-            </div>
-          )}
-          {route.page === "services" && (
-            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <ServiceListPage nav={nav} />
-            </div>
-          )}
-          {route.page === "project-settings" && (
-            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <ProjectSettings nav={nav} theme={theme} t={t} />
-            </div>
-          )}
-          {route.page === "service-detail" && (
-            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <ServiceDetailPage serviceId={route.serviceId} nav={nav} />
-            </div>
-          )}
-          {route.page === "truth" && (
-            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <TruthFiles bookId={route.bookId} nav={nav} theme={theme} t={t} />
-            </div>
-          )}
-          {route.page === "daemon" && (
-            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <DaemonControl nav={nav} theme={theme} t={t} sse={sse} />
-            </div>
-          )}
-          {route.page === "logs" && (
-            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <LogViewer nav={nav} theme={theme} t={t} />
-            </div>
-          )}
-          {route.page === "style" && (
-            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <StyleManager nav={nav} theme={theme} t={t} />
-            </div>
-          )}
-          {route.page === "translation" && (
-            <div className="max-w-6xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <TranslationManager nav={nav} theme={theme} t={t} />
-            </div>
-          )}
-          {route.page === "import" && (
-            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <ImportManager nav={nav} theme={theme} t={t} initialTab={route.tab} />
-            </div>
-          )}
-          {route.page === "radar" && (
-            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <RadarView nav={nav} theme={theme} t={t} />
-            </div>
-          )}
-          {route.page === "doctor" && (
-            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <DoctorView nav={nav} theme={theme} t={t} />
-            </div>
-          )}
-          {route.page === "play" && (
-            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <StoryPlayer projectId={route.projectId} nav={nav} theme={theme} t={t} />
-            </div>
-          )}
-          {route.page === "film" && (
-            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <StoryGraphTree projectId={route.projectId} nav={nav} theme={theme} t={t} />
-            </div>
-          )}
-          {route.page === "film-author" && (
-            <div className="absolute inset-0 flex min-w-0">
-              <ChatPage
-                activeBookId={route.projectId}
-                mode="interactive-film-authoring"
-                nav={nav}
-                theme={theme}
-                t={t}
-                sse={sse}
-              />
-            </div>
-          )}
-          {route.page === "film-studio" && (
-            <Suspense fallback={<div className="p-6 text-sm">{tr("加载创作向导…", "Loading creation wizard…")}</div>}>
-              <FilmWizard projectId={route.projectId} nav={nav} theme={theme} t={t} sse={sse} />
-            </Suspense>
-          )}
-          {route.page === "flow" && (
-            <Suspense fallback={<div className="p-6 text-sm">{tr("加载流程图…", "Loading flow view…")}</div>}>
-              <FlowView projectId={route.projectId} nav={nav} theme={theme} t={t} />
-            </Suspense>
-          )}
-        </main>
-      </div>
+  useEffect(() => { const onHash = () => setRoute(readRoute()); window.addEventListener('hashchange', onHash); return () => window.removeEventListener('hashchange', onHash); }, []);
+  useEffect(() => { document.documentElement.classList.toggle('dark', theme === 'dark'); }, [theme]);
+  const navigate = (page: string, id?: string) => { location.hash = `${page}${id ? `/${encodeURIComponent(id)}` : ''}`; };
+  const projectName = runtime.status?.rootDir.split('/').filter(Boolean).pop() ?? 'Project runtime';
+  const activeTasks = runtime.status?.tasks.filter(task => !terminalTask(task)).length ?? 0;
+  const attention = runtime.status?.distributions.filter(needsAttention).length ?? 0;
+  return <Workspace.Provider value={{ ...runtime, run: actions.run, busy: actions.busy }}><a href="#main-content" className="skip-link" onClick={e => { e.preventDefault(); document.getElementById('main-content')?.focus(); }}>Skip to workspace</a><div className="studio-shell">
+    <aside className="studio-sidebar"><a href="#works" className="brand"><InkosLogo className="brand-logo" /><span><strong>InkOS</strong><small>STUDIO</small></span></a><div className="sidebar-project"><p className="eyebrow">WORKSPACE</p><strong>{projectName}</strong><span className="muted small">One project · one runtime</span></div>
+      <nav aria-label="Studio navigation">{pages.map(({ id, label, icon: Icon }) => <a href={`#${id}`} key={id} className={route.page === id ? 'active' : ''} aria-current={route.page === id ? 'page' : undefined}><Icon size={18} /><span>{label}</span>{id === 'tasks' && activeTasks > 0 && <span className="nav-count">{activeTasks}</span>}{id === 'attention' && attention > 0 && <span className="nav-count">{attention}</span>}</a>)}</nav>
+      <div className="sidebar-footer"><Badge value={runtime.connection} /><p>Closing Studio disconnects this view.<br />Native work stays with the runtime.</p>{runtime.status && <code>PID {runtime.status.pid}</code>}</div>
+    </aside>
+    <div className="studio-content"><header className="studio-header"><div><span className="muted">Workspace</span><span className="breadcrumb-slash">/</span><strong>{pages.find(p => p.id === route.page)?.label}</strong></div><div className="header-actions"><Badge value={runtime.connection} /><Action onClick={runtime.invalidate}><RefreshCw size={15} /> Refresh</Action><button className="theme-button" aria-label={theme === 'dark' ? 'Use light theme' : 'Use dark theme'} onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button></div></header>
+      <main id="main-content" tabIndex={-1} className="workspace-main">
+        {runtime.error && <div className="notice error" role="alert"><span><strong>Runtime unavailable.</strong> {runtime.error}{runtime.status && ' Showing the last read projection.'}</span><Action onClick={runtime.invalidate}>Retry connection</Action></div>}
+        {actions.notice && <div className={`notice ${actions.notice.error ? 'error' : 'success'}`} role={actions.notice.error ? 'alert' : 'status'}><span>{actions.notice.text}</span><button onClick={actions.dismiss} aria-label="Dismiss notification">×</button></div>}
+        {!runtime.status && !runtime.error && <section className="panel"><p role="status" className="muted">Connecting to the project runtime…</p></section>}
+        {runtime.status && <div key={route.page} className="page-content enter">
+          {route.page === 'works' && <Works selectedId={route.id} select={id => navigate('works', id)} />}
+          {route.page === 'tasks' && <Tasks />}
+          {route.page === 'conversations' && <Conversations selectedId={route.id} select={id => navigate('conversations', id)} />}
+          {route.page === 'publishing' && <Publishing />}
+          {route.page === 'attention' && <Publishing attentionOnly />}
+          {route.page === 'models' && <Models loginId={route.id} selectLogin={id => navigate('models', id)} />}
+          {route.page === 'plugins' && <Plugins />}
+          {route.page === 'materials' && <Materials />}
+        </div>}
+      </main>
     </div>
-  );
+  </div></Workspace.Provider>;
 }

@@ -1,124 +1,47 @@
 import { createRequire } from "node:module";
-import { recoverAtomicFileSets } from "@actalk/inkos-core";
-import { findProjectRoot } from "./utils.js";
 import { Command } from "commander";
-import { initCommand } from "./commands/init.js";
-import { configCommand } from "./commands/config.js";
-import { bookCommand } from "./commands/book.js";
-import { chapterCommand } from "./commands/chapter.js";
-import { writeCommand } from "./commands/write.js";
-import { autoCommand } from "./commands/auto.js";
-import { reviewCommand } from "./commands/review.js";
-import { statusCommand } from "./commands/status.js";
-import { radarCommand } from "./commands/radar.js";
-import { upCommand, downCommand, daemonStatusCommand } from "./commands/daemon.js";
-import { doctorCommand } from "./commands/doctor.js";
-import { exportCommand } from "./commands/export.js";
-import { reviseCommand } from "./commands/revise.js";
-import { agentCommand } from "./commands/agent.js";
-import { updateCommand } from "./commands/update.js";
-import { detectCommand } from "./commands/detect.js";
-import { styleCommand } from "./commands/style.js";
-import { analyticsCommand } from "./commands/analytics.js";
-import { importCommand } from "./commands/import.js";
-import { fanficCommand } from "./commands/fanfic.js";
-import { shortCommand } from "./commands/short-fiction.js";
-import { forecastCommand } from "./commands/forecast.js";
-import { translateCommand } from "./commands/translate.js";
-import { createStudioCommand, launchStudioEntry } from "./commands/studio.js";
-import { createInteractCommand, type InteractCommandHooks } from "./commands/interact.js";
-import { createTuiCommand } from "./commands/tui.js";
-import { launchTui } from "./tui/app.js";
-import { createPublishingCommand } from './commands/publishing.js';
-import { workCommand } from "./commands/work.js";
+import { projectRoot } from "./utils.js";
+import { createInitCommand } from "./commands/init.js";
+import { createUpCommand, createDownCommand, createDaemonCommand } from "./commands/daemon.js";
+import { createStatusCommand } from "./commands/status.js";
+import { createStudioCommand } from "./commands/studio.js";
+import { createTuiCommand, openTui } from "./commands/tui.js";
+import { createInteractCommand } from "./commands/interact.js";
+import { createAgentCommand } from "./commands/agent.js";
 import { createGoalCommand } from "./commands/goal.js";
+import { createWorkCommand } from "./commands/work.js";
+import { createWriteCommand } from "./commands/write.js";
+import { createPublishingCommand } from "./commands/publishing.js";
+import { createExportCommand } from "./commands/export.js";
+import { createImportCommand } from "./commands/import.js";
+import { createArtifactsCommand } from "./commands/artifacts.js";
+import { createMaterialsCommand } from "./commands/materials.js";
+import { createModelsCommand, createPluginsCommand } from "./commands/models.js";
+import { createTasksCommand } from "./commands/tasks.js";
+import { createConversationsCommand, createSubmissionsCommand } from "./commands/conversations.js";
+import { createEventsCommand } from "./commands/events.js";
+import { createDoctorCommand } from "./commands/doctor.js";
+import { updateCommand } from "./commands/update.js";
 
-const require = createRequire(import.meta.url);
-const { version } = require("../package.json") as { version: string };
+const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
 
-export interface ProgramHooks {
-  readonly launchTui?: (projectRoot: string) => Promise<void> | void;
-  readonly launchStudio?: (projectRoot: string, port: string) => Promise<void> | void;
-  readonly studioRecentProjectPath?: string;
-  readonly readInteractionInput?: InteractCommandHooks["readInput"];
-}
-
-export function createProgram(hooks: ProgramHooks = {}): Command {
-  const program = new Command();
-
-  program
-    .name("inkos")
-    .description("InkOS — Multi-agent novel production system")
-    .version(version)
-    .enablePositionalOptions()
+export function createProgram(): Command {
+  const program = new Command().name("inkos").description("InkOS — durable creative runtime CLI and TUI")
+    .version(version).option("--project <path>", "Project root (defaults to cwd)")
+    .option("--root <path>", "Alias for --project")
     .showHelpAfterError("Run 'inkos --help' for available commands.")
-    .option("--service <service>", "Override LLM service for this CLI run")
-    .option("--model <model>", "Override LLM model for this CLI run")
-    .option("--api-key-env <envVar>", "Read LLM API key from this environment variable for this CLI run")
-    .option("--base-url <url>", "Override LLM base URL for this CLI run")
-    .option("--api-format <chat|responses|anthropic>", "Override LLM API format for this CLI run")
-    .option("--stream", "Force streaming LLM responses for this CLI run")
-    .option("--no-stream", "Force non-streaming LLM responses for this CLI run")
-    .action(async () => {
-      await launchStudioEntry(process.cwd(), "4567", {
-        launchStudio: hooks.launchStudio,
-        recentProjectPath: hooks.studioRecentProjectPath,
-      });
-    });
-
-  program.addCommand(initCommand);
-  program.addCommand(configCommand);
-  program.addCommand(bookCommand);
-  program.addCommand(workCommand);
-  program.addCommand(createGoalCommand());
-  program.addCommand(createPublishingCommand());
-  program.addCommand(chapterCommand);
-  program.addCommand(writeCommand);
-  program.addCommand(autoCommand);
-  program.addCommand(reviewCommand);
-  program.addCommand(statusCommand);
-  program.addCommand(radarCommand);
-  program.addCommand(upCommand);
-  program.addCommand(downCommand);
-  program.addCommand(daemonStatusCommand);
-  program.addCommand(doctorCommand);
-  program.addCommand(exportCommand);
-  program.addCommand(reviseCommand);
-  program.addCommand(agentCommand);
+    .action((_options, command) => openTui(projectRoot(command)));
+  for (const command of [
+    createInitCommand(), createUpCommand(), createDownCommand(), createStatusCommand(), createDaemonCommand(),
+    createStatusCommand("daemon-status"), createStudioCommand(), createTuiCommand(), createAgentCommand(), createInteractCommand(),
+    createGoalCommand(), createWriteCommand(), createWorkCommand(), createTasksCommand(), createConversationsCommand(),
+    createSubmissionsCommand(), createPublishingCommand(), createExportCommand(), createImportCommand(), createArtifactsCommand(),
+    createMaterialsCommand(), createModelsCommand(), createPluginsCommand(), createEventsCommand(), createDoctorCommand(),
+  ]) program.addCommand(command);
   program.addCommand(updateCommand);
-  program.addCommand(detectCommand);
-  program.addCommand(styleCommand);
-  program.addCommand(analyticsCommand);
-  program.addCommand(importCommand);
-  program.addCommand(fanficCommand);
-  program.addCommand(shortCommand);
-  program.addCommand(forecastCommand);
-  program.addCommand(translateCommand);
-  program.addCommand(createStudioCommand({
-    launchStudio: hooks.launchStudio,
-    recentProjectPath: hooks.studioRecentProjectPath,
-  }));
-  program.addCommand(createInteractCommand({
-    readInput: hooks.readInteractionInput,
-  }));
-  program.addCommand(createTuiCommand({ launchTui: hooks.launchTui }));
-
   return program;
 }
 
-export async function runProgram(
-  argv: string[] = process.argv,
-  hooks: ProgramHooks = {},
-): Promise<void> {
-  const program = createProgram(hooks);
-  program.hook("preAction", async (_command, actionCommand) => {
-    // Match the actual parsed command; an argument named preflight must not disable recovery.
-    if (actionCommand.name() === 'preflight' && actionCommand.parent?.name() === 'publishing'
-      && actionCommand.parent.parent === program) return;
-    let root: string;
-    try { root = findProjectRoot(); }
-    catch { return; } // init and help may run outside a project.
-    await recoverAtomicFileSets(root, true);
-  });
-  await program.parseAsync(argv);
+export async function runProgram(argv: string[] = process.argv): Promise<void> {
+  await createProgram().parseAsync(argv);
 }

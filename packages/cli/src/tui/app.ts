@@ -1,121 +1,25 @@
-import { access } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename } from "node:path";
 import { render } from "ink";
 import React from "react";
+import { RuntimeClient, type ConversationRecord } from "../runtime.js";
+import { ensureProjectDirectoryInitialized } from "../project-bootstrap.js";
 import { InkTuiApp } from "./dashboard.js";
-import { getTuiCopy, resolveTuiLocale, type TuiLocale } from "./i18n.js";
-import { loadProjectSession } from "./session-store.js";
-import { detectProjectLanguage, ensureProject } from "./setup.js";
-import { animateStartup } from "./effects.js";
-import { readCodexSettings } from "@actalk/inkos-core";
+import { resolveTuiLocale } from "./i18n.js";
 
-export interface TuiFrameState {
-  readonly locale?: TuiLocale;
-  readonly projectName: string;
-  readonly activeBookTitle?: string;
-  readonly status: string;
-  readonly messages?: ReadonlyArray<string>;
-  readonly events?: ReadonlyArray<string>;
-}
-
-export function renderTuiFrame(state: TuiFrameState): string {
-  const locale = state.locale ?? resolveTuiLocale();
-  const copy = getTuiCopy(locale);
-  const lines = [
-    `${copy.labels.project} ${state.projectName}`,
-    `${copy.labels.stage} ${state.status}`,
-    `${copy.labels.book} ${state.activeBookTitle ?? copy.labels.none}`,
-    "",
-    ...(state.messages?.length
-      ? state.messages.slice(-6).map((message) => `- ${message}`)
-      : [`- (${copy.labels.none})`]),
-    "",
-    state.events?.length
-      ? state.events.slice(-1).map((event) => `${copy.labels.recent} ${event}`)[0]!
-      : `${copy.labels.recent} (${copy.labels.none})`,
-    "",
-    copy.composer.placeholder,
-    "> ",
-  ];
-  return lines.join("\n");
-}
-
-async function readVersion(): Promise<string> {
-  try {
-    const { readFile } = await import("node:fs/promises");
-    const { join, dirname } = await import("node:path");
-    const { fileURLToPath } = await import("node:url");
-    const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-    const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf-8"));
-    return pkg.version ?? "dev";
-  } catch {
-    return "dev";
-  }
-}
-
-async function resolveProjectRoot(cwd: string): Promise<string> {
-  // If CWD is a book directory (contains book.json), walk up to the actual project root.
-  // Structure: <projectRoot>/works/<bookId>/source/book.json
-  try {
-    await access(join(cwd, "book.json"));
-    const parent = dirname(cwd);
-    if (basename(parent) === "books") {
-      return dirname(parent);
-    }
-  } catch {
-    // not a book directory
-  }
-  return cwd;
-}
-
-export async function launchTui(
-  projectRoot: string,
-): Promise<void> {
-  projectRoot = await resolveProjectRoot(projectRoot);
-  await ensureProject(projectRoot);
-  const projectLanguage = await detectProjectLanguage(projectRoot);
-  const locale = resolveTuiLocale(process.env, projectLanguage);
-  const copy = getTuiCopy(locale);
-
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    return;
-  }
-
-  const session = await loadProjectSession(projectRoot);
-  const codex = await readCodexSettings(projectRoot);
-  const modelInfo = { model: codex.model ?? "Codex default", provider: "Codex" };
-  const modelLabel = `${modelInfo.model} (Codex · ${codex.reasoningEffort} · ${codex.serviceTier})`;
-  const version = await readVersion();
-  const chatStreamBridge: { onTextDelta?: (text: string) => void } = {};
-
-  const originalEmitWarning = process.emitWarning;
-  process.emitWarning = (() => {}) as typeof process.emitWarning;
-  const originalStderrWrite = process.stderr.write.bind(process.stderr);
-  process.stderr.write = (chunk: string | Uint8Array, ...args: unknown[]) => {
-    const text = typeof chunk === "string" ? chunk : chunk.toString();
-    if (text.includes("ExperimentalWarning") || text.includes("--trace-warnings")) {
-      return true;
-    }
-    return (originalStderrWrite as Function)(chunk, ...args);
-  };
-
-  try {
-    await animateStartup(version, basename(projectRoot), session.activeBookId, modelInfo);
-
-    const app = render(
-      React.createElement(InkTuiApp, {
-        locale,
-        projectRoot,
-        projectName: basename(projectRoot),
-        modelLabel,
-        initialSession: session,
-        chatStreamBridge,
-      }),
-      { exitOnCtrlC: true },
-    );
-    await app.waitUntilExit();
-  } finally {
-    process.emitWarning = originalEmitWarning;
-    process.stderr.write = originalStderrWrite;
-  }
+export async function launchTui(projectRoot: string, options: { conversationId?: number } = {}): Promise<void> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("The TUI needs a terminal. Use interact, status --json, or events for non-interactive clients.");
+  await ensureProjectDirectoryInitialized(projectRoot);
+  const client = await RuntimeClient.connect(projectRoot);
+  const conversations: ConversationRecord[] = await client.rpc<ConversationRecord[]>("conversations.list");
+  const conversationId = options.conversationId ?? conversations.filter(item => !item.owner).sort((a, b) => a.id - b.id).at(-1)?.id;
+  const watch = new AbortController();
+  const app = render(React.createElement(InkTuiApp, {
+    client, projectName: basename(client.endpoint.rootDir), locale: resolveTuiLocale(),
+    initialConversationId: conversationId, signal: watch.signal,
+  }), { exitOnCtrlC: false });
+  const detach = () => { watch.abort(); app.unmount(); };
+  process.once("SIGTERM", detach);
+  try { await app.waitUntilExit(); }
+  finally { detach(); process.removeListener("SIGTERM", detach); }
+  // Runtime is intentionally left running. Only `inkos down` stops the project service.
 }

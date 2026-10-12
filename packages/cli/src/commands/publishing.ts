@@ -1,77 +1,41 @@
-import { Command } from 'commander';
-import {createPublishingPreflightCommand} from './publishing-preflight.js';
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import {
-  PublishingStore, ManualPublishingAdapter, PublishingSelectionSchema, PublishingFormatsSchema,
-  PublishingPlatformSchema, PublishingReceiptSchema, listPublishingCapabilities, listWorkManifests,
-} from '@actalk/inkos-core';
-import { findProjectRoot, log, logError } from '../utils.js';
-
-type Options = {json?: boolean};
-async function run(options: Options, task: (adapter: ManualPublishingAdapter, store: PublishingStore, root: string) => Promise<unknown> | unknown) {
-  let store: PublishingStore | undefined;
-  try {
-    const root = findProjectRoot();
-    store = new PublishingStore(join(root, '.inkos', 'harness.sqlite'));
-    const result = await task(new ManualPublishingAdapter(root, store), store, root);
-    log(JSON.stringify(result, null, 2));
-  } catch (error) {
-    const failure = {error: error instanceof Error ? error.message : String(error), code: (error as {code?: string}).code};
-    if (options.json) log(JSON.stringify(failure)); else logError(failure.error);
-    process.exitCode = 1;
-  } finally { store?.close(); }
-}
+import { Command, InvalidArgumentError, Option } from "commander";
+import { connect } from "../runtime.js";
+import { jsonObject, output, timestamp } from "../utils.js";
 
 export function createPublishingCommand(): Command {
-  const command = new Command('publishing').description('Prepare immutable manual publishing packages and record user-reported receipts; never uploads');
-  command.addCommand(createPublishingPreflightCommand());
-  command.command('capabilities').option('--json', 'Output JSON').action(() => log(JSON.stringify(listPublishingCapabilities(), null, 2)));
-  command.command('map-book').argument('<platform>', PublishingPlatformSchema.options.join(', '))
-    .argument('<remote-book-id>', 'Existing platform book ID, supplied by the author')
-    .argument('[work-id]', 'Work ID; inferred only when exactly one Work exists')
-    .requiredOption('--account <label>', 'Local account label, never a password or token')
-    .option('--json', 'Output JSON')
-    .action(async (platform: string, remoteBookId: string, workId: string | undefined, opts: Options & {account: string}) => run(opts, async (adapter, _store, root) => {
-      if (!workId) {
-        const works = await listWorkManifests(root);
-        if (works.length !== 1) throw new Error('Specify work-id when the project does not contain exactly one Work.');
-        workId = works[0]!.id;
-      }
-      return adapter.mapBook({platform: PublishingPlatformSchema.parse(platform), remoteBookId, accountLabel: opts.account, workId});
-    }));
-  command.command('targets').option('--json', 'Output JSON').action((opts: Options) => run(opts, (_adapter, store) => store.listTargets()));
-  command.command('prepare').argument('<target-id>').requiredOption('--selection <path>', 'JSON array of exact artifactId, revisionId, number and title selections')
-    .option('--formats <formats>', 'Comma-separated txt,md,epub', 'txt,md,epub').option('--json', 'Output JSON')
-    .action((targetId: string, opts: Options & {selection: string; formats: string}) => run(opts, async (adapter) => {
-      const chapters = PublishingSelectionSchema.parse(JSON.parse(await readFile(opts.selection, 'utf8')));
-      const formats = PublishingFormatsSchema.parse(opts.formats.split(','));
-      const pkg = await adapter.prepare({targetId, chapters, formats});
-      return adapter.verify(pkg.manifest.id);
-    }));
-  command.command('list').option('--target <id>', 'Filter by book mapping').option('--json', 'Output JSON')
-    .action((opts: Options & {target?: string}) => run(opts, (_adapter, store) => store.listPackages(opts.target)));
-  command.command('show').argument('<package-id>').option('--json', 'Output JSON')
-    .action((packageId: string, opts: Options) => run(opts, (_adapter, store) => store.getPackage(packageId)));
-  command.command('verify').argument('<package-id>').option('--json', 'Output JSON')
-    .action((packageId: string, opts: Options) => run(opts, adapter => adapter.verify(packageId)));
-  command.command('begin').description('Record an impending human submission before using the platform; does not upload')
-    .argument('<package-id>').argument('<chapter-number>')
-    .requiredOption('--version <number>', 'Current package state version from show')
-    .requiredOption('--event-id <id>', 'Unique local event ID; reuse only for an exact retry')
-    .option('--json', 'Output JSON')
-    .action((packageId: string, chapterNumber: string, opts: Options & {version: string; eventId: string}) => run(opts, adapter =>
-      adapter.beginSubmission({packageId, chapterNumber: Number(chapterNumber), expectedVersion: Number(opts.version), eventId: opts.eventId})));
-  command.command('receipt').description('Record author-checked platform status, never remote verification')
-    .argument('<package-id>').argument('<chapter-number>')
-    .requiredOption('--status <status>', 'submission_unknown, submitted_reported, published_reported, not_submitted_reported')
-    .requiredOption('--evidence <text>', 'What the author observed, including a receipt/reference when available; no credentials')
-    .option('--remote-chapter <id>', 'Platform chapter ID; required for published_reported')
-    .requiredOption('--version <number>', 'Current package state version from show')
-    .requiredOption('--event-id <id>', 'Unique local receipt event ID; reuse only for an exact retry')
-    .option('--json', 'Output JSON')
-    .action((packageId: string, chapterNumber: string, opts: Options & {status: string; evidence: string; remoteChapter?: string; version: string; eventId: string}) => run(opts, adapter =>
-      adapter.recordReceipt({packageId, chapterNumber: Number(chapterNumber), expectedVersion: Number(opts.version), eventId: opts.eventId,
-        receipt: PublishingReceiptSchema.parse({status: opts.status, evidence: opts.evidence, remoteChapterId: opts.remoteChapter})})));
-  return command;
+  const publishing = new Command("publishing").description("Manage independent publishing targets and durable distributions");
+  for (const [name, method] of [["targets", "publishing.targets"], ["list", "publishing.list"]] as const) {
+    publishing.command(name).option("--json", "Output JSON")
+      .action(async (_options, command) => output(await (await connect(command)).rpc(method)));
+  }
+  publishing.command("create-target").argument("[id]").requiredOption("--work <id>", "Work ID")
+    .requiredOption("--publisher <id>", "meganovel, browser, or extension publisher ID")
+    .requiredOption("--account-id <id>", "Account ID").requiredOption("--account-label <label>", "Account label")
+    .option("--remote-work <id>", "Existing remote Work ID").option("--browser <json>", "Browser settings", jsonObject)
+    .option("--metadata <json>", "Publisher metadata", jsonObject).option("--skill <id>", "Publisher skill")
+    .option("--json", "Output JSON")
+    .action(async (id: string | undefined, options, command) => output(await (await connect(command)).rpc("publishing.createTarget", {
+      id, workId: options.work, publisher: options.publisher, accountId: options.accountId, accountLabel: options.accountLabel,
+      remoteWorkId: options.remoteWork, browser: options.browser, metadata: options.metadata, skill: options.skill,
+    })));
+  publishing.command("update-target").argument("<id>").requiredOption("--changes <json>", "Target changes", jsonObject)
+    .option("--json", "Output JSON")
+    .action(async (id: string, options, command) => output(await (await connect(command)).rpc("publishing.updateTarget", { id, changes: options.changes })));
+  publishing.command("queue").argument("<target-id>").argument("<artifact-id>")
+    .option("--revision <id>", "Revision ID")
+    .addOption(new Option("--operation <operation>", "Distribution operation").choices(["publish", "update"]))
+    .option("--scheduled-at <time>", "ISO date or epoch milliseconds", value => {
+      const parsed = timestamp(value);
+      if (parsed === null) throw new InvalidArgumentError("Omit --scheduled-at for immediate publication.");
+      return parsed;
+    })
+    .option("--request-id <id>", "Idempotent request ID").option("--json", "Output JSON")
+    .action(async (targetId: string, artifactId: string, options, command) => output(await (await connect(command)).rpc("publishing.queue", {
+      targetId, artifactId, revisionId: options.revision, operation: options.operation, scheduledAt: options.scheduledAt, requestId: options.requestId,
+    })));
+  for (const method of ["resume", "observe"]) {
+    publishing.command(method).argument("<id>", "Distribution ID").option("--json", "Output JSON")
+      .action(async (id: string, _options, command) => output(await (await connect(command)).rpc(`publishing.${method}`, { id })));
+  }
+  return publishing;
 }

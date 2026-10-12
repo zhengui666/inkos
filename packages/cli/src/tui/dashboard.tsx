@@ -1,562 +1,147 @@
+import { randomUUID } from "node:crypto";
 import React, { useEffect, useRef, useState } from "react";
-import {
-  appendInteractionMessage,
-  type InteractionSession,
-} from "@actalk/inkos-core";
 import { Box, Text, useApp, useInput } from "ink";
-import { processTuiAgentInput } from "./agent-input.js";
-import { describeActivityState } from "./activity-state.js";
-import { resolveComposerCaretState } from "./composer-caret.js";
-import { resolveChatDepthProfile, type ChatDepth } from "./chat-depth.js";
-import { appendStreamingAssistantChunk, createOptimisticUserMessageSession } from "./chat-draft.js";
-import { renderComposerDisplay } from "./composer-display.js";
+import TextInput from "ink-text-input";
+import type { RuntimeClient } from "../runtime.js";
+import { conversationMessages, taskTree } from "../runtime-view.js";
+import { watchRuntimeEvents } from "../events.js";
+import { applyRuntimeEvent, emptyRuntimeState, eventRequiresRefresh, loadRuntimeState, type RuntimeTuiState } from "./runtime-state.js";
+import { submitTuiInput, TUI_COMMANDS, type BusyPolicy } from "./runtime-input.js";
+import { applySlashSuggestion, getSlashSuggestions } from "./slash-autocomplete.js";
+import { buildInputHistory, moveHistoryCursor, type InputHistoryState } from "./input-history.js";
+import type { TuiLocale } from "./i18n.js";
 import { renderMarkdown } from "./markdown.js";
-import { buildDashboardViewModel, type DashboardMessageRow } from "./dashboard-model.js";
-import { buildInputHistory, moveHistoryCursor } from "./input-history.js";
-import { getTuiCopy, type TuiLocale } from "./i18n.js";
-import { loadProjectSession, persistProjectSession, resolveSessionActiveBook } from "./session-store.js";
-import { classifyLocalTuiCommand, parseDepthCommand, parseModelCommand } from "./local-commands.js";
-import {
-  applySlashSuggestion,
-  getNextSlashSelection,
-  getSlashSuggestions,
-  SLASH_COMMANDS,
-} from "./slash-autocomplete.js";
-import {
-  WARM_ACCENT, WARM_BORDER, WARM_MUTED, WARM_REPLY,
-  STATUS_SUCCESS, STATUS_ERROR, STATUS_ACTIVE, STATUS_IDLE,
-  ROLE_USER, ROLE_SYSTEM,
-  isAppleTerminal,
-} from "./theme.js";
+import { WARM_ACCENT, WARM_MUTED, WARM_BORDER, WARM_REPLY, ROLE_USER, STATUS_ERROR } from "./theme.js";
 
-export interface InkTuiDashboardProps {
-  readonly locale: TuiLocale;
-  readonly projectName: string;
-  readonly activeBookTitle?: string;
-  readonly modelLabel: string;
-  readonly depthLabel?: string;
-  readonly session: InteractionSession;
-  readonly inputValue: string;
-  readonly isSubmitting: boolean;
-  readonly sinceTimestamp?: number;
-  readonly lastError?: string;
-  readonly slashSuggestions?: ReadonlyArray<string>;
-  readonly selectedSlashIndex?: number;
-  readonly showComposerCursor?: boolean;
-  readonly scrollOffset?: number;
-  readonly onInputChange?: (value: string) => void;
-  readonly onSubmit?: (value: string) => void;
-}
+export type InkTuiAppProps = {
+  client: RuntimeClient; projectName: string; locale: TuiLocale; initialConversationId?: number; signal: AbortSignal;
+};
 
-export interface InkTuiAppProps {
-  readonly locale: TuiLocale;
-  readonly projectRoot: string;
-  readonly projectName: string;
-  readonly modelLabel: string;
-  readonly initialSession: InteractionSession;
-  readonly chatStreamBridge?: {
-    onTextDelta?: (text: string) => void;
-    getChatRequestOptions?: () => {
-      readonly temperature?: number;
-      readonly maxTokens?: number;
-    };
-  };
-}
-
-export function InkTuiDashboard(props: InkTuiDashboardProps): React.JSX.Element {
-  const copy = getTuiCopy(props.locale);
-  const model = buildDashboardViewModel({
-    copy,
-    projectName: props.projectName,
-    activeBookTitle: props.activeBookTitle,
-    modelLabel: props.modelLabel,
-    depthLabel: props.depthLabel,
-    session: props.session,
-    isSubmitting: props.isSubmitting,
-    lastError: props.lastError,
-    sinceTimestamp: props.sinceTimestamp,
-    scrollOffset: props.scrollOffset,
-  });
-  const activeAccent = props.isSubmitting ? WARM_ACCENT : statusColor(model.executionStatus);
-  const composer = renderComposerDisplay(props.inputValue, model.composerPlaceholder, props.showComposerCursor ?? false);
-
-  const separatorWidth = Math.max(20, (process.stdout.columns ?? 60) - 8);
-  const thinRule = "─".repeat(separatorWidth);
-
-  return (
-    <Box flexDirection="column" width="100%" paddingX={2}>
-      {/* Header bar */}
-      <Text color={WARM_MUTED}>{model.headerLine}</Text>
-      <Text color={WARM_BORDER}>{thinRule}</Text>
-
-      {/* Conversation area */}
-      <Box flexDirection="column" marginTop={1} flexGrow={1}>
-        {model.messageRows.length > 0 ? (
-          model.messageRows.map((row) => <ConversationRow key={row.key} row={row} />)
-        ) : (
-          <Box marginY={1}>
-            <Text color={WARM_MUTED} italic>  {copy.composer.emptyConversation}</Text>
-          </Box>
-        )}
-      </Box>
-
-      {/* Composer area */}
-      <Box flexDirection="column" marginTop={1}>
-        <Text color={WARM_BORDER}>{thinRule}</Text>
-
-        {/* Composer input */}
-        <Box
-          marginTop={1}
-          flexDirection="column"
-          width="100%"
-          borderStyle="round"
-          borderColor={props.isSubmitting ? STATUS_ACTIVE : WARM_BORDER}
-          paddingX={1}
-        >
-          <Box>
-            <Text color={props.isSubmitting ? STATUS_ACTIVE : WARM_ACCENT} bold>
-              ›{" "}
-            </Text>
-            {composer.textBeforeCursor ? (
-              <Text color={composer.isPlaceholder ? WARM_MUTED : WARM_REPLY}>
-                {composer.textBeforeCursor}
-              </Text>
-            ) : null}
-            {composer.cursor ? (
-              <Text color={props.isSubmitting ? STATUS_ACTIVE : WARM_ACCENT}>
-                {composer.cursor}
-              </Text>
-            ) : null}
-            {composer.textAfterCursor ? (
-              <Text color={composer.isPlaceholder ? WARM_MUTED : WARM_REPLY}>
-                {composer.textAfterCursor}
-              </Text>
-            ) : null}
-          </Box>
-          {/* Slash command suggestions */}
-          {props.slashSuggestions && props.slashSuggestions.length > 0 ? (
-            <Box flexDirection="column" marginTop={1} borderTop borderColor={WARM_BORDER}>
-              {props.slashSuggestions.slice(0, 6).map((suggestion, index) => {
-                const isSelected = index === (props.selectedSlashIndex ?? 0);
-                return (
-                  <Box key={suggestion}>
-                    <Text color={isSelected ? WARM_ACCENT : WARM_BORDER}>{isSelected ? "› " : "  "}</Text>
-                    <Text color={isSelected ? WARM_REPLY : WARM_MUTED} bold={isSelected}>
-                      {suggestion}
-                    </Text>
-                  </Box>
-                );
-              })}
-            </Box>
-          ) : null}
-        </Box>
-        <Box marginTop={1}>
-          <ExecutionBadge status={model.executionStatus} color={activeAccent} />
-          <Text color={activeAccent}> {model.statusPrimaryLine}</Text>
-        </Box>
-      </Box>
-    </Box>
-  );
-}
-
-export function InkTuiApp(props: InkTuiAppProps): React.JSX.Element {
+export function InkTuiApp({ client, projectName, locale, initialConversationId, signal }: InkTuiAppProps): React.JSX.Element {
   const { exit } = useApp();
-  const copy = getTuiCopy(props.locale);
-  const [session, setSession] = useState(props.initialSession);
-  const [inputValue, setInputValue] = useState("");
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [lastError, setLastError] = useState<string | undefined>();
-  const [sinceTimestamp, setSinceTimestamp] = useState<number | undefined>();
-  const [selectedSlashIndex, setSelectedSlashIndex] = useState(0);
-  const [scrollOffset, setScrollOffset] = useState(0);
-  const [historyState, setHistoryState] = useState<{ cursor: number | null; draft: string }>({
-    cursor: null,
-    draft: "",
-  });
-  const [activityFrameIndex, setActivityFrameIndex] = useState(0);
-  const [chatDepth, setChatDepth] = useState<ChatDepth>("normal");
-  const [modelLabel, setModelLabel] = useState(
-    props.initialSession.modelOverride
-      ? formatModelOverrideLabel(props.initialSession.modelOverride, props.modelLabel)
-      : props.modelLabel,
-  );
-  const assistantDraftTimestampRef = useRef<number | null>(null);
-  const submitLockRef = useRef(false);
-  const slashSuggestions = getSlashSuggestions(inputValue, SLASH_COMMANDS);
-  const inputHistory = buildInputHistory(session.messages);
-  const activity = describeActivityState(copy);
-  const chatDepthProfile = resolveChatDepthProfile(chatDepth);
-  const composerCaret = resolveComposerCaretState({
-    inputValue,
-    isSubmitting,
-    blinkTick: 0,
-  });
+  const [state, setState] = useState<RuntimeTuiState>(emptyRuntimeState);
+  const [conversationId, setConversationId] = useState(initialConversationId);
+  const [input, setInput] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [connected, setConnected] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [whenBusy, setWhenBusy] = useState<BusyPolicy>("followUp");
+  const [scroll, setScroll] = useState(0);
+  const pending = useRef(false);
+  const activeClient = useRef(client);
+  const refresh = useRef<() => void>(() => {});
+  const history = useRef<InputHistoryState>({ cursor: null, draft: "" });
+  const english = locale === "en";
 
   useEffect(() => {
-    if (!isSubmitting) {
-      setActivityFrameIndex(0);
-      return;
-    }
-
-    const timer = setInterval(() => {
-      setActivityFrameIndex((current) => (current + 1) % activity.frames.length);
-    }, activity.intervalMs);
-    return () => clearInterval(timer);
-  }, [activity.frames.length, activity.intervalMs, isSubmitting]);
-
-  if (props.chatStreamBridge) {
-    props.chatStreamBridge.getChatRequestOptions = () => ({
-      temperature: chatDepthProfile.temperature,
-      maxTokens: chatDepthProfile.maxTokens,
+    const watch = new AbortController();
+    const detach = () => watch.abort();
+    if (signal.aborted) detach();
+    signal.addEventListener("abort", detach, { once: true });
+    let loading = false;
+    let requested = false;
+    const reload = async () => {
+      requested = true;
+      if (loading || watch.signal.aborted) return;
+      loading = true;
+      try {
+        while (requested && !watch.signal.aborted) {
+          requested = false;
+          const next = await loadRuntimeState(activeClient.current, conversationId);
+          if (!watch.signal.aborted) setState(current => ({ ...next, agentEvents: current.agentEvents }));
+        }
+      } catch (failure) { if (!watch.signal.aborted) setError(String(failure)); }
+      finally { loading = false; }
+    };
+    refresh.current = () => { void reload(); };
+    setState(current => ({ ...current, conversation: undefined, agentEvents: [] }));
+    setConnected(false);
+    void reload();
+    void watchRuntimeEvents(activeClient.current, event => {
+      if (watch.signal.aborted) return;
+      setState(current => applyRuntimeEvent(current, event));
+      if (eventRequiresRefresh(event)) void reload();
+    }, { conversationId, signal: watch.signal, onConnection: setConnected,
+      onClient: next => { activeClient.current = next; },
+    }).catch(failure => {
+      if (!watch.signal.aborted) setError(String(failure));
     });
-  }
+    return () => { detach(); signal.removeEventListener("abort", detach); };
+  }, [client, conversationId, signal]);
 
-  props.chatStreamBridge && (props.chatStreamBridge.onTextDelta = (text: string) => {
-    const timestamp = assistantDraftTimestampRef.current;
-    if (timestamp === null) {
-      return;
-    }
-
-    setSession((current) => appendStreamingAssistantChunk(current, text, timestamp));
-  });
-
-  useInput((_input, key) => {
-    if (key.escape) {
-      exit();
-      return;
-    }
-
-    if (slashSuggestions.length > 0 && key.tab) {
-      setInputValue(applySlashSuggestion(inputValue, slashSuggestions, selectedSlashIndex));
-      setSelectedSlashIndex(0);
-      return;
-    }
-
-    if (key.backspace || key.delete) {
-      setInputValue((current) => {
-        // Use Intl.Segmenter for grapheme-aware backspace (handles CJK, emoji, etc.)
-        const segments = [...new Intl.Segmenter().segment(current)];
-        segments.pop();
-        return segments.map((s) => s.segment).join("");
-      });
-      setSelectedSlashIndex(0);
-      return;
-    }
-
-    if (slashSuggestions.length > 0 && key.downArrow) {
-      setSelectedSlashIndex((current) => getNextSlashSelection(current, slashSuggestions.length, "down"));
-      return;
-    }
-
-    if (slashSuggestions.length > 0 && key.upArrow) {
-      setSelectedSlashIndex((current) => getNextSlashSelection(current, slashSuggestions.length, "up"));
-      return;
-    }
-
-    // Page Up / Page Down for conversation scrolling
-    // Raw sequences: Page Up = \x1b[5~ , Page Down = \x1b[6~
-    if (_input === "\x1b[5~") {
-      const maxOffset = Math.max(0, session.messages.length - 4);
-      setScrollOffset((cur) => Math.min(maxOffset, cur + 3));
-      return;
-    }
-    if (_input === "\x1b[6~") {
-      setScrollOffset((cur) => Math.max(0, cur - 3));
-      return;
-    }
-
-    if (key.downArrow) {
-      const next = moveHistoryCursor(inputHistory, historyState, inputValue, "down");
-      setHistoryState(next.state);
-      setInputValue(next.value);
-      return;
-    }
-
-    if (key.upArrow) {
-      const next = moveHistoryCursor(inputHistory, historyState, inputValue, "up");
-      setHistoryState(next.state);
-      setInputValue(next.value);
-      return;
-    }
-
-    if (key.return) {
-      void handleSubmit(inputValue);
-      return;
-    }
-
-    if (_input && !_input.includes("\r") && !_input.includes("\n") && !key.ctrl && !key.meta) {
-      setInputValue((current) => current + _input);
-      setSelectedSlashIndex(0);
+  const messages = conversationMessages(state.conversation);
+  const suggestions = getSlashSuggestions(input, TUI_COMMANDS);
+  useInput((value, key) => {
+    if (key.ctrl && (value === "c" || value === "d")) { exit(); return; }
+    if (key.pageUp) setScroll(current => current + 4);
+    if (key.pageDown) setScroll(current => Math.max(0, current - 4));
+    if (key.tab && suggestions.length) { setInput(applySlashSuggestion(input, suggestions, 0)); return; }
+    if (!submitting && (key.upArrow || key.downArrow)) {
+      const next = moveHistoryCursor(buildInputHistory(messages), history.current, input, key.upArrow ? "up" : "down");
+      history.current = next.state;
+      setInput(next.value);
     }
   });
 
-  const appendSystemNote = (content: string) => {
-    setLastError(undefined);
-    setSession((current) => appendInteractionMessage(current, {
-      role: "system",
-      content,
-      timestamp: Date.now(),
-    }));
-  };
-
-  const handleSubmit = async (rawValue: string) => {
-    const input = rawValue.trim();
-    if (!input || isSubmitting || submitLockRef.current) {
-      return;
-    }
-    submitLockRef.current = true;
-
+  const submit = async (value: string) => {
+    value = value.trim();
+    if (!value || pending.current) return;
+    if (/^\/(quit|exit)$/.test(value)) { exit(); return; }
+    const busy = /^\/busy\s+(steer|followUp|reject)$/.exec(value);
+    if (busy) { setWhenBusy(busy[1] as BusyPolicy); setInput(""); return; }
+    pending.current = true;
+    setSubmitting(true);
+    setError("");
+    setInput("");
+    setScroll(0);
+    history.current = { cursor: null, draft: "" };
+    const requestId = randomUUID();
     try {
-      const localCommand = classifyLocalTuiCommand(input);
-      const depthCommand = parseDepthCommand(input);
-      const modelCommand = parseModelCommand(input);
-      if (localCommand) {
-        setInputValue("");
-
-        if (localCommand === "quit") {
-          exit();
-          return;
-        }
-
-        if (localCommand === "help") {
-          appendSystemNote(copy.notes.help);
-          return;
-        }
-
-        if (localCommand === "status") {
-          const stage = session.currentExecution?.stageLabel
-            ?? session.currentExecution?.status
-            ?? copy.labels.ready;
-          appendSystemNote(copy.notes.status(stage));
-          return;
-        }
-
-        if (localCommand === "clear") {
-          setLastError(undefined);
-          setSinceTimestamp(Date.now());
-          return;
-        }
-
-        if (localCommand === "config") {
-          appendSystemNote(copy.notes.config);
-          return;
-        }
-      }
-
-      if (modelCommand) {
-        setInputValue("");
-        if (modelCommand.kind === "show") {
-          appendSystemNote(copy.notes.modelCurrent(modelLabel));
-          return;
-        }
-
-        const nextModelLabel = formatModelOverrideLabel(modelCommand.model, props.modelLabel);
-        const nextSession = appendInteractionMessage({
-          ...session,
-          modelOverride: modelCommand.model,
-        }, {
-          role: "system",
-          content: copy.notes.modelSet(modelCommand.model),
-          timestamp: Date.now(),
-        });
-        setSession(nextSession);
-        setModelLabel(nextModelLabel);
-        await persistProjectSession(props.projectRoot, nextSession);
-        return;
-      }
-
-      if (depthCommand) {
-        setInputValue("");
-        setChatDepth(depthCommand);
-        appendSystemNote(copy.notes.depthSet(copy.depthLabels[depthCommand]));
-        return;
-      }
-
-      const activeBookId = await resolveSessionActiveBook(props.projectRoot, session);
-      const userTimestamp = Date.now();
-      const assistantDraftTimestamp = userTimestamp + 1;
-      assistantDraftTimestampRef.current = assistantDraftTimestamp;
-      setIsSubmitting(true);
-      setLastError(undefined);
-      setInputValue("");
-      setScrollOffset(0);
-      setHistoryState({ cursor: null, draft: "" });
-      setSession((current) => createOptimisticUserMessageSession(current, input, userTimestamp));
-
-      const result = await processTuiAgentInput({
-        projectRoot: props.projectRoot,
-        input,
-        session,
-        activeBookId,
-        onTextDelta: (text) => {
-          props.chatStreamBridge?.onTextDelta?.(text);
-        },
-      });
-      setSession(result.session);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const failedSession = await loadProjectSession(props.projectRoot);
-      setSession(failedSession);
-      setLastError(message);
-    } finally {
-      assistantDraftTimestampRef.current = null;
-      setIsSubmitting(false);
-      submitLockRef.current = false;
-    }
+      const result = await submitTuiInput(activeClient.current, value, { conversationId, requestId, whenBusy });
+      if (result.conversationId !== undefined) setConversationId(result.conversationId);
+      if (result.output !== undefined) setNotice(typeof result.output === "string" ? result.output : JSON.stringify(result.output, null, 2));
+      else if (result.submission) setNotice(`Submission ${result.submission.id} · ${result.submission.status} · request ${requestId}`);
+      else setNotice(`Conversation ${result.conversationId}`);
+      refresh.current();
+    } catch (failure) {
+      setError(`${String(failure)} · request ${requestId}. Not automatically resubmitted.`);
+      refresh.current();
+    } finally { pending.current = false; setSubmitting(false); }
   };
 
-  const activitySession = isSubmitting
-    ? {
-        ...session,
-        currentExecution: {
-          status: "planning" as const,
-          bookId: session.activeBookId,
-          chapterNumber: session.activeChapterNumber,
-          stageLabel: `${activity.label} ${activity.frames[activityFrameIndex] ?? ""}`.trim(),
-        },
-      }
-    : session;
-
-  return (
-    <InkTuiDashboard
-      locale={props.locale}
-      projectName={props.projectName}
-      activeBookTitle={activitySession.activeBookId}
-      modelLabel={modelLabel}
-      depthLabel={copy.depthLabels[chatDepth]}
-      session={activitySession}
-      inputValue={inputValue}
-      isSubmitting={isSubmitting}
-      sinceTimestamp={sinceTimestamp}
-      lastError={lastError}
-      slashSuggestions={slashSuggestions}
-      selectedSlashIndex={selectedSlashIndex}
-      showComposerCursor={composerCaret.visible}
-      scrollOffset={scrollOffset}
-      onInputChange={(value) => {
-        setInputValue(value);
-        setSelectedSlashIndex(0);
-        setHistoryState((current) => current.cursor === null ? current : { cursor: null, draft: value });
-      }}
-      onSubmit={(value) => {
-        void handleSubmit(value);
-      }}
-    />
-  );
-}
-
-function formatModelOverrideLabel(model: string, defaultLabel: string): string {
-  const provider = defaultLabel.match(/\(([^)]+)\)$/)?.[1];
-  return provider ? `${model} (${provider})` : model;
-}
-
-function ConversationRow(props: { readonly row: DashboardMessageRow }): React.JSX.Element {
-  const { role, content } = props.row;
-
-  // Terminal.app: use the same simple layout as the main branch to avoid
-  // triggering CoreGraphics crashes from complex Box nesting + ANSI codes.
-  if (isAppleTerminal) {
-    const prefix = role === "user" ? "│ " : role === "system" ? "· " : "◆ ";
-    const color = role === "user" ? ROLE_USER : role === "system" ? ROLE_SYSTEM : WARM_REPLY;
-    return (
-      <Box marginBottom={1}>
-        <Text color={role === "assistant" ? WARM_ACCENT : color}>{prefix}</Text>
-        <Text color={color}>{content}</Text>
-      </Box>
-    );
-  }
-
-  if (role === "user") {
-    return (
-      <Box flexDirection="row" marginBottom={1}>
-        <Box minWidth={2}><Text color={ROLE_USER}>│</Text></Box>
-        <Box flexDirection="column" flexShrink={1}><Text color={ROLE_USER}>{content}</Text></Box>
-      </Box>
-    );
-  }
-
-  if (role === "system") {
-    return (
-      <Box flexDirection="row" marginBottom={1}>
-        <Box minWidth={2}><Text color={ROLE_SYSTEM}>·</Text></Box>
-        <Box flexDirection="column" flexShrink={1}><Text color={ROLE_SYSTEM}>{content}</Text></Box>
-      </Box>
-    );
-  }
-
-  // assistant — render markdown (bold, tables, code, etc.)
-  return (
-    <Box flexDirection="row" marginBottom={1}>
-      <Box minWidth={2}><Text color={WARM_ACCENT}>◆</Text></Box>
-      <Box flexDirection="column" flexShrink={1}><Text color={WARM_REPLY}>{renderMarkdown(content)}</Text></Box>
+  const end = Math.max(0, messages.length - scroll);
+  const visible = messages.slice(Math.max(0, end - 10), end);
+  const graphRows = taskTree(state.graph);
+  const inbox = state.conversation?.inbox ?? state.conversation?.docs?.["pi.inbox"];
+  const usage = state.conversation?.usage ?? state.status?.usage;
+  const recent = state.agentEvents.at(-1);
+  return <Box flexDirection="column" paddingX={1}>
+    <Text color={WARM_ACCENT} bold>InkOS · {projectName} · PID {state.status?.pid ?? client.endpoint.pid}</Text>
+    <Text color={WARM_MUTED}>{connected ? (english ? "Watching" : "已连接") : (english ? "Reconnecting (tasks keep running)" : "重连中（任务继续运行）")} · {JSON.stringify(state.status?.model ?? null)}</Text>
+    <Text color={WARM_MUTED}>{english ? "Conversation" : "会话"}: {conversationId ?? "new"} · {state.conversations.map(item => item.id).join(", ") || "none"} · busy={whenBusy}</Text>
+    <Box borderStyle="single" borderColor={WARM_BORDER} flexDirection="column" marginTop={1}>
+      <Text color={WARM_ACCENT}>{english ? "Task tree" : "任务树"}</Text>
+      {graphRows.length ? graphRows.slice(-10).map((row, index) => <Text key={index} color={WARM_MUTED}>{row}</Text>) : <Text color={WARM_MUTED}>{english ? "No live tasks" : "暂无运行任务"}</Text>}
+      <Text color={WARM_MUTED}>{english ? "Works" : "作品"}: {state.status?.works.map(work => `${work.id} (${work.title})`).join(" · ") || "none"}</Text>
     </Box>
-  );
-}
-
-function ExecutionBadge(props: { readonly status: string; readonly color?: string }): React.JSX.Element {
-  const icon = statusIcon(props.status);
-  return (
-    <Text color={props.color ?? statusColor(props.status)} bold>
-      {icon}
-    </Text>
-  );
-}
-
-function statusIcon(status: string): string {
-  switch (status) {
-    case "completed":
-      return "✓";
-    case "failed":
-      return "✗";
-    case "blocked":
-    case "waiting_human":
-      return "◈";
-    case "writing":
-      return "✎";
-    case "planning":
-    case "composing":
-      return "◇";
-    case "repairing":
-    case "persisting":
-      return "◉";
-    default:
-      return "●";
-  }
-}
-
-function MutedText(props: { readonly children: React.ReactNode }): React.JSX.Element {
-  return <Text color={WARM_MUTED}>{props.children}</Text>;
-}
-
-function messageColor(role: DashboardMessageRow["role"]): string {
-  switch (role) {
-    case "user":
-      return WARM_MUTED;
-    case "assistant":
-      return WARM_REPLY;
-    case "system":
-      return WARM_ACCENT;
-    default:
-      return WARM_REPLY;
-  }
-}
-
-function statusColor(status: string): string {
-  switch (status) {
-    case "completed":
-      return STATUS_SUCCESS;
-    case "failed":
-      return STATUS_ERROR;
-    case "blocked":
-    case "waiting_human":
-      return WARM_ACCENT;
-    case "writing":
-    case "repairing":
-    case "planning":
-    case "composing":
-    case "persisting":
-      return STATUS_ACTIVE;
-    default:
-      return STATUS_IDLE;
-  }
+    <Box flexDirection="column" marginTop={1}>
+      {visible.map(message => <Box key={message.key} flexDirection="column" marginBottom={1}>
+        <Text color={message.role === "user" ? ROLE_USER : WARM_ACCENT}>{message.role}</Text>
+        <Text color={WARM_REPLY}>{renderMarkdown(message.content)}</Text>
+      </Box>)}
+      {!messages.length && <Text color={WARM_MUTED}>{english ? "Chat here or /help. /note saves without calling a model." : "输入聊天或 /help。/note 可保存笔记，不调用模型。"}</Text>}
+      {notice && <Text color={WARM_MUTED}>{notice}</Text>}
+      {error && <Text color={STATUS_ERROR}>{error}</Text>}
+    </Box>
+    <Text color={WARM_MUTED}>inbox={JSON.stringify(inbox ?? null)} · usage={JSON.stringify(usage ?? null)}</Text>
+    {recent && <Text color={WARM_MUTED}>event: {recent.type ?? JSON.stringify(recent)}</Text>}
+    <Box borderStyle="round" borderColor={WARM_ACCENT} paddingX={1} marginTop={1}>
+      <Text color={WARM_ACCENT}>› </Text>
+      <TextInput value={input} onChange={setInput} onSubmit={value => { void submit(value); }}
+        focus={!submitting} placeholder={submitting ? (english ? "Submitting…" : "提交中…") : (english ? "Message or /command" : "聊天或 /命令")} />
+    </Box>
+    {suggestions.length > 0 && <Text color={WARM_MUTED}>{suggestions.slice(0, 4).join(" · ")}</Text>}
+    <Text color={WARM_MUTED}>{english ? "Enter send · Tab complete · PgUp/PgDn scroll · Ctrl-C leave (runtime stays running)" : "回车发送 · Tab 补全 · PgUp/PgDn 滚动 · Ctrl-C 退出（runtime 保持运行）"}</Text>
+  </Box>;
 }

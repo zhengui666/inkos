@@ -1,88 +1,62 @@
-import { z } from 'zod';
-import { HarnessIdSchema, WorkResourceIdSchema } from '../harness/contracts.js';
+import type { JsonObject } from '@earendil-works/pi-durable';
+import type { McpConfig } from '../runtime/mcp.js';
 
-export const PublishingPlatformSchema = z.enum(['fanqie', 'qidian', 'qimao', 'meganovel', 'goodnovel', 'dreame']);
-export type PublishingPlatform = z.infer<typeof PublishingPlatformSchema>;
-const Label = z.string().trim().min(1).max(500);
-export const PublishingTargetInputSchema = z.object({
-  workId: WorkResourceIdSchema, platform: PublishingPlatformSchema,
-  accountLabel: Label, remoteBookId: Label,
-}).strict();
-export const PublishingTargetSchema = PublishingTargetInputSchema.extend({
-  id: HarnessIdSchema, createdAt: z.string(), verification: z.enum(['user_supplied', 'independently_observed']),
-  observedAccountId: Label.optional(), creationOperationId: HarnessIdSchema.optional(),
-}).superRefine((target, ctx) => {
-  if (target.verification === 'independently_observed' && (!target.observedAccountId || !target.creationOperationId)) {
-    ctx.addIssue({code: z.ZodIssueCode.custom, message: 'An observed target needs its actual account and creation operation.'});
-  }
-  if (target.verification === 'user_supplied' && (target.observedAccountId !== undefined || target.creationOperationId !== undefined)) {
-    ctx.addIssue({code: z.ZodIssueCode.custom, message: 'User-supplied targets cannot claim observed creation provenance.'});
-  }
-});
-export type PublishingTarget = z.infer<typeof PublishingTargetSchema>;
-
-export const PublishingSelectionSchema = z.array(z.object({
-  artifactId: WorkResourceIdSchema, revisionId: HarnessIdSchema,
-  number: z.number().int().positive(), title: Label,
-}).strict()).min(1).superRefine((chapters, ctx) => {
-  if (new Set(chapters.map(c => c.number)).size !== chapters.length
-    || new Set(chapters.map(c => c.artifactId)).size !== chapters.length) {
-    ctx.addIssue({code: z.ZodIssueCode.custom, message: 'Select each chapter number and artifact only once.'});
-  }
-});
-export type PublishingSelection = z.infer<typeof PublishingSelectionSchema>;
-export const PublishingFormatsSchema = z.array(z.enum(['txt', 'md', 'epub'])).min(1);
-export const PublishingFileSchema = z.object({
-  path: z.string().regex(/^(chapters\/[0-9]+_chapter\.md|exports\/book\.(txt|md|epub)|README\.txt)$/u),
-  checksum: z.string().optional(), contentBase64: z.string().optional(), byteLength: z.number().int().nonnegative(),
-}).strict();
-export const PublishingManifestSchema = z.object({
-  version: z.literal(1), adapter: z.literal('manual'), id: HarnessIdSchema,
-  operationKey: z.string(), createdAt: z.string(), target: PublishingTargetSchema,
-  title: Label, language: z.string().min(1),
-  chapters: z.array(z.object({
-    artifactId: WorkResourceIdSchema, revisionId: HarnessIdSchema,
-    number: z.number().int().positive(), title: Label,
-    checksum: z.string().optional(), sourcePath: z.string(), packagePath: PublishingFileSchema.shape.path,
-  }).strict()).min(1),
-  formats: PublishingFormatsSchema, files: z.array(PublishingFileSchema).min(1),
-  remoteVerified: z.literal(false),
-}).strict();
-export type PublishingManifest = z.infer<typeof PublishingManifestSchema>;
-/** Compare recorded selections and actual bytes; former digest metadata is read-only history. */
-export function publishingManifestValue(manifest: PublishingManifest): string {
-  return JSON.stringify({...manifest,
-    chapters: manifest.chapters.map(({checksum: _legacy, ...chapter}) => chapter),
-    files: manifest.files.map(({checksum: _legacy, ...file}) => file),
-  });
-}
-export const PublishingChapterStatusSchema = z.enum([
-  'awaiting_submission', 'awaiting_receipt', 'submission_unknown',
-  'submitted_reported', 'published_reported', 'not_submitted_reported',
-]);
-export type PublishingChapterStatus = z.infer<typeof PublishingChapterStatusSchema>;
-export const PublishingReceiptSchema = z.object({
-  status: z.enum(['submission_unknown', 'submitted_reported', 'published_reported', 'not_submitted_reported']),
-  evidence: z.string().trim().min(1).max(8000),
-  remoteChapterId: Label.optional(),
-}).strict().superRefine((receipt, ctx) => {
-  if (receipt.status === 'published_reported' && !receipt.remoteChapterId) {
-    ctx.addIssue({code: z.ZodIssueCode.custom, message: 'A reported publication needs the platform chapter ID.'});
-  }
-  if (receipt.status === 'not_submitted_reported' && receipt.remoteChapterId) {
-    ctx.addIssue({code: z.ZodIssueCode.custom, message: 'An absent submission cannot have a platform chapter ID.'});
-  }
-});
-export type PublishingReceipt = z.infer<typeof PublishingReceiptSchema>;
-export interface PublishingPackage {
-  readonly manifest: PublishingManifest;
-  readonly version: number;
-  readonly chapters: Array<{
-    number: number; status: PublishingChapterStatus; remoteChapterId: string | null;
-    evidence: string | null; provenance: 'user_reported' | null;
-  }>;
-  readonly remoteVerified: false;
-}
-export function publishingError(code: string, message: string): Error & {code: string} {
-  return Object.assign(new Error(message), {code});
-}
+export type PublishingOperation = 'publish' | 'update';
+export type BrowserConfig = {
+  /** Omit mcp to launch the installed official Playwright MCP. */
+  mcp?: McpConfig; userDataDir?: string; headless?: boolean; executablePath?: string; args?: string[];
+};
+export type RemoteMapping = {
+  workId: string | null; workUrl: string | null;
+  artifactIds: Record<string, string>; artifactUrls: Record<string, string>; readerUrls: Record<string, string>;
+};
+export type TargetConfig = {
+  entryUrl: string; accountId: string; remote: RemoteMapping; browser: BrowserConfig;
+  skill: string; metadata: JsonObject; cadence?: { cron: string; timeZone?: string };
+};
+export type CreateTargetInput = {
+  id?: string; workId: string; platform: string; label?: string; enabled?: boolean;
+  config: Pick<TargetConfig, 'entryUrl' | 'accountId'> & Partial<Omit<TargetConfig, 'entryUrl' | 'accountId' | 'remote'>> & { remote?: Partial<RemoteMapping> };
+};
+export type UpdateTargetInput = {
+  label?: string; enabled?: boolean;
+  config?: Partial<Omit<TargetConfig, 'remote'>> & { remote?: Partial<RemoteMapping> };
+};
+export type PublishingTarget = {
+  id: string; workId: string; platform: string; label: string; enabled: boolean; config: TargetConfig;
+  conversationId: number; createdAt: number; updatedAt: number;
+};
+export type QueueDistributionInput = {
+  targetId: string; artifactId: string; revisionId?: string; operation?: PublishingOperation;
+  /** Epoch milliseconds. Scheduling is local; the platform receives one Now action when due. */
+  scheduledAt?: number; requestId?: string;
+};
+export type DistributionRequest = {
+  revisionId: string; operation: PublishingOperation; scheduledAt: number | null; requestId: string | null;
+};
+export type RemoteIdentity = { workId: string | null; artifactId: string | null; authorUrl: string | null; readerUrl: string | null };
+export type BrowserObservation = {
+  state: 'absent' | 'draft' | 'submitted' | 'reviewing' | 'rejected' | 'published' | 'user-action' | 'unknown';
+  accountId: string | null; remote: RemoteIdentity; title: string | null; body: string | null;
+  complete: boolean;
+  /** Positive evidence the retained intent did not take effect, NOT merely a missing row. */
+  notApplied: boolean; evidence: string; observedAt: number;
+};
+export type DistributionIntent = {
+  request: DistributionRequest; target: PublishingTarget; conversationId: number; startedAt: number;
+};
+export type DistributionStatus = BrowserObservation['state'] | 'queued' | 'observing' | 'needs-observation' | 'unsupported' | 'failed';
+export type Distribution = {
+  id: string; targetId: string; artifactId: string; workId: string;
+  desired: DistributionRequest; taskId: number | null; status: DistributionStatus;
+  intent: DistributionIntent | null; observationConversationId: number | null;
+  remote: RemoteIdentity; lastObservation: BrowserObservation | null;
+  observedRevisionId: string | null; submittedRevisionId: string | null; publishedRevisionId: string | null;
+  requests: Record<string, DistributionRequest>; error: string | null; createdAt: number; updatedAt: number;
+};
+export type DistributionTaskInput = { distributionId: string; request: DistributionRequest; mode: 'deliver' | 'observe' };
+export type DistributionCheckpoint = { phase: 'start' } | { phase: 'recover' };
+export type DistributionResult = { id: string; status: DistributionStatus };
+export const distributionKey = (targetId: string, artifactId: string): string => JSON.stringify([targetId, artifactId]);
+export const emptyRemote = (): RemoteIdentity => ({ workId: null, artifactId: null, authorUrl: null, readerUrl: null });
+export const emptyMapping = (): RemoteMapping => ({ workId: null, workUrl: null, artifactIds: {}, artifactUrls: {}, readerUrls: {} });

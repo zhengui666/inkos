@@ -1,18 +1,13 @@
 import { Command } from "commander";
-import { launchTui } from "../tui/app.js";
+import { nativeId, projectRoot } from "../utils.js";
 
-export interface TuiCommandHooks {
-  readonly launchTui?: (projectRoot: string) => Promise<void> | void;
+export async function openTui(root: string, conversationId?: number): Promise<void> {
+  const { launchTui } = await import("../tui/app.js");
+  await launchTui(root, { conversationId });
 }
 
-export function createTuiCommand(hooks: TuiCommandHooks = {}): Command {
-  return new Command("tui")
-    .description("Open the InkOS project workspace TUI")
-    .action(async () => {
-      if (hooks.launchTui) {
-        await hooks.launchTui(process.cwd());
-        return;
-      }
-      await launchTui(process.cwd());
-    });
+export function createTuiCommand(): Command {
+  return new Command("tui").description("Open the shared runtime chat and task-tree TUI")
+    .option("--conversation <id>", "Open a persistent conversation", nativeId)
+    .action((options, command) => openTui(projectRoot(command), options.conversation));
 }

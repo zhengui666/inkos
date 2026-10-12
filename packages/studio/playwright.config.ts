@@ -1,31 +1,28 @@
-import { defineConfig } from "@playwright/test";
+import { defineConfig } from '@playwright/test';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const scratch = process.env.PI_SCRATCH_DIR ?? tmpdir();
+const project = process.env.INKOS_E2E_ROOT ?? mkdtempSync(join(scratch, 'inkos-studio-e2e-'));
+process.env.INKOS_E2E_ROOT = project;
 
 export default defineConfig({
-  testDir: "./e2e",
-  // Rebuild @actalk/inkos-core before starting the E2E server.  The API server
-  // (tsx watch src/api/index.ts) imports core via its compiled dist/index.js,
-  // not the TypeScript source.  A stale dist causes runtime behaviour to
-  // diverge from the sources, making otherwise-correct logic invisible to the
-  // test server.  See e2e/global-setup.ts for details.
-  globalSetup: "./e2e/global-setup.ts",
-  timeout: 60_000,
-  // Run specs serially against the single shared dev server. The authoring
-  // agent flow streams a long SSE turn; with parallel workers, concurrent
-  // specs hammering the one server starve that turn into a 60s timeout (the
-  // spec passes alone but flakes in a parallel full run). Serial is both
-  // reliable and faster here (one backend, no contention).
+  testDir: './e2e',
+  testMatch: '**/*.spec.ts',
+  timeout: 30_000,
+  expect: { timeout: 10_000 },
   workers: 1,
-  use: {
-    baseURL: "http://localhost:4580",
-    headless: true,
-    screenshot: "only-on-failure",
-  },
-  // Ports 4580/4581 are dedicated to E2E to avoid conflict with the dev server.
+  fullyParallel: false,
+  outputDir: join(project, 'browser-results'),
+  reporter: [['list']],
+  use: { baseURL: 'http://127.0.0.1:4580', headless: true, screenshot: 'only-on-failure', trace: 'retain-on-failure', launchOptions: process.env.INKOS_BROWSER_EXECUTABLE ? { executablePath: process.env.INKOS_BROWSER_EXECUTABLE } : {} },
   webServer: {
-    command: "INKOS_STUDIO_PORT=4581 INKOS_PROJECT_ROOT=../../test-project tsx watch --clear-screen=false src/api/index.ts & INKOS_STUDIO_PORT=4581 vite --host --port 4580 ; kill %1 2>/dev/null",
-    url: "http://localhost:4580",
+    command: 'npm run build:client && tsx e2e/serve.ts',
+    url: 'http://127.0.0.1:4580/api/v1/status',
+    env: { INKOS_E2E_ROOT: project, INKOS_STUDIO_PORT: '4580' },
     reuseExistingServer: false,
-    timeout: 120_000,
-    cwd: ".",
+    timeout: 60_000,
+    cwd: '.',
   },
 });

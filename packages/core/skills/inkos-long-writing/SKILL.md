@@ -1,10 +1,10 @@
 ---
 name: inkos-long-writing
-description: 长篇小说的场景构造、人物因果、信息释放与连载节奏。Used by InkOS long-form workers as their shared craft method.
+description: 长篇小说的场景构造、人物因果、信息释放与连载节奏。Craft guidance for InkOS fiction extensions.
 ---
 # Long-form narrative craft
 
-Apply this method inside the active architect, writer, auditor, or reviser operation, across genres. When the author leaves the reading goal open, default to accessible commercial web fiction in the requested language. Favour a protagonist with little leverage who finds a concrete opening, acts against meaningful opposing interests, and earns a felt change in circumstances. An explicit literary, quiet, tragic, experimental, or other non-commercial intent overrides this default. Genre and author voice determine the kind of pleasure and pacing.
+Apply this method when the fiction profile plans, composes, reviews or edits. Follow the author's reading goal, genre, voice and requested pacing. Literary, quiet, tragic, experimental, commercial and other intentions are all valid; do not select a commercial underdog structure as a global default.
 
 - Build scenes with an immediate objective, resistance, a meaningful turn and lasting consequences.
 - Let character choices follow what each person wants, knows, fears, and can afford. Supporting positions can be sharp, selfish or openly malicious. A few consequential acts can establish a role; do not require every supporting character to be morally complex or explain their entire background. Relationships and status change through what people do.
@@ -22,7 +22,5 @@ Apply this method inside the active architect, writer, auditor, or reviser opera
 - Use varied natural paragraphs. Honor an explicit Chinese paragraph preference when supplied; otherwise choose breaks for meaning, emphasis and speaker clarity rather than a character quota. Avoid frequent fragments and extended bare question-answer exchanges; integrate relevant action, expression, surroundings and narration while keeping the speaker clear.
 - When reviewing a new foundation, test whether the central conflict can sustain the requested span, the opening creates forward pressure, the world is specific and coherent, major characters differ in motive and voice, and the outline can progress without repeating one beat. For fan fiction or series work, preserve source facts while establishing a real divergence or new narrative space.
 
-Load `references/foundation-design.md` while creating or rebuilding a book foundation. Load `references/reader-contract-and-progression.md` while planning, writing, reviewing, or revising chapters.
-Load `references/scene-dialogue-and-length-budget.md` while planning, drafting, reviewing, or polishing scenes. Load `references/state-projection.md` while observing a completed chapter or settling runtime truth files.
-
-For commercial topic design, foundation, planning, prose and revision, load `references/commercial-underdog-engine.md`. Carry the structured reader contract into the foundation and its chapter delivery into the memo; do not leave the promise only in advice or a blurb.
+Use `references/foundation-design.md`, `references/scene-dialogue-and-length-budget.md` and `references/state-projection.md` when relevant to the requested task.
+`references/reader-contract-and-progression.md` and `references/commercial-underdog-engine.md` are optional methods for explicitly requested commercial serial work, never mandatory platform or core policy.

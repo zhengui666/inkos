@@ -5,5 +5,6 @@ export default defineConfig({
     // CLI integration tests spawn real child processes; the default 5s timeout
     // is too aggressive when the whole workspace runs in parallel.
     testTimeout: 60_000,
+    hookTimeout: 60_000,
   },
 });

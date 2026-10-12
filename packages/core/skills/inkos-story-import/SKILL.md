@@ -7,9 +7,9 @@ description: 导入已有小说、逆向重建设定与续写工程，并区分�
 Use this skill when the user wants an existing manuscript to become an editable, continuable InkOS project.
 
 - Determine the user's intent before acting:
-  - `import_chapters`: the text becomes real chapters in the active book and InkOS reconstructs state.
-  - `ingest_material`: the text remains reference material only.
-  - `manage_book_reference`: an archived source should guide future chapters for user-stated purposes.
+  - Manuscript import saves real content revisions through the artifact service/CLI `import` or explicit `content_create` input; inspect evidence before reconstructing domain state.
+  - `materials_ingest`: the text remains reference material only.
+  - `work_update`: selected material IDs and their purposes guide subsequent creation without automatically becoming canon.
 - Preserve chapter order with natural chapter-number ordering. Confirm the continuation point when the active book already has chapters.
 - Never treat a user's own manuscript as an imitation target by default.
 - After import, report imported chapter count, detected gaps, reconstructed facts, uncertainties, and the next safe continuation point.

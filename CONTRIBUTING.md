@@ -1,89 +1,27 @@
 # Contributing
 
-## Setup
+InkOS retains three packages: `core`, `cli`, and `studio`. Use Node ≥22.19.0 and pnpm 11.3.0.
 
-```bash
-git clone https://github.com/Narcooo/inkos.git
-cd inkos
+```sh
 pnpm install
 pnpm build
+pnpm typecheck
 pnpm test
+pnpm test:flows
+pnpm --filter @actalk/inkos-studio test:e2e
+pnpm test:install
 ```
 
-Node ≥ 20, pnpm ≥ 9.
+Install a Playwright Chromium browser for e2e (`pnpm --filter @actalk/inkos-studio exec playwright install chromium`), or set `INKOS_BROWSER_EXECUTABLE` to an installed Chrome executable. Tests use actual official SDK, SQLite, filesystem, subprocesses and browser tools; do not replace them with successful model scripts, fake SDKs or fake publishing sites.
 
-## Project Structure
+- Put execution in official pi-durable tasks/conversations. Do not introduce another Agent loop, scheduler, lease system, transcript recovery or client execution database.
+- Put work plans, professional structures, artifact references and distribution intent in domain Documents. Keep large content in stable-version files.
+- Implement tools/tasks with official Extension. New content profiles can supply `parseDomain`; new publishers declare their actual capabilities.
+- Keep Studio server as assembly and domain routes as thin RPC/SSE adapters. CLI/TUI connect to the same owner.
+- Preserve useful domain assertions and original manuscripts/databases. Migrations read originals and write only destination domain data; unknown remote outcomes must be observed.
+- Keep changes scoped. Do not add checksums, release proof ledgers, redundant approval chains or a private SDK compatibility layer.
+- Local tests must clean their services and temporary projects. Do not use live accounts/models without explicit configuration, scope and fee authorization.
 
-```
-packages/
-  core/    # Agents, pipeline, state management, LLM providers
-  cli/     # Commander.js commands (22 commands)
-```
+Architecture and deletion decisions belong in `.opensdlc/architecture.md`; migration, executed checks and remaining gaps belong in `.opensdlc/delivery.md`. Historical `.pi/plan/` documents are not rewritten as implementation evidence.
 
-Monorepo managed with pnpm workspaces. `cli` depends on `core` via `workspace:*`.
-
-## Development
-
-```bash
-pnpm dev          # Watch mode (both packages)
-pnpm build        # Build once
-pnpm test         # Run all tests
-pnpm typecheck    # Type-check without emitting
-```
-
-## Commit Convention
-
-```
-<type>: <description>
-```
-
-Types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `ci`
-
-Keep commits atomic — one logical change per commit. Split new files, interface changes, tests, and docs into separate commits when they're non-trivial.
-
-## Pull Request Checklist
-
-- [ ] `pnpm build` passes
-- [ ] `pnpm test` passes (all existing + new tests)
-- [ ] `pnpm typecheck` passes
-- [ ] New features have tests
-- [ ] No unrelated formatting changes (keep diffs focused)
-- [ ] Commit messages follow the convention above
-
-## Code Style
-
-- TypeScript, strict mode
-- 2-space indentation
-- Immutable patterns: `{ ...obj, key: value }` over mutation
-- Functions < 50 lines, files < 800 lines
-- Errors must surface, not be swallowed (`catch { }` without re-throw needs a comment)
-- Publishable package manifests must use registry-installable internal versions, not `workspace:*`; `pnpm` links local packages through the workspace config during development.
-
-## Adding a CLI Command
-
-1. Create `packages/cli/src/commands/<name>.ts`
-2. Export a `Command` instance
-3. Register it in `packages/cli/src/index.ts`
-4. Add `--json` output support
-5. Support book-id auto-detection when only one book exists
-
-## Adding a Genre
-
-1. Create `packages/core/genres/<id>.md` with YAML frontmatter
-2. Define: `chapterTypes`, `fatigueWords`, `numericalSystem`, `powerScaling`, `pacingRule`, `satisfactionTypes`, `auditDimensions`, `language`
-3. Add genre body (prohibitions, language rules, narrative guidance)
-
-## Testing
-
-Tests live next to source in `__tests__/` directories. We use Vitest.
-
-```bash
-pnpm --filter @actalk/inkos-core test    # Core tests only
-pnpm --filter @actalk/inkos test         # CLI tests only
-```
-
-For features touching the LLM pipeline, mock the LLM calls — don't make real API requests in tests.
-
-## Questions?
-
-Open an issue or check existing ones: https://github.com/Narcooo/inkos/issues
+CI runs the commands above and one three-tarball clean-install smoke. Release reuses CI and publishes core, Studio, then CLI with pnpm's native workspace dependency conversion. Local contribution work does not automatically publish, push or deploy.

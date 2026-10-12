@@ -77,13 +77,13 @@ function escHtml(s: string): string {
 
 export function buildPlayableHtml(
   graph: StoryGraph,
-  opts?: { assetDataUris?: Record<string, string>; title?: string },
+  opts?: { assetDataUris?: Record<string, string>; title?: string; locale?: string },
 ): string {
   const title = opts?.title ?? graph.title ?? graph.projectId;
   const graphJson = esc(JSON.stringify(graph));
   const assetsJson = esc(JSON.stringify(opts?.assetDataUris ?? {}));
   return `<!doctype html>
-<html lang="zh"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<html lang="${escHtml(opts?.locale ?? 'en')}"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>${escHtml(title)}</title><style>${CSS}</style></head>
 <body><div id="wrap"><h1>${escHtml(title)}</h1><div id="if-player" data-if-player></div></div>
 <script>var GRAPH=${graphJson};var ASSETS=${assetsJson};</script>

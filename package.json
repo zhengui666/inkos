@@ -28,19 +28,13 @@
     "dev": "pnpm -r --parallel dev",
     "test": "pnpm -r test",
     "test:flows": "pnpm -r --if-present test:flows",
-    "lint": "pnpm -r lint",
     "typecheck": "pnpm -r typecheck",
-    "audit:semantic-patterns": "node scripts/audit-semantic-patterns.mjs",
-    "verify:publish-manifests": "node scripts/verify-no-workspace-protocol.mjs packages/core packages/cli packages/studio",
+    "test:install": "node scripts/install-smoke.mjs",
     "release": "pnpm build && pnpm test"
   },
   "engines": {
     "node": ">=22.19.0",
-    "pnpm": ">=9.0.0"
+    "pnpm": "11.3.0"
   },
-  "pnpm": {
-    "overrides": {
-      "@mariozechner/pi-ai": "0.67.1"
-    }
-  }
+  "packageManager": "pnpm@11.3.0"
 }

@@ -1,6 +1,6 @@
 # Mode-aware narrative craft
 
-The built-in `short-fiction` and `longform-novel` profiles combine their existing mode-specific writing Skill with the existing `inkos-story-deslop` prose method. This is prompt guidance inside the current operation, not a new workflow engine, automatic rewrite, detector, or publishing action. Other profiles are unchanged. Project Skills can replace a built-in Skill by id; a custom profile can select its own required methods.
+The built-in `fiction` and `short-fiction` profiles load their mode-specific writing Skill as guidance inside official durable tasks. Authors may explicitly request `inkos-story-deslop` through `work.domain.skills`. This is craft guidance, not another workflow engine, automatic detector or publishing action. Project Skills can replace a built-in by the same ID.
 
 ## Shared method and mode differences
 
@@ -8,7 +8,7 @@ The built-in `short-fiction` and `longform-novel` profiles combine their existin
 - Short fiction: an obstructed goal and opposing aims made visible in the opening, active choices, changing stakes, and a focused conflict with a complete emotional payoff; explicit alternative ending/genre choices remain authoritative
 - Long fiction: an active protagonist goal, sustained progress and earned stage payoffs, distinct voices and motivated change over time, carried-forward knowledge and consequences, and independent long-range promises across chapters and arcs
 - Planning can compare unsettled titles or openings, build a skeleton, draft scenes, review, and target repairs. These are skippable methods within the active operation, not compulsory new steps or reasons to reopen accepted choices
-- Chinese fiction defaults to commercial web fiction when the author has not specified another creative target. Clear conflict, protagonist agency and emotional return take priority over neutral observation. Explicit literary, quiet, tragic or other non-commercial intent overrides this product default. Quiet scenes, lyricism, direct thought and functional repetition can serve buildup, cost, attachment and release; prose cleanup preserves the desired dramatic intensity
+- Author intent governs the creative target in every locale. Commercial conflict and emotional return are appropriate when requested; quiet, literary, tragic or other directions do not need to override a hidden product template.
 
 Hook intervals, dialogue ratios, word bans, and chapter or scene counts are not universal quality gates. An explicit author constraint still applies. Names of platforms or genres do not imply numerical quotas. Model-predicted completion rates, authorship judgments, AI-detector scores, and platform acceptance are not outcomes this guidance establishes.
 
@@ -24,14 +24,9 @@ Reviewed on 2026-10-03. The guidance independently restates transferable craft i
 
 The upstream MIT licenses do not grant rights to third-party literary works or private tutorials referenced by those repositories. InkOS does not bundle them; its existing project license is unchanged.
 
-## Creative target and sample feedback
-
-The initial delivered samples preserved continuity and natural expression, but the user found their creative direction too restrained for the intended web-fiction reading experience. The correction is to restore conflict, active pursuit and tangible emotional reward, while keeping genre variety and author authority. This is a product/default-target decision supported by the user's feedback, not a claim that all readers prefer one kind of fiction.
-
-Sample inputs should state the desired payoff and immediate goal clearly, while keeping essential canon in one authoritative context instead of repeating a dense constraint list across rules, memos and instructions. Technical accuracy or an absence of prose defects does not by itself establish that the story delivers the requested pleasure.
 
 ## Verification boundaries
 
-`writing-guidance-routing.test.ts` exercises actual worker message preparation, mode selection, linked resources, author authority and targets, custom overrides, and isolation from other profiles and read-only semantic mechanics. Existing Skill and production contract tests cover regression. These tests use no model calls and establish prompt-routing behavior only.
+The durable flow regressions cover profile execution, author-supplied content, cached reviews, targeted saved-revision adoption, Japanese locale and plan changes. Runtime regressions load and execute a project-local official profile. They use real SDK and files without model calls and do not establish literary quality.
 
 Literary quality requires a separate evaluation on original passages not used to derive these instructions: different genres, short and long form, quiet and high-pressure scenes, deliberate stylistic exceptions, and continuity across chapters. Compare source and revised text, inspect evidence-backed diagnoses and protected facts, and separate reader preference from objective continuity defects. Passing routing tests does not establish better prose, detector performance, completion rates, or platform acceptance.

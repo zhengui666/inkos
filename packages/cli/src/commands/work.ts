@@ -1,97 +1,53 @@
 import { Command } from "commander";
-import {
-  CreativeEpisodeStore,
-  listWorkManifests,
-  loadWorkManifest,
-  migrateLegacyWorks,
-} from "@actalk/inkos-core";
-import { join } from "node:path";
-import { findProjectRoot, log, logError } from "../utils.js";
+import { connect, type Work } from "../runtime.js";
+import { jsonObject, output } from "../utils.js";
+import { mergePlan, planFromOptions, planOptions } from "../work-options.js";
 
-export const workCommand = new Command("work")
-  .description("Inspect creative Works, artifacts, revisions, and Episodes");
+function fields(command: Command): Command {
+  return planOptions(command.option("--title <text>", "Work title")
+    .option("--profile <id>", "Built-in or extension profile (no platform required)")
+    .option("--locale <locale>", "Writing locale")
+    .option("--domain <json>", "Profile-specific domain data", jsonObject))
+    .option("--json", "Output JSON");
+}
 
-workCommand.command("migrate")
-  .description("Preview or copy legacy projects into the Work library")
-  .option("--apply", "Apply the migration, retaining original directories")
-  .option("--source <path>", "Migrate one legacy directory, for example books/my-book")
-  .option("--json", "Output JSON")
-  .action(async (opts: { apply?: boolean; source?: string; json?: boolean }) => {
-    try {
-      const results = await migrateLegacyWorks(findProjectRoot(), opts);
-      if (opts.json) log(JSON.stringify({ applied: opts.apply === true, results }, null, 2));
-      else for (const item of results) log(`${item.source} | ${item.status} | ${item.fileCount ?? 0} files${item.error ? ` | ${item.error}` : ""}`);
-      if (results.some((item) => item.status === "invalid" || item.status === "conflict")) process.exitCode = 1;
-    } catch (error) { logError(String(error)); process.exitCode = 1; }
-  });
-
-workCommand
-  .command("list")
-  .description("List every creative Work across all content types")
-  .option("--profile <profileId>", "Filter by Work profile")
-  .option("--json", "Output JSON")
-  .action(async (opts: { profile?: string; json?: boolean }) => {
-    try {
-      const root = findProjectRoot();
-      const works = await listWorkManifests(root, opts.profile?.trim() || undefined);
-      const output = works.map((work) => ({
-        id: work.id,
-        title: work.title,
-        profileId: work.profileId,
-        language: work.language,
-        status: work.status,
-        artifacts: work.artifacts.length,
-        updatedAt: work.updatedAt,
+export function createWorkCommand(): Command {
+  const work = new Command("work").description("Manage Works and persistent production plans through the runtime");
+  work.command("list").option("--profile <id>", "Filter by profile").option("--json", "Output JSON")
+    .action(async (options, command) => {
+      const works: Work[] = await (await connect(command)).rpc<Work[]>("works.list");
+      output(options.profile ? works.filter(item => item.profile === options.profile) : works);
+    });
+  fields(work.command("create").argument("[title]").option("--id <id>", "Work ID"))
+    .action(async (title: string | undefined, options, command) => {
+      title = options.title ?? title;
+      if (!title?.trim()) throw new Error("Pass a title or --title.");
+      output(await (await connect(command)).rpc("works.create", {
+        id: options.id, title, profile: options.profile, locale: options.locale, brief: options.brief,
+        plan: planFromOptions(options), domain: options.domain,
       }));
-      if (opts.json) {
-        log(JSON.stringify({ works: output }, null, 2));
-        return;
+    });
+  work.command("show").argument("<id>").option("--json", "Output JSON")
+    .action(async (id: string, _options, command) => output(await (await connect(command)).rpc("works.get", { id })));
+  fields(work.command("update").argument("<id>").option("--changes <json>", "Work changes JSON", jsonObject))
+    .action(async (id: string, options, command) => {
+      const client = await connect(command);
+      const changes = { ...options.changes };
+      for (const key of ["title", "profile", "locale", "brief", "domain"]) {
+        if (options[key] !== undefined) changes[key] = options[key];
       }
-      if (output.length === 0) {
-        log("No creative Works found.");
-        return;
-      }
-      for (const work of output) {
-        log(`${work.id} | ${work.profileId} | ${work.title} | ${work.artifacts} artifacts | ${work.status}`);
-      }
-    } catch (error) {
-      if (opts.json) log(JSON.stringify({ error: String(error) }));
-      else logError(`Failed to list Works: ${error}`);
-      process.exitCode = 1;
-    }
-  });
-
-workCommand
-  .command("show")
-  .description("Show one Work with artifact revisions and recent Episodes")
-  .argument("<work-id>", "Work ID")
-  .option("--json", "Output JSON")
-  .action(async (workId: string, opts: { json?: boolean }) => {
-    let episodes: CreativeEpisodeStore | undefined;
-    try {
-      const root = findProjectRoot();
-      const work = await loadWorkManifest(root, workId);
-      episodes = new CreativeEpisodeStore(join(root, ".inkos", "harness.sqlite"));
-      const recentEpisodes = episodes.listEpisodes({ workId, limit: 50 });
-      if (opts.json) {
-        log(JSON.stringify({ work, episodes: recentEpisodes }, null, 2));
-        return;
-      }
-      log(`${work.title} (${work.id})`);
-      log(`Profile: ${work.profileId} | Language: ${work.language} | Status: ${work.status}`);
-      log(`Artifacts: ${work.artifacts.length} | Episodes: ${recentEpisodes.length}`);
-      for (const artifact of work.artifacts) {
-        const current = artifact.revisions.find((revision) => revision.id === artifact.currentRevisionId);
-        log(`  ${artifact.kind} | ${current?.path ?? "(no accepted revision)"} | ${artifact.revisions.length} revision(s)`);
-      }
-      for (const episode of recentEpisodes.slice(0, 10)) {
-        log(`  episode ${episode.id} | ${episode.status} | ${episode.startedAt}`);
-      }
-    } catch (error) {
-      if (opts.json) log(JSON.stringify({ error: String(error) }));
-      else logError(`Failed to inspect Work: ${error}`);
-      process.exitCode = 1;
-    } finally {
-      episodes?.close();
-    }
-  });
+      const plan = planFromOptions({ ...options, plan: mergePlan(changes.plan ?? {}, options.plan ?? {}) });
+      if (plan) changes.plan = plan; // Only explicit changes; the runtime owns persisted-state merging.
+      if (!Object.keys(changes).length) throw new Error("Pass Work fields, --plan, or --changes.");
+      output(await client.rpc("works.update", { id, changes }));
+    });
+  for (const [name, paused] of [["pause", true], ["resume", false]] as const) {
+    work.command(name).argument("<id>").option("--json", "Output JSON")
+      .action(async (id: string, _options, command) => output(await (await connect(command)).rpc("works.pause", { id, paused })));
+  }
+  work.command("migrate").description("Preview legacy migration by default; --apply retains original data")
+    .option("--source <path>", "Legacy source directory").option("--apply", "Apply migration")
+    .option("--json", "Output JSON")
+    .action(async (options, command) => output(await (await connect(command)).rpc("work.migrate", { source: options.source, apply: options.apply === true })));
+  return work;
+}

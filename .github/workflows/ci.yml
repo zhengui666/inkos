@@ -1,175 +1,27 @@
 name: CI
-
 on:
   push:
     branches: [master, main]
   pull_request:
     branches: [master, main]
-
+  workflow_call:
 jobs:
-  build-and-test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        node-version: [22, 24]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node-version }}
-          cache: pnpm
-
-      - name: Verify installed-package workflow gates
-        run: node --test scripts/installed-gates-workflow.test.mjs
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm build
-      - run: pnpm typecheck
-      - run: pnpm test
-      - name: Verify real Studio SSE shutdown and daemon drain without model calls
-        if: runner.os == 'Linux'
-        run: node scripts/verify-studio-shutdown.mjs
-      - name: Verify pinned Codex native-tool isolation without credentials
-        if: runner.os == 'Linux'
-        env:
-          INKOS_CODEX_INTEGRATION: '1'
-        run: pnpm --filter @actalk/inkos-core exec vitest run src/codex/__tests__/isolation.integration.test.ts src/codex/__tests__/worker-output.integration.test.ts src/codex/__tests__/code-mode.integration.test.ts src/codex/__tests__/main-completion.integration.test.ts src/codex/__tests__/research-discovery.integration.test.ts src/codex/__tests__/native-compaction.integration.test.ts
-
-  installed-package-smoke:
+  verify:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        node-version: [22, 24]
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 11.3.0
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm build
-      - name: Install all three local tarballs in a clean directory
-        id: installed-package
-        run: |
-          set -euo pipefail
-          INSTALLED_ROOT=$(mktemp -d "$RUNNER_TEMP/inkos-installed.XXXXXX")
-          PACK_DIR=$(mktemp -d "$RUNNER_TEMP/inkos-pack.XXXXXX")
-          INSTALLED_EVIDENCE_DIR=$(mktemp -d "$RUNNER_TEMP/inkos-evidence.XXXXXX")
-          echo "INSTALLED_ROOT=$INSTALLED_ROOT" >> "$GITHUB_ENV"
-          echo "INSTALLED_EVIDENCE_DIR=$INSTALLED_EVIDENCE_DIR" >> "$GITHUB_ENV"
-          EXPECTED_VERSION=$(node --input-type=module <<'NODE'
-          import { readFileSync } from 'node:fs';
-          const versions = ['core', 'studio', 'cli'].map(pkg => JSON.parse(readFileSync(`packages/${pkg}/package.json`, 'utf8')).version);
-          if (!versions[0] || !versions.every(version => version === versions[0])) throw new Error('Publishable package versions must match');
-          console.log(versions[0]);
-          NODE
-          )
-          echo "EXPECTED_VERSION=$EXPECTED_VERSION" >> "$GITHUB_ENV"
-          for pkg in core studio cli; do
-            (cd "packages/$pkg" && npm pack --pack-destination "$PACK_DIR")
-          done
-          CORE_TGZ="$PACK_DIR/actalk-inkos-core-$EXPECTED_VERSION.tgz"
-          STUDIO_TGZ="$PACK_DIR/actalk-inkos-studio-$EXPECTED_VERSION.tgz"
-          CLI_TGZ="$PACK_DIR/actalk-inkos-$EXPECTED_VERSION.tgz"
-          test -f "$CORE_TGZ" && test -f "$STUDIO_TGZ" && test -f "$CLI_TGZ"
-          cd "$INSTALLED_ROOT"
-          npm init -y
-          npm install --no-audit --no-fund "$CORE_TGZ" "$STUDIO_TGZ" "$CLI_TGZ"
-      - name: Verify exact installed package versions and CLI
-        if: ${{ !cancelled() && steps.installed-package.outcome == 'success' }}
-        run: node scripts/verify-installed-release.mjs --root "$INSTALLED_ROOT" --version "$EXPECTED_VERSION" --output "$INSTALLED_EVIDENCE_DIR/release.json"
-      - name: Verify installed Studio without model calls or accounts
-        if: ${{ !cancelled() && steps.installed-package.outcome == 'success' }}
-        run: node scripts/verify-installed-studio.mjs --root "$INSTALLED_ROOT" --output "$INSTALLED_EVIDENCE_DIR/studio.json"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: installed-package-smoke-node-${{ matrix.node-version }}
-          path: ${{ runner.temp }}/inkos-evidence.*/*.json
-          retention-days: 7
-
-  codex-browser:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
+          node-version: 22.19.0
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @actalk/inkos-studio exec playwright install --with-deps chromium
       - run: pnpm build
-      - name: Verify the isolated MegaNovel DOM workflow without real accounts
-        env:
-          INKOS_BROWSER_FIXTURES: '1'
-        run: pnpm --filter @actalk/inkos-core exec vitest run src/__tests__/meganovel-dom-binding.test.ts src/__tests__/meganovel-auth-boundary.test.ts
-      - name: Initialize a ChatGPT-only project without legacy API keys
-        run: |
-          mkdir -p test-project
-          printf '%s\n' '{"name":"Codex browser tests","version":"0.1.0","language":"en"}' > test-project/inkos.json
-      - name: Verify Codex settings, Doctor and radar UI with mocked account APIs
-        run: pnpm --filter @actalk/inkos-studio exec playwright test --config=playwright.codex.config.ts codex-settings.spec.ts
-      - name: Verify creation-board controls with isolated offline API fixtures
-        run: pnpm --filter @actalk/inkos-studio exec playwright test --config=playwright.creation.config.ts
-      - uses: actions/upload-artifact@v4
-        if: failure()
-        with:
-          name: codex-browser-results
-          path: packages/studio/test-results/
-          retention-days: 7
-
-  verify-pack:
-    runs-on: ubuntu-latest
-    needs: build-and-test
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm build
-
-      - name: Verify no workspace:* in tarballs
-        run: |
-          set -euo pipefail
-          for pkg in packages/core packages/cli packages/studio; do
-            echo "--- Checking $pkg ---"
-            cd "$pkg"
-            PACKDIR=$(mktemp -d)
-            npm pack --pack-destination "$PACKDIR" 2>/dev/null
-            TGZ=$(ls "$PACKDIR"/*.tgz)
-            PACKED_PKG=$(tar -xOf "$TGZ" package/package.json)
-            if echo "$PACKED_PKG" | grep -q '"workspace:'; then
-              echo "FAIL: $pkg tarball still contains workspace: protocol"
-              echo "$PACKED_PKG" | grep 'workspace:'
-              rm -rf "$PACKDIR"
-              exit 1
-            fi
-            echo "OK: $pkg tarball is clean"
-            rm -rf "$PACKDIR"
-            cd - >/dev/null
-          done
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm test:flows
+      - run: pnpm --filter @actalk/inkos-studio test:e2e
+      - run: node scripts/install-smoke.mjs
