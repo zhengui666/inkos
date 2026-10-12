@@ -1,3 +1,4 @@
+import type { WorkAutonomy } from '@actalk/inkos-core';
 export type RecordData = Record<string, any>;
 export type Work = {
   id: string; title: string; profile: string; locale: string;
@@ -8,6 +9,7 @@ export type Work = {
     production: { backlog: number; cron: string | null; nextAt: number | null } };
   artifactIds: string[]; targetIds: string[]; materialIds: string[];
   domain: RecordData; history: RecordData[]; legacy?: RecordData;
+  autonomy?: WorkAutonomy;
 };
 export type RuntimeStatus = {
   pid: number; rootDir: string; works: Work[]; targets: RecordData[];

@@ -76,7 +76,7 @@ export function useActions(invalidate: () => void) {
     try {
       const result = await action(); invalidate(); setNotice({ text: success, error: false }); return result;
     } catch (e) {
-      setNotice({ text: `${e instanceof Error ? e.message : String(e)} — Read the latest state before retrying.`, error: true });
+      setNotice({ text: e instanceof Error ? e.message : String(e), error: true });
     } finally {
       pending.current.delete(key); setBusy(new Set(pending.current));
     }

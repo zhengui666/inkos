@@ -5,6 +5,7 @@ import { proxyMethods } from '../proxy.js';
 export function workRoutes(app: Hono, client: RuntimeClient) {
   proxyMethods(app, client, [
     'works.list', 'works.create', 'works.get', 'works.update', 'works.pause',
+    'autonomy.configure', 'autonomy.start', 'autonomy.stop', 'ranking.read',
     'artifacts.read', 'artifacts.save', 'artifacts.edit', 'artifacts.export',
     'materials.ingest', 'materials.query', 'materials.list', 'work.migrate',
   ]);

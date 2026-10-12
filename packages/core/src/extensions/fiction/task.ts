@@ -1,6 +1,6 @@
 import { configure, defineTask, UsageDoc, type ConversationId, type JsonObject, type TaskRuntime, type RunningTask } from '@earendil-works/pi-durable';
 import type { Context } from '@earendil-works/chord';
-import { contentText } from '@earendil-works/pi-ai';
+import { readModelAnswer } from '../model-answer.js';
 import { Works, Artifacts, Reviews, reviewKey, type Work, type ReviewResult } from '../../works/documents.js';
 import { saveArtifact, savedRevision, readArtifact } from '../../works/artifacts.js';
 import { commitRevision } from '../../works/service.js';
@@ -51,10 +51,7 @@ async function ask(task: Invocation, runtime: Runtime, context: Context, instruc
   if (!conversation) throw new Error('Owned conversation missing');
   const settled = await (await conversation.submit({ type: 'input', content: prompt, requestId: `content:${task.id}:${checkpoint.phase}:${checkpoint.attempt}` }, context)).wait(context);
   if (settled.status !== 'done' || settled.type !== 'input') throw new Error(`Model step failed (${checkpoint.phase}); saved content retained`);
-  const entry = await runtime.entry(settled.answer, context);
-  const answer = entry?.model?.find(message => message.role === 'assistant');
-  if (!answer || answer.role !== 'assistant') throw new Error('Model step has no assistant answer');
-  return contentText(answer.content);
+  return readModelAnswer(runtime, checkpoint.child, settled.answer, context);
 }
 function validateContent(profile: ContentProfile, text: string): JsonObject | undefined {
   return profile.parseDomain?.(text);
@@ -83,6 +80,7 @@ export function createContentTask(rootDir: string) {
         const previousContent = previousRevision && !previousRevision.format.startsWith('image/') ? await readArtifact(rootDir, previousRevision) : undefined;
         const guidance = await profileGuidance(rootDir, work.profile, Array.isArray(work.domain.skills) ? work.domain.skills.filter((id): id is string => typeof id === 'string') : []);
         const contextText = JSON.stringify({ brief: work.plan.brief, locale: work.locale, plan: work.plan, domain: work.domain, guidance, previousContent,
+          autonomy: work.autonomy ? { selection: work.autonomy.selection, research: work.autonomy.research } : undefined,
           materials: materials.filter(item => !work.materialIds.length || work.materialIds.includes(item.id)), instruction: task.input.instruction ?? '' });
         await runtime.commit(async tx => {
           const doc = await tx.doc(Works, work.id, work); if (!doc.pauseRequested) doc.status = 'active';
@@ -165,7 +163,7 @@ export function createContentTask(rootDir: string) {
     abort: async (task, runtime, context) => {
       const work = await runtime.snapshot(Works, task.input.workId, context);
       await runtime.commit(async tx => {
-        if (work) (await tx.doc(Works, work.id, work)).status = 'cancelled';
+        if (work && (!work.autonomy?.taskId || work.autonomy.stoppedAt)) (await tx.doc(Works, work.id, work)).status = 'cancelled';
         return { status: 'terminal', outcome: { status: 'aborted' } };
       }, context);
     },

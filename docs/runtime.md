@@ -10,9 +10,13 @@ The runtime owns `.inkos/durable.sqlite`. The reused exclusive SQLite sidecar lo
 
 Use `inkos models list`, `models login <provider> --type api_key|oauth`, and `models set <provider> <model-id>`. API keys and OAuth follow the official pi-ai catalog and authentication flows, including supported OpenAI/Codex providers; removing Codex App Server does not ban those model providers. Login secrets are prompted, not passed as CLI arguments. Project credentials live in `.inkos/credentials.json` with owner-only file permissions.
 
+In Studio's Models page, **Connect API key** or **Connect OAuth** opens a focused authentication dialog. Submit the official SDK prompt (secret values are password inputs), or open the provider's authorization link and finish in your browser. Successful completion refreshes the provider catalog; select a model afterwards. Cancel/Escape cancels the pending native flow and releases its callback listener. Environment-only providers do not advertise an unsupported interactive login.
+
+Native OpenAI ChatGPT OAuth receives InkOS's stable per-project device UUID, persisted in the existing project Document, and uses the official SDK callback server on localhost port **1455**. An unfinished login can occupy that port; cancel it before starting another. InkOS does not implement another OAuth transport or token exchange.
+
 `inkos.json` accepts a native project `model: {provider, modelId}` and `durable` Harness settings. Conversation configuration accepts SDK model references and routing through `conversations configure <id> --changes <json>`. New conversations inherit the project model unless explicitly configured. No `backend`, kernel selector or old `INKOS_LLM_*` override layer is used. Configure a custom provider through an official extension when it is not in the SDK catalog.
 
-No model connection/generation was executed for this local delivery. Do not interpret catalog visibility or an unconfigured-model failure regression as a live inference check.
+Local checks exercise API-key storage with inert placeholder strings and native OAuth authorization-link/cancellation handling without visiting the provider. These are not valid-credential, real OAuth token-exchange or inference checks; no real account/model call or fee is implied.
 
 ## Work plans and content SOP
 

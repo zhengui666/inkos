@@ -5,7 +5,7 @@ import { ProjectDoc, Works } from '../../works/documents.js';
 import { Distributions, PublishingTargets } from '../../publishing/documents.js';
 import { distributionKey } from '../../publishing/contracts.js';
 import { atBoundary, createContentTask } from './task.js';
-import { bufferedUnits, completedUnits } from '../../works/progress.js';
+import { publishingBufferFull, completedUnits } from '../../works/progress.js';
 
 export function nextProductionTime(cron: string | null, from: number): number {
   return cron ? CronExpressionParser.parse(cron, { currentDate: from }).next().getTime() : from;
@@ -24,7 +24,7 @@ export function createProductionTask(rootDir: string) {
         }
         const nextAt = work.plan.production.nextAt ?? task.state.checkpoint.nextAt;
         if (nextAt > runtime.now()) await runtime.sleep(nextAt, context);
-        if ((work.plan.serial || work.targetIds.length > 0) && await bufferedUnits(runtime, work, context) >= work.plan.production.backlog) {
+        if (await publishingBufferFull(runtime, work, context)) {
           // Native document watches, not a second scheduler: publishing and plan changes wake this step.
           const watches: (WatchHandle<unknown> | undefined)[] = [await runtime.watchDoc(Works, work.id, context), await runtime.watchDoc(ProjectDoc, context)];
           for (const id of work.targetIds) watches.push(await runtime.watchDoc(PublishingTargets, id, context));
@@ -36,7 +36,7 @@ export function createProductionTask(rootDir: string) {
           try {
             for (const watch of watches) if (watch) { const initial = JSON.stringify(watch.value); watch.start(async () => { if (JSON.stringify(watch.value) !== initial) wake(); }); }
             const latest = await runtime.snapshot(Works, work.id, context);
-            if (latest && !latest.pauseRequested && await bufferedUnits(runtime, latest, context) >= latest.plan.production.backlog) {
+            if (latest && !latest.pauseRequested && await publishingBufferFull(runtime, latest, context)) {
               runtime.signal.throwIfAborted(); await changed;
             }
           } finally { runtime.signal.removeEventListener('abort', abort); await Promise.all(watches.map(watch => watch?.stop())); }

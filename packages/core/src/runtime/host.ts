@@ -16,6 +16,9 @@ import { ProjectDoc, Works } from '../works/documents.js';
 import { WorksService } from '../works/service.js';
 import { createContentTask, type ContentInput } from '../extensions/fiction/task.js';
 import { createProductionTask } from '../extensions/fiction/production.js';
+import { AutonomyConfigSchema, createAutonomyTask, createAutonomyDeadline } from '../extensions/fiction/autonomy.js';
+import { defaultAutonomyConfig } from '../works/autonomy.js';
+import { findRankingSource, readRanking } from '../extensions/research/ranking.js';
 import { createCapabilities } from '../extensions/capabilities.js';
 import { createPublishingExtension } from '../extensions/publishing/index.js';
 import { PublishingService } from '../publishing/service.js';
@@ -26,7 +29,7 @@ import { exportArtifact, editArtifact } from '../extensions/export.js';
 import { commitAtomicFileSet, recoverAtomicFileSets } from '../utils/atomic-file-set.js';
 
 const ctx = BACKGROUND_CONTEXT;
-type LoginState = { status: 'running' | 'done' | 'failed'; events: AuthEvent[]; prompt?: AuthPrompt; error?: string; respond?: (value: string) => void };
+type LoginState = { providerId: string; type: AuthType; status: 'running' | 'done' | 'failed' | 'cancelled'; events: AuthEvent[]; prompt?: AuthPrompt; error?: string; respond?: (value: string) => void; controller: AbortController; completion?: Promise<void> };
 export class RuntimeHost {
   readonly works: WorksService;
   readonly publishing: PublishingService;
@@ -71,6 +74,8 @@ export class RuntimeHost {
     } catch (error) { await harness?.close(ctx); for (const client of clients) await client.close(); owner.release(); throw error; }
   }
   async close(): Promise<void> {
+    for (const state of this.logins.values()) if (state.status === 'running') state.controller.abort();
+    await Promise.all([...this.logins.values()].map(state => state.completion));
     try { await this.harness.close(ctx); for (const client of this.clients) await client.close(); }
     finally { this.release(); }
   }
@@ -98,6 +103,44 @@ export class RuntimeHost {
     }, ctx);
     this.harness.resume(); return result;
   }
+  async startAutonomy(p: { workId: string; durationMs?: number; requestId?: string }) {
+    const work = await this.works.get(p.workId);
+    const config = AutonomyConfigSchema.parse(work.autonomy?.config ?? defaultAutonomyConfig());
+    if (!config.sources.length) throw new Error('Configure at least one readable ranking source');
+    for (const source of config.sources) findRankingSource(this.registry.snapshot(), source.source);
+    const duration = p.durationMs ?? 86_400_000;
+    if (!Number.isFinite(duration) || duration <= 0) throw new Error('Run duration must be positive and finite');
+    const key = JSON.stringify(['autonomy', p.requestId ?? randomUUID()]);
+    const result = await (await this.harness.root(ctx)).commit(async tx => {
+      const project = await tx.doc(ProjectDoc);
+      if (Object.hasOwn(project.requests, key)) return { ...project.requests[key] };
+      const active = (await tx.scanTasks({}, 1000)).items.find(task => task.state.status !== 'terminal' && ['inkos.content', 'inkos.production', 'inkos.autonomy'].includes(task.kind) && (task.input as { workId?: string }).workId === work.id);
+      if (active) {
+        if (active.kind === 'inkos.autonomy') return { taskId: active.id, artifactId: '' };
+        throw new Error('This work already has an active creation task');
+      }
+      const startedAt = Date.now(), endAt = startedAt + duration;
+      const current = await tx.doc(Works, work.id, work);
+      const selection = current.autonomy?.selection ? JSON.parse(JSON.stringify(current.autonomy.selection)) : undefined;
+      const firstAt = current.autonomy?.nextChapterAt ?? 0;
+      const taskId = await tx.createTask(createAutonomyTask(this.rootDir), { workId: work.id, endAt, reuseSelection: Boolean(selection && current.artifactIds.length), firstAt }, { ownership: { kind: 'conversation' }, background: true });
+      const deadlineTaskId = await tx.createTask(createAutonomyDeadline((id, expected) => this.stopAutonomy(id, expected, true)), { workId: work.id, taskId, endAt }, { ownership: { kind: 'conversation' }, background: true });
+      current.autonomy = { config, research: [], ...(selection ? { selection } : {}), taskId, deadlineTaskId, startedAt, endAt, nextChapterAt: firstAt || startedAt };
+      current.pauseRequested = false; current.status = 'active'; current.updatedAt = startedAt;
+      return project.requests[key] = { taskId, artifactId: '' };
+    }, ctx);
+    this.harness.resume(); return result;
+  }
+  async stopAutonomy(workId: string, expectedTaskId?: number, deadline = false) {
+    const work = await this.works.get(workId), run = work.autonomy;
+    if (!run?.taskId || expectedTaskId !== undefined && run.taskId !== expectedTaskId) return { stopped: false };
+    const task = await this.harness.getTask(run.taskId as TaskId, ctx);
+    if (!task || task.state.status === 'terminal') return { stopped: false };
+    await this.works.pause(workId, true);
+    await this.harness.abortTask(run.taskId as TaskId, ctx);
+    if (!deadline && run.deadlineTaskId) await this.harness.abortTask(run.deadlineTaskId as TaskId, ctx);
+    return { stopped: true, taskId: run.taskId };
+  }
   async rpc(method: string, p: any = {}): Promise<any> {
     switch (method) {
       case 'status': return this.status();
@@ -106,6 +149,20 @@ export class RuntimeHost {
       case 'works.get': return this.works.get(p.id);
       case 'works.update': return this.works.update(p.id, p.changes);
       case 'works.pause': return this.works.pause(p.id, p.paused);
+      case 'autonomy.configure': {
+        const config = AutonomyConfigSchema.parse(p.config);
+        for (const source of config.sources) findRankingSource(this.registry.snapshot(), source.source);
+        const work = await this.works.get(p.workId);
+        await this.harness.commit(async tx => {
+          const current = await tx.doc(Works, work.id, work);
+          if (current.autonomy) current.autonomy.config = config;
+          else current.autonomy = { config, research: [], taskId: null, deadlineTaskId: null, startedAt: null, endAt: null };
+          current.updatedAt = Date.now();
+        }, ctx); return this.works.get(work.id);
+      }
+      case 'autonomy.start': return this.startAutonomy(p);
+      case 'autonomy.stop': return this.stopAutonomy(p.workId);
+      case 'ranking.read': return readRanking(this.registry.snapshot(), p, new AbortController().signal);
       case 'creation.start': return this.startContent(p);
       case 'creation.produce': {
         const work = await this.works.get(p.workId); const root = await this.harness.root(ctx); const key = JSON.stringify(['production', p.requestId ?? randomUUID()]);
@@ -183,7 +240,7 @@ export class RuntimeHost {
       case 'publishing.observe': return this.publishing.observe(p.id);
       case 'models.list': {
         const providers = await Promise.all(this.models.getProviders().map(async provider => ({ id: provider.id, name: provider.name,
-          configured: !!await this.models.checkAuth(provider.id), authTypes: [...(provider.auth.apiKey ? ['api_key'] : []), ...(provider.auth.oauth ? ['oauth'] : [])] })));
+          configured: !!await this.models.checkAuth(provider.id), authTypes: [...(provider.auth.apiKey?.login ? ['api_key'] : []), ...(provider.auth.oauth?.login ? ['oauth'] : [])] })));
         return { providers, models: this.models.getModels(p.provider), selected: (await this.harness.snapshot(ProjectDoc, ctx))?.model ?? null };
       }
       case 'models.set': {
@@ -192,8 +249,9 @@ export class RuntimeHost {
         await this.harness.commit(async tx => { (await tx.doc(ProjectDoc)).model = model; }, ctx); return model;
       }
       case 'models.login.start': return this.startLogin(p.providerId, p.type);
-      case 'models.login.status': { const state = this.logins.get(p.id); if (!state) throw new Error('Login not found'); const { respond, ...view } = state; return view; }
-      case 'models.login.respond': { const state = this.logins.get(p.id); if (!state?.respond) throw new Error('Login is not awaiting input'); const respond = state.respond; delete state.respond; delete state.prompt; respond(p.value); return { id: p.id }; }
+      case 'models.login.status': { const state = this.logins.get(p.id); if (!state) throw new Error('Login not found'); const { controller, completion, respond, ...view } = state; return view; }
+      case 'models.login.respond': { const state = this.logins.get(p.id); if (!state?.respond) throw new Error('Login is not awaiting input'); state.respond(p.value); return { id: p.id }; }
+      case 'models.login.cancel': { const state = this.logins.get(p.id); if (!state) throw new Error('Login not found'); if (state.status === 'running') state.controller.abort(); await state.completion; return { id: p.id, status: state.status }; }
       case 'models.logout': await this.models.logout(p.providerId); return { providerId: p.providerId };
       case 'plugins.list': return describePlugins(this.registry);
       case 'plugins.configure': {
@@ -206,12 +264,28 @@ export class RuntimeHost {
       default: throw new Error(`Unknown runtime method: ${method}`);
     }
   }
-  private startLogin(providerId: string, type: AuthType) {
-    const id = randomUUID(); const state: LoginState = { status: 'running', events: [] }; this.logins.set(id, state);
-    void this.models.login(providerId, type, {
-      prompt: prompt => new Promise(resolve => { state.prompt = prompt; state.respond = resolve; }),
+  private async startLogin(providerId: string, type: AuthType) {
+    const deviceId = type === 'oauth' ? await this.harness.commit(async tx => {
+      const project = await tx.doc(ProjectDoc); return project.deviceId ??= randomUUID();
+    }, ctx) : undefined;
+    const id = randomUUID(); const state: LoginState = { providerId, type, status: 'running', events: [], controller: new AbortController() }; this.logins.set(id, state);
+    state.completion = this.models.login(providerId, type, {
+      signal: state.controller.signal,
+      prompt: prompt => new Promise((resolve, reject) => {
+        const signal = AbortSignal.any([state.controller.signal, ...(prompt.signal ? [prompt.signal] : [])]);
+        const cleanup = () => { signal.removeEventListener('abort', cancel); if (state.respond === respond) { delete state.respond; delete state.prompt; } };
+        const respond = (value: string) => { cleanup(); resolve(value); };
+        const cancel = () => { cleanup(); reject(signal.reason); };
+        if (signal.aborted) { reject(signal.reason); return; }
+        const { signal: nativeSignal, ...view } = prompt; state.prompt = view; state.respond = respond;
+        signal.addEventListener('abort', cancel, { once: true });
+      }),
       notify: event => { state.events.push(event); },
-    }).then(() => { state.status = 'done'; delete state.prompt; delete state.respond; }, error => { state.status = 'failed'; state.error = error.message; delete state.prompt; delete state.respond; });
+    }, { agentName: 'InkOS', getDeviceId: () => deviceId! }).then(() => {
+      state.status = 'done'; delete state.prompt; delete state.respond;
+    }, error => {
+      state.status = state.controller.signal.aborted ? 'cancelled' : 'failed'; state.error = error instanceof Error ? error.message : String(error); delete state.prompt; delete state.respond;
+    });
     return { id };
   }
 }

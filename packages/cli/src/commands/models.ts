@@ -6,7 +6,7 @@ import { connect } from "../runtime.js";
 import { log, output } from "../utils.js";
 
 type AuthPrompt = { type: "text" | "secret" | "select" | "manual_code"; message: string; placeholder?: string; options?: Array<{ id: string; label: string; description?: string }> };
-type LoginStatus = { status: "running" | "done" | "failed"; events: any[]; prompt?: AuthPrompt; error?: string };
+type LoginStatus = { status: "running" | "done" | "failed" | "cancelled"; events: any[]; prompt?: AuthPrompt; error?: string };
 
 async function ask(prompt: AuthPrompt): Promise<string> {
   if (!process.stdin.isTTY) throw new Error("Native model login needs an interactive terminal. Credentials are not accepted as CLI arguments.");
@@ -50,6 +50,7 @@ export function createModelsCommand(): Command {
         for (const event of status.events.slice(shown)) showAuthEvent(event);
         shown = status.events.length;
         if (status.status === "failed") throw new Error(status.error ?? "Native model login failed.");
+        if (status.status === "cancelled") throw new Error("Native model login cancelled.");
         if (status.status === "done") { log(`Logged in to ${providerId}.`); return; }
         if (status.prompt) {
           const value = await ask(status.prompt);

@@ -1,0 +1,44 @@
+import { test, expect, type APIRequestContext } from '@playwright/test';
+async function api(request: APIRequestContext, method: string, params: object = {}) {
+  const response = await request.post(`/api/v1/${method.replaceAll('.', '/')}`, { data: params });
+  const result = await response.json(); expect(response.ok(), JSON.stringify(result)).toBeTruthy(); return result;
+}
+test('work-local unattended settings preserve unsaved input and locale; a native bounded source failure stops without publication', async ({ page, request }) => {
+  const work = await api(request, 'works.create', { title: 'Bounded unattended UI check', locale: 'ja', brief: 'Author intent must remain intact.', plan: { serial: true, units: null } });
+  const mutations: string[] = [];
+  page.on('request', value => { if (['/autonomy/configure', '/autonomy/start', '/works/update'].some(path => new URL(value.url()).pathname.endsWith(path))) mutations.push(value.url()); });
+  await page.goto(`/#works/${work.id}`);
+  await expect(page.getByRole('navigation', { name: 'Studio navigation' }).getByRole('link')).toHaveCount(3);
+  await expect(page.getByRole('heading', { name: 'Unattended writing', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Start timed run', exact: true })).toBeDisabled();
+  await page.getByLabel('Ranking source URLs', { exact: true }).fill('http://127.0.0.1:1/unreadable-ranking');
+  await page.getByLabel('Chapter interval (minutes)', { exact: true }).fill('15');
+  await page.getByLabel('Interface language').selectOption('zh-CN');
+  await expect(page.getByLabel('榜单来源地址', { exact: true })).toHaveValue('http://127.0.0.1:1/unreadable-ranking');
+  await expect(page.getByLabel('章节间隔（分钟）', { exact: true })).toHaveValue('15');
+  await expect(page.getByRole('button', { name: '开始限时运行', exact: true })).toBeDisabled();
+  expect(mutations).toEqual([]);
+  await page.getByLabel('界面语言').selectOption('en');
+  await page.getByRole('button', { name: 'Save run settings', exact: true }).click();
+  await expect(page.locator('.notice.success')).toContainText('Unattended settings saved');
+  const saved = await api(request, 'works.get', { id: work.id });
+  expect(saved.autonomy.config.chapterEveryMs).toBe(900000); expect(saved.locale).toBe('ja'); expect(saved.plan.brief).toBe(work.plan.brief);
+  await page.getByText('Sources & run settings', { exact: true }).click();
+  await page.getByLabel('Ranking source URLs', { exact: true }).fill('http://127.0.0.1:1/unsaved-source');
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(page.getByLabel('Ranking source URLs', { exact: true })).toHaveValue('http://127.0.0.1:1/unsaved-source');
+  const admitted = await api(request, 'autonomy.start', { workId: work.id, durationMs: 1800, requestId: crypto.randomUUID() });
+  const before = await api(request, 'works.get', { id: work.id });
+  await expect.poll(async () => (await api(request, 'works.get', { id: work.id })).autonomy.lastError).toMatch(/fetch failed/i);
+  await expect(page.getByTestId(`task-${admitted.taskId}`)).toBeVisible();
+  await page.reload();
+  expect((await api(request, 'works.get', { id: work.id })).autonomy.endAt).toBe(before.autonomy.endAt);
+  await api(request, 'tasks.wait', { id: admitted.taskId });
+  await expect.poll(async () => (await api(request, 'works.get', { id: work.id })).autonomy.stopReason).toBe('deadline');
+  const after = await api(request, 'works.get', { id: work.id });
+  expect(after.artifactIds).toEqual([]); expect(after.targetIds).toEqual([]);
+  expect((await api(request, 'status')).distributions.filter((item: any) => item.workId === work.id)).toEqual([]);
+  expect(mutations.filter(url => url.endsWith('/autonomy/configure'))).toHaveLength(1);
+  await page.setViewportSize({ width: 375, height: 900 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});

@@ -1,4 +1,5 @@
 import { defineDoc, defineDocFamily, type JsonObject } from '@earendil-works/pi-durable';
+import type { WorkAutonomy } from './autonomy.js';
 
 export type ReviewPolicy = { id: string; enabled: boolean; maxRevisions: number; maxCost: number | null };
 export type WorkPlan = {
@@ -11,6 +12,7 @@ export type Work = {
   plan: WorkPlan; artifactIds: string[]; targetIds: string[]; materialIds: string[];
   domain: JsonObject; history: JsonObject[]; legacy: JsonObject;
   pauseRequested: boolean; createdAt: number; updatedAt: number;
+  autonomy?: WorkAutonomy;
 };
 export type ArtifactRevision = {
   id: string; artifactId: string; workId: string; title: string; path: string;
@@ -28,6 +30,7 @@ export type ProjectState = {
   workIds: string[]; targetIds: string[]; distributionIds: string[];
   migrations: Record<string, JsonObject>; requests: Record<string, { taskId: number; artifactId: string }>;
   model: { provider: string; modelId: string } | null; legacyConfig: JsonObject;
+  deviceId?: string;
 };
 export const ProjectDoc = defineDoc<ProjectState>({
   kind: 'inkos.project', version: 1, scope: 'session',

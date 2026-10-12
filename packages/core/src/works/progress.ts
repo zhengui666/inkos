@@ -26,3 +26,8 @@ export async function bufferedUnits(reader: DocumentReader, work: Work, context:
   }
   return count;
 }
+/** Publishing limits apply only when a real enabled destination exists. Offline serials must keep writing. */
+export async function publishingBufferFull(reader: DocumentReader, work: Work, context: Context): Promise<boolean> {
+  const targets = await Promise.all(work.targetIds.map(id => reader.snapshot(PublishingTargets, id, context)));
+  return targets.some(target => target?.enabled) && await bufferedUnits(reader, work, context) >= work.plan.production.backlog;
+}

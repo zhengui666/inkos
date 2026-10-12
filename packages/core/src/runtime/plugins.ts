@@ -2,13 +2,14 @@ import { createRequire } from 'node:module';
 import { isAbsolute, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { Extension, Registry, JsonObject } from '@earendil-works/pi-durable';
+import type { RankingSource } from '../extensions/research/ranking.js';
 
 export type ContentProfile = {
   id: string; label: string; format: string; countingUnit: 'word' | 'grapheme';
   instructions: string; domainKind: string; parseDomain?: (text: string) => JsonObject;
 };
 export type PublisherDescription = { id: string; label: string; capabilities: string[] };
-export type InkExtension = Extension & { profiles?: ContentProfile[]; publishers?: PublisherDescription[] };
+export type InkExtension = Extension & { profiles?: ContentProfile[]; publishers?: PublisherDescription[]; rankingSources?: RankingSource[] };
 export type PluginContext = { rootDir: string };
 export async function loadPlugins(registry: Registry, modules: string[], context: PluginContext): Promise<void> {
   const require = createRequire(resolve(context.rootDir, 'package.json'));
@@ -25,7 +26,7 @@ export function describePlugins(registry: Registry) {
   return registry.snapshot().installed().map(extension => {
     const ink = extension as InkExtension;
     return { name: ink.name, tools: ink.tools?.map(tool => tool.name) ?? [], tasks: ink.tasks?.map(task => task.definition.name) ?? [],
-      profiles: ink.profiles ?? [], publishers: ink.publishers ?? [] };
+      profiles: ink.profiles ?? [], publishers: ink.publishers ?? [], rankingSources: (ink.rankingSources ?? []).map(({ id, label, description }) => ({ id, label, description })) };
   });
 }
 export function findProfile(registry: { installed(): readonly Extension[] }, id: string): ContentProfile {

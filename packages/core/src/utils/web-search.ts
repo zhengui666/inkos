@@ -66,13 +66,13 @@ export async function searchWeb(
  * Fetch a URL and return its complete text content.
  * HTML is stripped to plain text. Context budgeting happens at the consumer.
  */
-export async function fetchUrl(url: string): Promise<string> {
+export async function fetchUrl(url: string, signal?: AbortSignal): Promise<string> {
   const res = await fetch(url, {
     headers: {
       "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
       "Accept": "text/html, application/json, text/plain",
     },
-    signal: AbortSignal.timeout(15000),
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
   });
 
   if (!res.ok) {
@@ -87,6 +87,8 @@ export async function fetchUrl(url: string): Promise<string> {
       .replace(/<script[\s\S]*?<\/script>/gi, "")
       .replace(/<style[\s\S]*?<\/style>/gi, "")
       .replace(/<[^>]*>/g, " ")
+      .replace(/&#(x[\da-f]+|\d+);/gi, (_, value: string) => { const n = value[0].toLowerCase() === 'x' ? parseInt(value.slice(1), 16) : Number(value); return n <= 0x10ffff ? String.fromCodePoint(n) : ''; })
+      .replace(/&(amp|quot|apos|lt|gt|nbsp);/gi, (_, value: string) => ({ amp: '&', quot: '"', apos: "'", lt: '<', gt: '>', nbsp: ' ' })[value.toLowerCase()] ?? '')
       .replace(/\s+/g, " ")
       .trim();
   }

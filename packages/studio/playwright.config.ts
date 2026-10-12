@@ -16,7 +16,7 @@ export default defineConfig({
   fullyParallel: false,
   outputDir: join(project, 'browser-results'),
   reporter: [['list']],
-  use: { baseURL: 'http://127.0.0.1:4580', headless: true, screenshot: 'only-on-failure', trace: 'retain-on-failure', launchOptions: process.env.INKOS_BROWSER_EXECUTABLE ? { executablePath: process.env.INKOS_BROWSER_EXECUTABLE } : {} },
+  use: { baseURL: 'http://127.0.0.1:4580', locale: 'en-US', headless: true, screenshot: 'only-on-failure', trace: 'retain-on-failure', launchOptions: process.env.INKOS_BROWSER_EXECUTABLE ? { executablePath: process.env.INKOS_BROWSER_EXECUTABLE } : {} },
   webServer: {
     command: 'npm run build:client && tsx e2e/serve.ts',
     url: 'http://127.0.0.1:4580/api/v1/status',

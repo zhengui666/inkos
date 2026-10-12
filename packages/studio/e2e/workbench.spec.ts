@@ -42,7 +42,6 @@ test('platform-free Japanese work, imported revisions, editing and independent t
   await expect(page.getByTestId('revision-id')).toHaveText(read.revision.id);
   await expect(page.getByLabel('Draft content')).toHaveValue('日本語の改稿。');
   await page.screenshot({ path: info.outputPath('works-desktop.png'), fullPage: true });
-  await page.getByRole('link', { name: 'Publishing', exact: true }).click();
   for (const account of ['Offline A', 'Offline B']) {
     await page.getByRole('button', { name: 'Add target', exact: true }).click();
     await page.getByLabel('Target work').selectOption(workId);
@@ -66,7 +65,7 @@ test('native offline task survives refresh, pause/resume and cancellation', asyn
   // Native pause/resume/cancel are exercised while that durable task is sleeping.
   const work = await api(request, 'works.create', { title: 'Offline scheduled production', profile: 'article', locale: 'ja', plan: { production: { nextAt: Date.now() + 3_600_000, backlog: 1, cron: null } } });
   const created = await api(request, 'produce', { workId: work.id, requestId: crypto.randomUUID() });
-  await page.goto('/#tasks');
+  await page.goto(`/#works/${work.id}`);
   const row = page.getByTestId(`task-${created.taskId}`);
   await expect(row).toBeVisible();
   await expect.poll(async () => (await api(request, 'tasks.get', { id: created.taskId })).state.status).toBe('running');
@@ -88,26 +87,25 @@ test('native offline task survives refresh, pause/resume and cancellation', asyn
   expect((await stat(join(before.rootDir, '.inkos', 'durable.sqlite'))).size).toBeGreaterThan(0);
 });
 
-test('persistent conversation writes one offline note; reload never resubmits', async ({ page, request }) => {
-  await page.goto('/#conversations');
-  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
-  await page.getByLabel('Offline note', { exact: true }).fill('Research decision: keep the Japanese letter intact.');
-  let submissions = 0;
-  page.on('request', request => { if (request.url().endsWith('/conversations/submit')) submissions++; });
-  await page.getByRole('button', { name: 'Save note', exact: true }).click();
-  await expect(page.locator('.transcript')).toContainText('Research decision: keep the Japanese letter intact.');
-  const id = Number(page.url().split('#conversations/')[1]);
-  const native = await api(request, 'conversations.get', { id });
-  expect(native.entries.filter((entry: any) => entry.kind === 'inkos.note')).toHaveLength(1);
+test('legacy destinations are passive Works fallbacks; native conversation notes still survive reload without resubmission', async ({ page, request }) => {
+  const conversation = await api(request, 'conversations.create');
+  const draft = { type: 'write', entry: { kind: 'inkos.note', data: { text: 'Research decision: keep the Japanese letter intact.' } }, requestId: 'kept-offline-note' };
+  const submission = await api(request, 'conversations.submit', { id: conversation.id, draft });
+  await api(request, 'submissions.wait', { id: submission.id });
+  let writes = 0;
+  page.on('request', value => { if (/\/(submit|create|start|produce)$/.test(new URL(value.url()).pathname)) writes++; });
+  for (const destination of ['tasks', 'conversations/123', 'publishing', 'attention', 'materials']) {
+    await page.goto(`/#${destination}`);
+    await expect(page.getByRole('heading', { name: 'Works & revisions', exact: true })).toBeVisible();
+    await expect(page.getByRole('navigation', { name: 'Studio navigation' }).getByRole('link')).toHaveCount(3);
+  }
   await page.reload();
-  await expect(page.locator('.transcript')).toContainText('Research decision: keep the Japanese letter intact.');
-  expect(submissions).toBe(1);
-  await page.getByLabel('Message type').selectOption('input');
-  await page.getByLabel('Agent input', { exact: true }).fill('No model should run');
-  await expect(page.getByRole('button', { name: 'Send input', exact: true })).toBeDisabled();
+  const native = await api(request, 'conversations.get', { id: conversation.id });
+  expect(native.entries.filter((entry: any) => entry.kind === 'inkos.note')).toHaveLength(1);
+  expect(writes).toBe(0);
 });
 
-test('unconfigured models, official extension descriptors, materials and user-action entry', async ({ page, request }, info) => {
+test('unconfigured models, searchable providers and official extension descriptors remain usable', async ({ page, request }, info) => {
   await page.goto('/#models');
   await expect(page.getByText('Model service is not configured.', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Use model', exact: true })).toBeDisabled();
@@ -115,23 +113,21 @@ test('unconfigured models, official extension descriptors, materials and user-ac
   await expect(page.locator('input[type=radio]')).toHaveCount(0);
   await page.screenshot({ path: info.outputPath('models-desktop.png'), fullPage: true });
   await page.getByRole('link', { name: 'Extensions', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'Extensions & capabilities', exact: true })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Native tasks', exact: true }).first()).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Content publishers', exact: true }).first()).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Extensions', exact: true })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Native tasks', exact: true }).first()).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Content publishers', exact: true }).first()).toBeVisible();
+  await page.getByText('Configure extension modules', { exact: true }).click();
   await page.getByLabel('Official extension modules').fill('./does-not-exist.js');
   await page.getByRole('button', { name: 'Apply modules', exact: true }).click();
   await expect(page.getByRole('alert')).toContainText('does-not-exist');
-  await page.getByRole('link', { name: 'Materials', exact: true }).click();
-  await page.getByLabel('Material file path').fill('research.md');
-  await page.getByRole('button', { name: 'Ingest source', exact: true }).click();
-  await expect(page.locator('.material-item h3').first()).toBeVisible();
-  await page.getByLabel('Search materials', { exact: true }).fill('Kyoto');
-  await page.getByRole('button', { name: 'Search', exact: true }).click();
-  await expect(page.locator('.material-item')).toContainText('handwritten letter');
-  await page.getByRole('link', { name: 'User actions', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'User actions & observation', exact: true })).toBeVisible();
+  await api(request, 'materials.ingest', { sourceKind: 'file', filePath: 'research.md' });
+  expect((await api(request, 'materials.query', { query: 'Kyoto' })).length).toBeGreaterThan(0);
   const status = await api(request, 'status');
   expect(await readFile(join(status.rootDir, 'research.md'), 'utf8')).toContain('Kyoto');
+  await page.goto('/#models');
+  await page.getByLabel('Search providers').fill('openai');
+  await expect(page.locator('.provider')).toContainText(['openai']);
+  expect(await page.locator('.provider').count()).toBeLessThan(10);
 });
 
 test('responsive layout, visible keyboard focus and reduced motion on the real UI', async ({ page }, info) => {
@@ -145,7 +141,7 @@ test('responsive layout, visible keyboard focus and reduced motion on the real U
   expect(await page.locator('.page-content').evaluate(el => getComputedStyle(el).animationName)).toBe('none');
   for (const width of [1440, 1024, 375]) {
     await page.setViewportSize({ width, height: 900 });
-    for (const destination of ['works', 'tasks', 'conversations', 'publishing', 'models', 'plugins']) {
+    for (const destination of ['works', 'models', 'plugins']) {
       await page.goto(`/#${destination}`);
       await expect(page.locator('.page-content')).toBeVisible();
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
@@ -162,7 +158,7 @@ test('native budget fault is terminal and explicit retry preserves the saved aut
   const draftPath = join(root, '.inkos/artifacts', work.id, 'budget-draft/budget-v1/content.txt');
   const savedAt = (await stat(draftPath)).mtimeMs;
   expect(await readFile(draftPath, 'utf8')).toBe('Author draft retained during failure.');
-  await page.goto('/#tasks'); const row = page.getByTestId(`task-${created.taskId}`);
+  await page.goto(`/#works/${work.id}`); const row = page.getByTestId(`task-${created.taskId}`);
   await expect(row.getByRole('button', { name: 'Pause', exact: true })).toBeDisabled();
   await expect(row.getByRole('button', { name: 'Cancel', exact: true })).toBeDisabled();
   await row.getByRole('button', { name: 'Retry content', exact: true }).click();
@@ -173,4 +169,16 @@ test('native budget fault is terminal and explicit retry preserves the saved aut
   expect(await readFile(draftPath, 'utf8')).toBe('Author draft retained during failure.');
   expect((await stat(draftPath)).mtimeMs).toBe(savedAt);
   expect((await api(request, 'status')).usage.models).toEqual({});
+});
+test('native text artifact format stays visible and is preserved by an author edit', async ({ page, request }) => {
+  const work = await api(request, 'works.create', { title: 'Native text format', profile: 'fiction' });
+  const saved = await api(request, 'artifacts.save', { workId: work.id, title: 'Author text chapter', content: 'Author-supplied plain text.', format: 'text' });
+  await page.goto(`/#works/${work.id}`);
+  await expect(page.getByLabel('Content format', { exact: true })).toHaveValue('text');
+  await expect(page.getByLabel('Draft content', { exact: true })).toHaveValue('Author-supplied plain text.');
+  await page.getByLabel('Draft content', { exact: true }).fill('Updated author plain text.');
+  await page.getByRole('button', { name: 'Save revision', exact: true }).click();
+  await expect(page.getByTestId('revision-id')).not.toHaveText(saved.id);
+  const read = await api(request, 'artifacts.read', { id: saved.artifactId });
+  expect(read.revision.format).toBe('text'); expect(read.content).toBe('Updated author plain text.'); expect(read.artifact.revisions).toHaveLength(2);
 });
